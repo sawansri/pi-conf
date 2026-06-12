@@ -145,6 +145,9 @@ Already true in your environment per `~/.pi/agent/models.json`:
 Already installed (or trivial to install):
 
 - `@majorgilles/pi-grill-me` (npm package, install via `pi install npm:@majorgilles/pi-grill-me`)
+- `@calesennett/pi-codex-usage` (recommended companion — live Codex 5h/7d
+  footer; install via `pi install npm:@calesennett/pi-codex-usage`, see
+  `install.md` → "Optional companions")
 
 ## Extension required
 

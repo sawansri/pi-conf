@@ -137,3 +137,43 @@ rm -rf ~/.pi/agent/extensions/tdd-pipeline
 ```
 
 No background processes, no global state damage. `models.json` left untouched.
+
+---
+
+## Optional companions
+
+### `pi-codex-usage` — watch Codex rate-limit budget
+
+The first two pipeline phases (plan and test) hammer Codex 5.5. If you're on
+ChatGPT Plus/Pro you have rolling 5h and 7d usage caps that can be exhausted
+mid-build. `@calesennett/pi-codex-usage` writes a live footer showing both
+windows, so you can pause before you run out instead of getting a 429 in the
+middle of the green loop.
+
+Install:
+
+```bash
+pi install npm:@calesennett/pi-codex-usage
+```
+
+It registers `/codex-usage-mode` (toggles between `left` and `used`
+display) and `/codex-usage-reset-window` (toggles between `5h` and `7d`
+countdown). Both compose fine with the pipeline's own status widget — pi
+renders multiple `ctx.ui.setStatus(key, text)` entries side-by-side in the
+footer, no conflict.
+
+Recommended workflow:
+
+1. Once you're logged in to Codex via `/login`, hit `/codex-usage-mode used`
+   to read used-%.
+2. While the pipeline runs, glance at the footer. If you're past ~80% on
+   5h or 7d, `/build-pause` and let it drain, or `/build-model
+   openai/<other-model>` for the remaining phase.
+3. The pipeline does *not* auto-pause on high usage — the footer is the
+   signal, you decide. Adding automated pause-on-threshold would couple two
+   extensions together for marginal benefit.
+
+If you switch away from Codex (e.g. to a direct OpenAI API key) and have
+unlimited rate budget, you can still leave the extension installed — it
+shows zeros and is harmless. To remove: `pi uninstall
+npm:@calesennett/pi-codex-usage`.
