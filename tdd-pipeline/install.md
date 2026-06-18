@@ -102,7 +102,56 @@ strong on coding tasks. To swap:
 You can also add `kimi-k2.6` etc. to your `models.json` if your account lists
 them, then `/build-model fireworks/<that-id>` at runtime.
 
-## 5. Verify the full loop manually (one sanity run)
+## 5. Optional: pin defaults per phase via JSON
+
+If you'd rather not edit the extension code, drop a defaults file at
+`~/.pi/agent/tdd-pipeline.json`:
+
+```bash
+cat > ~/.pi/agent/tdd-pipeline.json << 'EOF'
+{
+  "plannerModel": "openai-codex/gpt-5.5",
+  "plannerThinking": "high",
+  "testerModel": "openai-codex/gpt-5.4-mini",
+  "testerThinking": "medium",
+  "implementerModel": "fireworks/accounts/fireworks/models/glm-5p2",
+  "implementerThinking": "xhigh",
+  "autonomous": false
+}
+EOF
+```
+
+Reload with `/reload` in pi. From now on every fresh `/build` uses these
+instead of the in-code defaults. Unknown fields, wrong types, and bad JSON
+fall back silently to in-code — the file is never load-bearing.
+
+Override per-phase models at runtime with `/build-models`:
+
+```
+> /build-models impl=fireworks/accounts/fireworks/models/minimax-m3@xhigh
+```
+
+Validates against `ctx.modelRegistry.find()` *before* writing anything;
+all-or-nothing commit.
+
+### Auto-advance mode
+
+By default, `autonomous: false` — detector firings print a notification but
+do not advance the build. You review each phase boundary and run
+`/build-next` (or `/build-continue "…"` / `/build-rewind`) explicitly.
+
+Three ways to run unattended:
+
+- **Per-build flag:** `/build <feature> --autonomous`
+- **Per-build toggle:** `/build-autonomous` at any time during a build
+- **Persistent default:** `"autonomous": true` in `tdd-pipeline.json`
+
+The persistent form applies to every build you start with `/build`. Mix and
+match: e.g., set `"autonomous": true` in the JSON and *opt out* per-build by
+sending `/build-autonomous` immediately after the build starts to flip
+the flag back to manual.
+
+## 6. Verify the full loop manually (one sanity run)
 
 ```
 /model openai/gpt-5.5
@@ -123,8 +172,11 @@ Then drive the grill interview to "tests + impl plan" output. Once you answer
 | Symptom | What to do |
 |---------|-----------|
 | Status widget stuck on phase | `/build-next` |
+| Green loop stopped without finishing | `/build-continue ["nudge"]` |
+| Implementation went badly, want fresh start *for this phase only* | `/build-rewind` then `/build-continue` |
 | Wrong model picked | `/build-model <provider/id>` |
 | Got bored of automation | `/build-pause`, drive yourself |
+| Need to revisit an old approach or branch | `/tree` (native pi command) — the rewind summary appears as `rewind-<phase>` |
 | Want to throw it all away | `/build-reset` |
 | Context feels big after green | Hit `/compact` |
 | Need to see the approved grill plan | `/checkpoint edit` (grill-me command) |
