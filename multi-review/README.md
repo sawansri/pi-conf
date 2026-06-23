@@ -80,6 +80,10 @@ extglob — documented limitation.
    (≥ 2 reviewers ⇒ CONSENSUS). Group severity escalates to the max of
    members.
 
+   Each reviewer also runs at the thinking level included with its spec
+   (`provider/id@level`, see Defaults). Bare specs fall back to model
+   defaults; the SDK clamps per model.
+
 6. **Judge pass** — single `completeSimple()` on the configured judge model
    with maxTokens 8192 and temperature inherited from defaults. Output is
    structured markdown: severity + title + file:line + category + per-reviewer
@@ -116,6 +120,35 @@ This file stays optional — if absent, the extension warns on `/multi-review`
 and tells you the exact shape to drop. Unknown fields, wrong types, or
 malformed JSON all degrade silently to in-code defaults so the file is
 never load-bearing.
+
+### Per-reviewer thinking level (optional)
+
+A reviewer entry can carry a `@level` suffix to force a specific thinking
+level for that run. The suffix matches the same `provider/id@level` syntax
+used elsewhere in this repo (`tdd-pipeline` uses it for `/build-models`).
+
+```jsonc
+{
+  "reviewers": [
+    "fireworks/.../minimax-m3@xhigh",   // force xhigh on the slow model
+    "fireworks/.../glm-5p2@high",       // moderate reasoning
+    "fireworks/.../kimi-k2p7"           // bare → model default (medium)
+  ]
+}
+```
+
+Rules:
+- Allowed levels: `off | minimal | low | medium | high | xhigh`.
+- Bare spec → model default (`medium` for reasoning-capable models, no
+  reasoning field emitted otherwise).
+- A level that the model's `thinkingLevelMap` clamps to a softer value
+  (e.g. `xhigh` → `high` on some Fireworks-hosted models) is surfaced in
+  the notify under "clamped" so you don't have to guess why reasoning
+  looks lighter than expected.
+
+The picker (`/multi-review-pick`) currently writes bare specs only; edit
+the JSON directly if you want per-reviewer levels. Editing the picker to
+expose per-row level controls is tracked as future polish.
 
 ## Out of scope (by design)
 

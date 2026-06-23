@@ -34,6 +34,71 @@ import { Type } from "typebox";
 export type ModelSpec = `${string}/${string}`;
 
 /**
+ * Per-reviewer entry parsed out of the raw `provider/id[@level]` form.
+ * Storage form in MultiReviewConfig.reviewers stays stringly-typed so JSON
+ * keeps bare (`fireworks/.../minimax-m3`) and suffixed
+ * (`fireworks/.../minimax-m3@xhigh`) forms in the same field. Parsing
+ * happens at load + at request time; clamping happens per-model.
+ */
+export interface ReviewerSpec {
+	spec: ModelSpec;
+	thinking: ThinkingLevelAlias;
+}
+
+export const THINKING_LEVEL_ALIASES = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+export type ThinkingLevelAlias = (typeof THINKING_LEVEL_ALIASES)[number];
+
+/**
+ * Parse a `provider/id[@level]` raw string into a ReviewerSpec. Returns
+ * null for malformed entries (no '/' separator). The level suffix is
+ * accepted ONLY when it matches a known alias — anything not in the
+ * allowlist is treated as part of the spec, so a typo like
+ * `fireworks/.../m@HIGH` falls back gracefully instead of crashing.
+ */
+export function parseReviewerSpec(raw: string, fallbackThinking: ThinkingLevelAlias = "medium"): ReviewerSpec | null {
+	const trimmed = raw.trim();
+	if (!trimmed) return null;
+	const atIdx = trimmed.lastIndexOf("@");
+	let specPart: string;
+	let thinking: ThinkingLevelAlias;
+	if (atIdx > 0 && atIdx < trimmed.length - 1) {
+		const maybeLevel = trimmed.slice(atIdx + 1);
+		if ((THINKING_LEVEL_ALIASES as readonly string[]).includes(maybeLevel)) {
+			specPart = trimmed.slice(0, atIdx);
+			thinking = maybeLevel as ThinkingLevelAlias;
+		} else {
+			specPart = trimmed;
+			thinking = fallbackThinking;
+		}
+	} else {
+		specPart = trimmed;
+		thinking = fallbackThinking;
+	}
+	if (!specPart.includes("/")) return null;
+	return { spec: specPart as ModelSpec, thinking };
+}
+
+export function formatReviewerSpec(rs: ReviewerSpec): string {
+	// Collapse the common case (default medium thinking) for legibility.
+	if (rs.thinking === "medium") return rs.spec;
+	return `${rs.spec}@${rs.thinking}`;
+}
+
+/**
+ * Decide the `reasoning` field on a completeSimple call for one reviewer.
+ *  - non-reasoning-capable model → no field (SDK ignores anyway but
+ *    keeps the wire payload clean);
+ *  - "off" intent → no field (run fast, no reasoning text);
+ *  - otherwise → pass the requested level. The SDK clamps per model's
+ *    thinkingLevelMap so per-provider quirks are honored.
+ */
+export function reasoningForRequest(rs: ReviewerSpec, model: Model): ThinkingLevelAlias | undefined {
+	if (!model.reasoning) return undefined;
+	if (rs.thinking === "off") return undefined;
+	return rs.thinking;
+}
+
+/**
  * Output of runMultiReviewFromArgs. Tool surface returns it; slash command
  * uses notify unless explicitly told to stay silent (we don't, today).
  */
@@ -50,9 +115,14 @@ export interface MultiReviewRunResult {
 
 /** Per-reviewer input that survives a /reload (saved via pi.appendEntry). */
 export interface MultiReviewConfig {
-	reviewers: ModelSpec[];
+	/**
+	 * Reviewer specs as the user wrote them. Each entry is `provider/id` or
+	 * `provider/id@level` (e.g. `fireworks/.../minimax-m3@xhigh`). Parsing
+	 * happens lazily via parseReviewerSpec.
+	 */
+	reviewers: string[];
 	judge: ModelSpec;
-	judgeThinking: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+	judgeThinking: ThinkingLevelAlias;
 	concurrency: number;
 	temperature: number;
 }
@@ -122,6 +192,43 @@ export function findModel(ctx: ExtensionContext, spec: ModelSpec): Model | null 
 	const provider = spec.slice(0, slash);
 	const id = spec.slice(slash + 1);
 	return ctx.modelRegistry.find(provider, id);
+}
+
+/**
+ * Resolve the configured reviewer pool against the live ModelRegistry with
+ * per-reviewer thinking. Returns parsed spec + resolved Model + a flag
+ * indicating whether the spec's thinking got clamped for the model (so the
+ * notify can surface it). Drops spec strings that don't resolve at all.
+ */
+export async function resolveReviewerPoolStructured(
+	ctx: ExtensionContext,
+	rawReviewers: string[],
+): Promise<{ entries: Array<{ raw: string; rs: ReviewerSpec; model: Model; clamped: boolean }>; missing: string[] }> {
+	const available: Model[] = await ctx.modelRegistry.getAvailable();
+	const byKey = new Map<string, Model>();
+	for (const m of available) byKey.set(`${m.provider}/${m.id}`, m);
+
+	const entries: Array<{ raw: string; rs: ReviewerSpec; model: Model; clamped: boolean }> = [];
+	const missing: string[] = [];
+	for (const raw of rawReviewers) {
+		const parsed = parseReviewerSpec(raw);
+		if (!parsed) {
+			missing.push(raw);
+			continue;
+		}
+		const model = byKey.get(parsed.spec);
+		if (!model) {
+			missing.push(raw);
+			continue;
+		}
+		let clamped = false;
+		if (model.reasoning && parsed.thinking !== "off") {
+			const mapped = model.thinkingLevelMap?.[parsed.thinking as keyof typeof model.thinkingLevelMap];
+			clamped = mapped !== undefined && mapped !== parsed.thinking && mapped !== null;
+		}
+		entries.push({ raw, rs: parsed, model, clamped });
+	}
+	return { entries, missing };
 }
 
 /**
@@ -730,7 +837,12 @@ export interface ReviewerFinding {
 }
 
 export interface ReviewerRunResult {
+	/** The spec as the user wrote it — with the @level suffix when present. */
+	formattedSpec: string;
 	spec: ModelSpec;
+	thinking: ThinkingLevelAlias;
+	/** True when Model.thinkingLevelMap clamped the requested level to a softer value. */
+	clamped: boolean;
 	model: Model;
 	ok: boolean;
 	findings: ReviewerFinding[];
@@ -840,18 +952,25 @@ function parseReviewerJson(rawText: string): ReviewerFinding[] {
 
 async function runReviewer(
 	model: Model,
+	reviewerSpec: ReviewerSpec,
 	ctx: ExtensionContext,
 	systemPrompt: string,
 	userPrompt: string,
 	temperature: number,
 	abortSignal: AbortSignal | undefined,
-): Promise<Omit<ReviewerRunResult, "spec">> {
+): Promise<Omit<ReviewerRunResult, "formattedSpec" | "spec" | "thinking" | "clamped">> {
 	const started = Date.now();
 	const { completeSimple } = await import("@mariozechner/pi-ai");
+	const reasoning = reasoningForRequest(reviewerSpec, model);
 	const response = await completeSimple(
 		model,
 		{ systemPrompt, messages: [{ role: "user", content: [{ type: "text", text: userPrompt }] }] },
-		{ signal: abortSignal, temperature, maxTokens: 4096 },
+		{
+			signal: abortSignal,
+			temperature,
+			maxTokens: 4096,
+			...(reasoning !== undefined ? { reasoning } : {}),
+		},
 	);
 	const text = response.content
 		.filter((c) => c.type === "text")
@@ -894,7 +1013,7 @@ const MAX_PARALLEL = 16;
  * arrays gives us the cap without a custom queue.
  */
 async function runAllReviewers(
-	resolved: { spec: ModelSpec; model: Model }[],
+	resolved: Array<{ rs: ReviewerSpec; model: Model; clamped: boolean }>,
 	systemPrompt: string,
 	userPrompt: string,
 	concurrency: number,
@@ -918,14 +1037,23 @@ async function runAllReviewers(
 			if (idx >= resolved.length) return;
 			const slot = resolved[idx];
 			try {
-				const partial = await runReviewer(slot.model, ctx, systemPrompt, userPrompt, temperature, abortSignal);
-				const full: ReviewerRunResult = { spec: slot.spec, ...partial };
+				const partial = await runReviewer(slot.model, slot.rs, ctx, systemPrompt, userPrompt, temperature, abortSignal);
+				const full: ReviewerRunResult = {
+					formattedSpec: formatReviewerSpec(slot.rs),
+					spec: slot.rs.spec,
+					thinking: slot.rs.thinking,
+					clamped: slot.clamped,
+					...partial,
+				};
 				results[idx] = full;
 				done++;
 				onProgress?.(done, total, full);
 			} catch (err) {
 				const full: ReviewerRunResult = {
-					spec: slot.spec,
+					formattedSpec: formatReviewerSpec(slot.rs),
+					spec: slot.rs.spec,
+					thinking: slot.rs.thinking,
+					clamped: slot.clamped,
 					model: slot.model,
 					ok: false,
 					findings: [],
@@ -1370,22 +1498,30 @@ function buildPickerRows(models: Model[]): { rows: PickerRow[]; modelRowIndexToS
 async function pickReviewersViaTUI(
 	ctx: ExtensionContext,
 	models: Model[],
-	preSelect: ModelSpec[] = [],
+	preSelect: string[] = [],
 ): Promise<ModelSpec[] | null> {
 	if (!ctx.hasUI) {
 		// Best-effort fallback for print/RPC modes: select first pre-existing
 		// spec that resolves else fail cleanly. We've already filtered the
-		// pool upstream so this should never be the only path.
-		const first = preSelect.find((s) => models.some((m) => `${m.provider}/${m.id}` === s));
-		return first ? [first] : null;
+		// pool upstream so this should never be the only path. We keep the
+		// bare spec only (drop any @level suffix from the storage form).
+		const first = preSelect.find((s) => {
+			const bare = parseReviewerSpec(s)?.spec ?? s;
+			return models.some((m) => `${m.provider}/${m.id}` === bare);
+		});
+		if (!first) return null;
+		const bare = parseReviewerSpec(first)?.spec ?? first;
+		return [bare];
 	}
 
 	const { rows, modelRowIndexToSpec } = buildPickerRows(models);
 	const preSelectedModelIndices = new Set<number>();
 	for (const spec of preSelect) {
+		const parsed = parseReviewerSpec(spec);
+		const bareSpec = parsed?.spec ?? spec;
 		let idx = 0;
 		for (const m of models) {
-			if (`${m.provider}/${m.id}` === spec) {
+			if (`${m.provider}/${m.id}` === bareSpec) {
 				preSelectedModelIndices.add(idx);
 				break;
 			}
@@ -1587,7 +1723,7 @@ async function runMultiReviewFromArgs(
 	// session that the user opted not to persist), bypass the configured
 	// pool for this run only. Keeping the override list distinct from cfg
 	// means we never silently mutate the user's persisted defaults.
-	const effectiveReviewerSpecs: ModelSpec[] = transientReviewers && transientReviewers.length > 0
+	const effectiveReviewerSpecs: string[] = transientReviewers && transientReviewers.length > 0
 		? transientReviewers
 		: cfg.reviewers;
 	if (effectiveReviewerSpecs.length === 0) {
@@ -1597,23 +1733,16 @@ async function runMultiReviewFromArgs(
 				"multi-review: no reviewers configured.\n\n" +
 				`Drop a "$PI_CODING_AGENT_DIR/multi-review.json" like:\n` +
 				`  { "reviewers": ["fireworks/.../model-a", "fireworks/.../model-b"], "judge": "fireworks/.../judge" }\n` +
+				`Or with per-reviewer thinking: "fireworks/.../model-a@xhigh"\n` +
 				`Then /reload.\n\nArgs: ${rawArgs.trim() || "(none)"}`,
 			notifyLevel: "warning",
 		};
 	}
 
-	// Resolve the override list against the live registry (same gate as the
-	// configured pool: missing API key or absent model → dropped with surface
-	// feedback in the notify).
-	const available = await ctx.modelRegistry.getAvailable();
-	const availableKeys = new Set(available.map((m) => `${m.provider}/${m.id}`));
-	const resolved: { spec: ModelSpec; model: Model }[] = [];
-	const missingPool: ModelSpec[] = [];
-	for (const spec of effectiveReviewerSpecs) {
-		if (!availableKeys.has(spec)) { missingPool.push(spec); continue; }
-		const model = findModel(ctx, spec)!;
-		resolved.push({ spec, model });
-	}
+	// Resolve the override list against the live registry with per-reviewer
+	// thinking parsed out of any `@level` suffix. Drops specs that don't
+	// resolve at all — same surface feedback as before for missing models.
+	const resolved = (await resolveReviewerPoolStructured(ctx, effectiveReviewerSpecs)).entries;
 	if (resolved.length === 0) {
 		return {
 			kind: "notify",
@@ -1644,7 +1773,7 @@ async function runMultiReviewFromArgs(
 
 	setStatus(`multi-review · fanning out to ${resolved.length} reviewers (cap ${cfg.concurrency})`, ctx);
 	const completedRunResults = await runAllReviewers(
-		resolved,
+		resolved.map((r) => ({ rs: r.rs, model: r.model, clamped: r.clamped })),
 		REVIEWER_SYSTEM_PROMPT,
 		userPrompt,
 		cfg.concurrency,

@@ -53,8 +53,27 @@ EOF
 
 The file is read once on first use (cached for the extension's lifetime);
 `/reload` to rescan. Unknown keys, bad JSON, or a missing file all fall
-back silently to in-code defaults. Only the four keys listed above are
-honored — anything else is ignored.
+back silently to in-code defaults. Only the keys listed above are honored
+— anything else is ignored.
+
+Per-reviewer thinking level is supported via the `provider/id@level`
+suffix on each reviewer entry; bare entries use the model default:
+
+```bash
+cat > ~/.pi/agent/multi-review.json << 'EOF'
+{
+  "reviewers": [
+    "fireworks/accounts/fireworks/models/minimax-m3@xhigh",
+    "fireworks/accounts/fireworks/models/glm-5p2@high",
+    "fireworks/accounts/fireworks/models/kimi-k2p7"
+  ]
+}
+EOF
+```
+
+Allowed levels: `off | minimal | low | medium | high | xhigh`. If a model
+clams a level (e.g. `xhigh`→`high` on Fireworks), the notify surfaces it
+under "clamped" so you can spot it without guessing.
 
 ## 3. Verify the two surfaces
 
