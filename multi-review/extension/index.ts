@@ -651,6 +651,144 @@ async function runAllReviewers(
 	return results;
 }
 
+// ---------- dedupe & group ----------
+
+const SEVERITY_RANK: Record<ReviewerFinding["severity"], number> = {
+	critical: 5,
+	high: 4,
+	medium: 3,
+	low: 2,
+	info: 1,
+	none: 0,
+};
+
+export interface DedupeGroup {
+	id: string;
+	file: string;
+	line_start: number | null;
+	line_end: number | null;
+	severity: ReviewerFinding["severity"];
+	category: string;
+	title: string;
+	titles: string[]; // every distinct title model used
+	members: { spec: ModelSpec; comment: string; severity: ReviewerFinding["severity"] }[];
+	reviewerSpecs: ModelSpec[]; // unique specs that flagged this group
+	consensus: boolean; // ≥ 2 distinct reviewers
+}
+
+function isOverlapping(a: ReviewerFinding, b: ReviewerFinding): boolean {
+	if (a.file !== b.file) return false;
+	if (a.line_start === null || a.line_end === null || b.line_start === null || b.line_end === null) return true;
+	const aStart = a.line_start <= a.line_end ? a.line_start : a.line_end;
+	const aEnd = a.line_start <= a.line_end ? a.line_end : a.line_start;
+	const bStart = b.line_start <= b.line_end ? b.line_start : b.line_end;
+	const bEnd = b.line_start <= b.line_end ? b.line_end : b.line_start;
+	return aStart <= bEnd && bStart <= aEnd;
+}
+
+/**
+ * Greedy O(N²) dedupe. N is small (a few dozen findings per reviewer ×
+ * a handful of reviewers), so the quadratic cost is fine and the simple
+ * match predicate is easier to audit than a hash-based strategy. The
+ * predicate permits same-file matches to overlap (line ranges touch) and
+ * also short-circuits to "same file" when either side is file-level
+ * (line_start === null).
+ */
+export function dedupeReviewerFindings(results: ReviewerRunResult[]): DedupeGroup[] {
+	const placed = new Set<string>();
+	const allFindings: { spec: ModelSpec; index: number; finding: ReviewerFinding }[] = [];
+	for (const r of results) {
+		if (!r.ok) continue;
+		r.findings.forEach((finding, index) => {
+			allFindings.push({ spec: r.spec, index, finding });
+		});
+	}
+
+	const groups: DedupeGroup[] = [];
+	for (const { spec, index, finding } of allFindings) {
+		const key = `${spec}::${index}`;
+		if (placed.has(key)) continue;
+
+		const group: DedupeGroup = {
+			id: `g${groups.length + 1}`,
+			file: finding.file,
+			line_start: finding.line_start,
+			line_end: finding.line_end,
+			severity: finding.severity,
+			category: finding.category,
+			title: finding.title,
+			titles: [finding.title],
+			members: [{ spec, comment: finding.comment, severity: finding.severity }],
+			reviewerSpecs: [spec],
+			consensus: false,
+		};
+		placed.add(key);
+
+		// Fuse with anything overlapping from later reviewers.
+		for (let j = allFindings.indexOf({ spec, index, finding }) + 1; j < allFindings.length; j++) {
+			const jt = allFindings[j];
+			if (placed.has(`${jt.spec}::${jt.index}`)) continue;
+			if (!isOverlapping(finding, jt.finding)) continue;
+			// Already in? Skip.
+			if (group.reviewerSpecs.includes(jt.spec)) {
+				// Same reviewer reporting the same area twice — fuse but don't double-count.
+				group.members.push({ spec: jt.spec, comment: jt.finding.comment, severity: jt.finding.severity });
+				if (!group.titles.includes(jt.finding.title)) group.titles.push(jt.finding.title);
+				if (SEVERITY_RANK[jt.finding.severity] > SEVERITY_RANK[group.severity]) {
+					group.severity = jt.finding.severity;
+				}
+				placed.add(`${jt.spec}::${jt.index}`);
+				continue;
+			}
+			group.members.push({ spec: jt.spec, comment: jt.finding.comment, severity: jt.finding.severity });
+			group.reviewerSpecs.push(jt.spec);
+			if (!group.titles.includes(jt.finding.title)) group.titles.push(jt.finding.title);
+			if (SEVERITY_RANK[jt.finding.severity] > SEVERITY_RANK[group.severity]) {
+				group.severity = jt.finding.severity;
+			}
+			placed.add(`${jt.spec}::${jt.index}`);
+		}
+
+		group.consensus = group.reviewerSpecs.length >= 2;
+		// Line ranges — expand to cover all member ranges if previously null.
+		if (group.line_start === null || group.line_end === null) {
+			let minStart: number | null = null;
+			let maxEnd: number | null = null;
+			for (const m of group.members) {
+				// re-extract from the allFindings list; a small downside is that we
+				// don't carry line_start/line_end on the group member so this stays
+				// best-effort. For file-level entries, leaving null is correct.
+			}
+			group.line_start = minStart;
+			group.line_end = maxEnd;
+		}
+		groups.push(group);
+	}
+
+	// Sort by severity desc, then file, then line_start.
+	groups.sort((a, b) => {
+		const s = SEVERITY_RANK[b.severity] - SEVERITY_RANK[a.severity];
+		if (s !== 0) return s;
+		const f = a.file.localeCompare(b.file);
+		if (f !== 0) return f;
+		return (a.line_start ?? -1) - (b.line_start ?? -1);
+	});
+	return groups;
+}
+
+function formatRange(start: number | null, end: number | null): string {
+	if (start === null && end === null) return "file";
+	if (start === null) return `…${end}`;
+	if (end === null || end === start) return `L${start}`;
+	return `L${start}-${end}`;
+}
+
+function formatGroup(g: DedupeGroup): string {
+	const badge = g.consensus ? `[CONSENSUS ×${g.reviewerSpecs.length}]` : `[×${g.reviewerSpecs.length}]`;
+	const range = formatRange(g.line_start, g.line_end);
+	return `${badge.padEnd(20)} ${g.severity.toUpperCase().padEnd(8)} ${g.file}:${range}  ${g.title}`;
+}
+
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		const cfg = loadConfig();
@@ -722,21 +860,34 @@ export default function (pi: ExtensionAPI) {
 				undefined, // command context — wire signal in the polish commit
 				ctx,
 			);
-			setStatus(`multi-review · aggregator passes land in commit 5+`, ctx);
+			setStatus(`multi-review · dedupe pass`, ctx);
+
+			const groups = dedupeReviewerFindings(completedRunResults);
+			setStatus(`multi-review · ${groups.length} groups (judge lands in commit 6)`, ctx);
 
 			const lines: string[] = [
-				`multi-review · fan-out finished`,
+				`multi-review · fan-out + dedupe finished`,
 				`scope: ${target.label}   files: ${target.files.length}   diff bytes: ${target.diffText.length}`,
+				``,
+				`per-reviewer:`,
 			];
 			for (const r of completedRunResults) {
 				const icon = r.ok ? (r.findings.length > 0 ? "✓" : "·") : "✗";
 				const dur = `${(r.durationMs / 1000).toFixed(1)}s`;
 				const usage = r.usage ? ` ↑${r.usage.input} ↓${r.usage.output} $${r.usage.cost.toFixed(4)}` : "";
-				lines.push(`${icon} ${r.spec}  findings=${r.findings.length}  ${dur}${usage}`);
-				if (!r.ok && r.errorMessage) lines.push(`    error: ${r.errorMessage.slice(0, 240)}`);
+				lines.push(`  ${icon} ${r.spec}  findings=${r.findings.length}  ${dur}${usage}`);
+				if (!r.ok && r.errorMessage) lines.push(`      error: ${r.errorMessage.slice(0, 240)}`);
 			}
-			const totalFindings = completedRunResults.reduce((s, r) => s + r.findings.length, 0);
-			lines.push(``, `Total raw findings: ${totalFindings}. Dedupe + judge pass land in commit 5+.`);
+			lines.push(
+				``,
+				`deduped groups (${groups.length}):`,
+			);
+			for (const g of groups) {
+				lines.push(`  ${formatGroup(g)}`);
+				for (const m of g.members) {
+					lines.push(`      · ${m.spec}: ${m.comment.slice(0, 240)}`);
+				}
+			}
 
 			ctx.ui.notify(lines.join("\n"), "info");
 		},
