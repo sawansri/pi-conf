@@ -20,38 +20,60 @@ that you can expand/collapse with `Ctrl+O` like any other entry.
 | Slash command | `/multi-review` (use defaults) · `/multi-review 4321` (review PR #4321) · `/multi-review focus the diff in `src/auth/*`` (free-text focus) |
 | LLM-callable tool | The active agent can invoke `multi_review` when it decides a review would help — same params as the command. |
 
-## Design (sequenced commits during development)
+`/multi-review` registers argument autocompletion with a few example shapes
+(`#1234`, a PR URL, `focus: …`) so the call shape is discoverable without
+memorization.
 
-1. **Scaffold + design docs** — this commit.
-2. **Model pool & validation** — `multi-review.reviewers` and `multi-review.judge` settings
-   pointing at `provider/id` strings that already exist in `ctx.modelRegistry`.
-   Validation refuses to run if either pool is empty.
-3. **Slash-command arg parsing** — three input shapes: `[/multi-review]`,
-   `[/multi-review <pr-number>]`, `[/multi-review <free-text focus>]`.
-4. **Scope resolution** —
-   - PR number ⇒ `gh pr view <num> --json files,title,body,baseRefName,headRefName,url`
-     + `gh pr diff <num>` for the actual diff. Falls back to
-     `git diff <base>...HEAD` if `gh` is missing or the repo isn't GitHub.
-   - Free text ⇒ appended to the reviewer prompt as a focus hint. No review
-     scope is implied; you may want to point at specific hunks yourself.
-5. **Parallel fan-out** — `Promise.all` of `completeSimple()` per reviewer,
-   single shared prompt asking for JSON `[{file, line_start, line_end,
-   severity, category, comment}]`. Abort signal threaded from `ctx.signal`
-   so `Ctrl+C` cancels all in-flight.
-6. **Dedupe & group** — group findings by `file + overlapping line range`,
-   count how many of the configured reviewers flagged each group → "consensus"
-   badge when ≥ 2. Per-model labels stay attached so you can see who said what.
-7. **Judge pass** — one final `completeSimple()` call against the configured
-   judge model (default = currently active model). Prompt is the deduped
-   findings tree plus all reviewer→comment maps. Output is markdown with each
-   finding showing the severity, the file/line, the consensus count, and a
-   per-model attribution strip.
-8. **Render & wire-up** — inject the judge's output as a custom-typed session
-   entry via `pi.sendMessage({ customType: "multi-review", ... })` plus a
-   `pi.registerMessageRenderer()` that renders the entry with severity
-   colors, reviewer chips, and Ctrl+O collapsing.
-9. **Polish** — abort handling, defaults file, dry-run flag, edge cases on
-   parse failures.
+## Wire-up
+
+1. **Arg parsing** — three shapes: `[/multi-review]`, `[/multi-review <pr>]`,
+   `[/multi-review <free-text focus>]`. Accepts `#1234`, raw `1234`, and
+   `…/pull/1234` style URLs. Trailing prose after a PR number flows into
+   the focus hint so callers can combine shapes.
+
+2. **Scope resolution** —
+   - PR number ⇒ `gh pr view <num> --json title,body,files,baseRefName,headRefName,url`
+     + `gh pr diff <num>`. Falls back to
+     `git fetch origin pull/<num>/head:pr-<num>` + `git diff pr-<num>...HEAD`
+     when `gh` is missing or the repo isn't GitHub.
+   - Default (no args) ⇒ `git diff <upstream>...HEAD`, falling back through
+     `main` / `master` / `develop` / `origin/main` / `origin/master`, then
+     `git show HEAD` if all diffs are empty. Not-a-git-repo ⇒ scan with
+     `find`, excluding `node_modules`/`.git`/`dist`/`build`/`.next`/lockfiles.
+   - Free text ⇒ no diff; the focus hint becomes the user's directive and a
+     directory listing feeds reviewers enough scope to be useful.
+
+3. **Parallel fan-out** — `Promise.all` (capped by `multi-review.concurrency`,
+   max 16) of `completeSimple()` per reviewer in a single shared in-process
+   call. Abort signal threaded from the tool's `ctx.signal` so `Ctrl+C`
+   during an agent turn cancels every in-flight call. Fail-soft: a single
+   reviewer's parse/protocol crash doesn't abort the rest.
+
+4. **Structured prompt** — each reviewer is told to output ONLY a JSON
+   array `[{file, line_start, line_end, severity, category, title, comment}]`
+   with `severity ∈ {critical|high|medium|low|info|none}` and a free-form
+   short `category` label. Parser is tolerant of markdown fences and prose
+   wrap; finds the first `[` and last `]` before parsing.
+
+5. **Dedupe + group** — greedy O(N²) overlap matcher (same file + touching
+   lines OR either side file-level). Per-group carries the full per-model
+   attribution: `members[]` keep every spec's original comment, `titles[]`
+   collect distinct titles, `reviewerSpecs[]` feeds the consensus badge
+   (≥ 2 reviewers ⇒ CONSENSUS). Group severity escalates to the max of
+   members.
+
+6. **Judge pass** — single `completeSimple()` on the configured judge model
+   with maxTokens 8192 and temperature inherited from defaults. Output is
+   structured markdown: severity + title + file:line + category + per-reviewer
+   comment list + one-sentence "Judge's take". Reviews never merged silently:
+   when reviewers disagree, both comments appear.
+
+7. **Render + inject** — judges' markdown lands as a custom-typed session
+   entry (`pi.sendMessage({ customType: "multi-review", ... })`) so it lives
+   in the transcript, survives `/compact`, and shows under `/tree`. The
+   custom message renderer (`pi.registerMessageRenderer`) renders a compact
+   severity tally + per-finding brief in the collapsed view; expanded mode
+   (Ctrl+O) shows per-reviewer comments and the full markdown synthesis.
 
 ## Defaults file
 
@@ -72,13 +94,23 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
 }
 ```
 
-This file stays optional — if absent, the picker UI shows everything from
-`ctx.modelRegistry.getAvailable()` that resolves.
+This file stays optional — if absent, the extension warns on `/multi-review`
+and tells you the exact shape to drop. Unknown fields, wrong types, or
+malformed JSON all degrade silently to in-code defaults so the file is
+never load-bearing.
 
-## Out of scope
+## Out of scope (by design)
 
 - **Auto-apply suggestions.** Review outputs a description, not a fix.
-- **models.json modifications.** Per user requirement, the extension reads
-  the user's existing registry and never adds new entries.
-- **Provider pinning.** Pickers include any provider; Fireworks models show
-  up alongside Anthropic / OpenAI / Kimi / MiniMax / Z.AI.
+- **models.json modifications.** The extension reads `ctx.modelRegistry`
+  only; per the user requirement it never adds new entries or modifies
+  provider configuration.
+- **Provider pinning.** The reviewer pool is whatever you listed in
+  `multi-review.json`; pickers can include any provider that the
+  registry has API keys for (Fireworks, Kimi, MiniMax, Z.AI, Anthropic,
+  OpenAI, etc.).
+- **Sub-process sharding.** Following the `completeSimple()` in-process
+  pattern, not the `subagent`-style subprocess spawn. Single fire-time,
+  no per-reviewer tool sandbox.
+- **Interactive reviewer picker.** Empty pool currently just notifies.
+  A `ctx.ui.custom()` multi-select picker is a future polish item.

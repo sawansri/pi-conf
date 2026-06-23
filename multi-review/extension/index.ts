@@ -1,20 +1,25 @@
 /**
- * Multi-Review — fan-out code reviewer (DESIGN: ../README.md)
+ * Multi-Review — fan-out code reviewer (DESIGN: ../README.md · ../install.md)
  *
- * Commands registered:
+ * Surfaces:
  *   /multi-review [PR-number | free-text focus]
+ *   multi_review (tool) — same shape, agent-callable
  *
- * Persistent defaults: reads $PI_CODING_AGENT_DIR/multi-review.json once on
- * first access. Unknown fields, bad JSON, or missing file all fall back to
- * in-code defaults silently.
+ * Pipeline (shared by both):
+ *   parseReviewArgs → resolve pool + judge
+ *                     → buildReviewTarget (PR via gh, fallback to git fetch;
+ *                                          default-branch diff; or directory listing)
+ *                     → runAllReviewers (parallel completeSimple, capped at concurrency)
+ *                     → dedupeReviewerFindings (greedy overlap, consensus badge)
+ *                     → runJudge (single completeSimple on configured judge)
+ *                     → pi.sendMessage({ customType: "multi-review", … })
+ *                     → pi.registerMessageRenderer collapses/expands it in TUI
  *
- * Status + display: session_start notifies with the resolved reviewer pool
- * size; the same info appears as a footer status. Each command run pushes
- * live status ('resolving scope…' → 'target=…' → etc) so Ctrl+C is visible.
+ * Persistent defaults: $PI_CODING_AGENT_DIR/multi-review.json loaded once,
+ * unknown keys / bad JSON / missing file → silent in-code defaults.
  *
- * Status of this commit: scope resolution lands here (PR via gh+git fallback,
- * default-branch diff, free-text). Parallel fan-out + structured prompt,
- * dedupe, judge pass, and chat-render still land in subsequent commits.
+ * Constraint enforced throughout: this extension never writes to
+ * ~/.pi/agent/models.json. It only reads ctx.modelRegistry.
  */
 
 import * as fs from "node:fs";
@@ -1044,11 +1049,19 @@ function renderMultiReviewMessage(
  * Centralizes the ordering (pool → judge check → scope → fan-out → dedupe →
  * judge → inject/notify) so the only thing that differs between the two
  * surfaces is how the result surfaces.
+ *
+ * `signal`: pass `ctx.signal` when called from a tool execution (defined
+ * during active turns) so that Ctrl+C and model_call aborts cancel all
+ * in-flight reviewer and judge requests. Slash commands fire outside an
+ * active turn so ctx.signal is undefined there — we degrade to no abort
+ * instead of synthesizing a fake signal so the user gets to see partial
+ * results rather than a recall race.
  */
 async function runMultiReviewFromArgs(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	rawArgs: string,
+	signal: AbortSignal | undefined,
 ): Promise<MultiReviewRunResult> {
 	const cfg = loadConfig();
 	const judge = resolveJudge(ctx, cfg);
@@ -1099,7 +1112,7 @@ async function runMultiReviewFromArgs(
 		userPrompt,
 		cfg.concurrency,
 		cfg.temperature,
-		undefined, // command context — future polish wires ctx.signal here
+		signal,
 		ctx,
 	);
 	setStatus(`multi-review · dedupe pass`, ctx);
@@ -1108,7 +1121,7 @@ async function runMultiReviewFromArgs(
 	setStatus(`multi-review · ${groups.length} groups · invoking judge ${cfg.judge}`, ctx);
 
 	const failedSpecs = completedRunResults.filter((r) => !r.ok).map((r) => r.spec);
-	const judgeResult = await runJudge(judge, groups, target, failedSpecs, ctx, undefined, cfg.temperature);
+	const judgeResult = await runJudge(judge, groups, target, failedSpecs, ctx, signal, cfg.temperature);
 	setStatus(`multi-review · done`, ctx);
 
 	const details: MultiReviewDetails = {
@@ -1154,8 +1167,20 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Fan-out code review across configured models. Usage: " +
 			"/multi-review [PR-number | free-text focus].",
+		// Argument autocomplete hints the call shape so users don't have to
+		// remember to type '#' vs raw digits.
+		getArgumentCompletions: (_prefix): Array<{ value: string; label: string; description?: string }> | null => [
+			{ value: "", label: "(default)", description: "review current cwd's diff vs main/master" },
+			{ value: "#1234", label: "#1234", description: "review PR #1234" },
+			{ value: "https://github.com/owner/repo/pull/1234", label: "PR URL", description: "extract number from URL" },
+			{ value: "focus: ", label: "focus: <text>", description: "free-text focus hint, no PR" },
+		],
 		handler: async (args, ctx) => {
-			const result = await runMultiReviewFromArgs(pi, ctx, args);
+			// Slash commands fire outside active turns, so ctx.signal is
+			// undefined; we pass undefined and accept that the user can't
+			// hard-cancel mid-fan-out from here. The tool surface (next
+			// sibling) does pass signal — ctrl+c in tool context works.
+			const result = await runMultiReviewFromArgs(pi, ctx, args, undefined);
 			ctx.ui.notify(result.notifyMessage, result.notifyLevel);
 			if (result.injectMessage) {
 				pi.sendMessage({ ...result.injectMessage, display: true });
@@ -1192,11 +1217,11 @@ export default function (pi: ExtensionAPI) {
 				maxLength: 2000,
 			})),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const parts: string[] = [];
 			if (typeof params.pr_number === "number") parts.push(String(params.pr_number));
 			if (typeof params.focus === "string" && params.focus.trim()) parts.push(params.focus.trim());
-			const result = await runMultiReviewFromArgs(pi, ctx, parts.join(" "));
+			const result = await runMultiReviewFromArgs(pi, ctx, parts.join(" "), signal);
 			ctx.ui.notify(result.notifyMessage, result.notifyLevel);
 			if (!result.injectMessage) {
 				return {
