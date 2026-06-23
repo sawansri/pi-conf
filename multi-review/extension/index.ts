@@ -23,9 +23,25 @@ import type { ExtensionAPI, ExtensionContext, ExecResult } from "@mariozechner/p
 import type { Model } from "@mariozechner/pi-ai";
 import { getAgentDir, getMarkdownTheme } from "@mariozechner/pi-coding-agent";
 import { Box, Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
+import { Type } from "typebox";
 
 /** Provider/model-id pair as written in the defaults file and the picker. */
 export type ModelSpec = `${string}/${string}`;
+
+/**
+ * Output of runMultiReviewFromArgs. Tool surface returns it; slash command
+ * uses notify unless explicitly told to stay silent (we don't, today).
+ */
+export interface MultiReviewRunResult {
+	kind: "inject" | "notify";
+	notifyMessage: string;
+	notifyLevel: "info" | "warning" | "error";
+	injectMessage?: {
+		customType: "multi-review";
+		content: string;
+		details: MultiReviewDetails;
+	};
+}
 
 /** Per-reviewer input that survives a /reload (saved via pi.appendEntry). */
 export interface MultiReviewConfig {
@@ -1023,6 +1039,105 @@ function renderMultiReviewMessage(
 	}
 
 	return box;
+/**
+ * Shared entry point used by both `/multi-review` and the `multi_review` tool.
+ * Centralizes the ordering (pool → judge check → scope → fan-out → dedupe →
+ * judge → inject/notify) so the only thing that differs between the two
+ * surfaces is how the result surfaces.
+ */
+async function runMultiReviewFromArgs(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	rawArgs: string,
+): Promise<MultiReviewRunResult> {
+	const cfg = loadConfig();
+	const judge = resolveJudge(ctx, cfg);
+
+	if (cfg.reviewers.length === 0) {
+		return {
+			kind: "notify",
+			notifyMessage:
+				"multi-review: no reviewers configured.\n\n" +
+				`Drop a "$PI_CODING_AGENT_DIR/multi-review.json" like:\n` +
+				`  { "reviewers": ["fireworks/.../model-a", "fireworks/.../model-b"], "judge": "fireworks/.../judge" }\n` +
+				`Then /reload.\n\nArgs: ${rawArgs.trim() || "(none)"}`,
+			notifyLevel: "warning",
+		};
+	}
+
+	const pool = await resolveReviewerPool(ctx, cfg);
+	if (!pool) {
+		return {
+			kind: "notify",
+			notifyMessage:
+				`multi-review: none of the configured reviewers resolved.\n` +
+				describeResolved([], cfg.reviewers) +
+				`\nArgs: ${rawArgs.trim() || "(none)"}`,
+			notifyLevel: "error",
+		};
+	}
+	if (!judge) {
+		return {
+			kind: "notify",
+			notifyMessage:
+				`multi-review: judge model missing in registry: ${cfg.judge}\n` +
+				`Add it to ~/.pi/agent/models.json (or /login) and /reload.\n` +
+				`\nArgs: ${rawArgs.trim() || "(none)"}`,
+			notifyLevel: "error",
+		};
+	}
+
+	const parsed = parseReviewArgs(rawArgs);
+	setStatus(`multi-review · resolving scope…`, ctx);
+	const target = await buildReviewTarget(pi, parsed, ctx.cwd);
+	const userPrompt = buildReviewUserPrompt(target);
+
+	setStatus(`multi-review · fanning out to ${pool.resolved.length} reviewers (cap ${cfg.concurrency})`, ctx);
+	const completedRunResults = await runAllReviewers(
+		pool.resolved,
+		REVIEWER_SYSTEM_PROMPT,
+		userPrompt,
+		cfg.concurrency,
+		cfg.temperature,
+		undefined, // command context — future polish wires ctx.signal here
+		ctx,
+	);
+	setStatus(`multi-review · dedupe pass`, ctx);
+
+	const groups = dedupeReviewerFindings(completedRunResults);
+	setStatus(`multi-review · ${groups.length} groups · invoking judge ${cfg.judge}`, ctx);
+
+	const failedSpecs = completedRunResults.filter((r) => !r.ok).map((r) => r.spec);
+	const judgeResult = await runJudge(judge, groups, target, failedSpecs, ctx, undefined, cfg.temperature);
+	setStatus(`multi-review · done`, ctx);
+
+	const details: MultiReviewDetails = {
+		target,
+		groups,
+		reviewerSpecs: completedRunResults.map((r) => r.spec),
+		failedSpecs,
+		judge: cfg.judge,
+		judgeDurationMs: judgeResult.durationMs,
+		judgeUsage: judgeResult.usage,
+		consensusCount: groups.filter((g) => g.consensus).length,
+		totalFindings: groups.reduce((s, g) => s + g.members.length, 0),
+	};
+
+	return {
+		kind: "inject",
+		notifyMessage:
+			`multi-review · done — review injected into chat\n` +
+			`scope: ${target.label}   files: ${target.files.length}   diff bytes: ${target.diffText.length}\n` +
+			`judge: ${cfg.judge}   (${(judgeResult.durationMs / 1000).toFixed(1)}s${judgeResult.usage ? `, $${judgeResult.usage.cost.toFixed(4)}` : ""})\n` +
+			`reviewers: ${completedRunResults.length}   dedupe groups: ${groups.length}   consensus: ${details.consensusCount}\n` +
+			`Press Ctrl+O on the chat entry to expand per-model attribution + full judge markdown.`,
+		notifyLevel: "info",
+		injectMessage: {
+			customType: "multi-review",
+			content: judgeResult.markdown,
+			details,
+		},
+	};
 }
 
 export default function (pi: ExtensionAPI) {
@@ -1034,106 +1149,71 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerMessageRenderer("multi-review", renderMultiReviewMessage as unknown as Parameters<ExtensionAPI["registerMessageRenderer"]>[1]);
 
+	// Slash command — surface-level UI entry point.
 	pi.registerCommand("multi-review", {
 		description:
 			"Fan-out code review across configured models. Usage: " +
-			"/multi-review [PR-number | free-text focus]. " +
-			"Subsequent commits wire in fan-out, dedupe, judge, render.",
+			"/multi-review [PR-number | free-text focus].",
 		handler: async (args, ctx) => {
-			const cfg = loadConfig();
-			const judge = resolveJudge(ctx, cfg);
-			setStatus(
-				`multi-review · ${cfg.reviewers.length} cfg / ${judge ? "judge=ok" : "judge=MISSING"}`,
-				ctx,
-			);
-
-			if (cfg.reviewers.length === 0) {
-				ctx.ui.notify(
-					"multi-review: no reviewers configured.\n\n" +
-						`Drop a "$PI_CODING_AGENT_DIR/multi-review.json" like:\n` +
-						`  { "reviewers": ["fireworks/.../model-a", "fireworks/.../model-b"], "judge": "fireworks/.../judge" }\n` +
-						`Then /reload.\n\nArgs: ${args.trim() || "(none)"}`,
-					"warning",
-				);
-				return;
+			const result = await runMultiReviewFromArgs(pi, ctx, args);
+			ctx.ui.notify(result.notifyMessage, result.notifyLevel);
+			if (result.injectMessage) {
+				pi.sendMessage({ ...result.injectMessage, display: true });
 			}
+		},
+	});
 
-			const pool = await resolveReviewerPool(ctx, cfg);
-			if (!pool) {
-				ctx.ui.notify(
-					`multi-review: none of the configured reviewers resolved.\n` +
-						describeResolved([], cfg.reviewers) +
-						`\nArgs: ${args.trim() || "(none)"}`,
-					"error",
-				);
-				return;
+	// LLM-callable tool — agent-driven UI entry point.
+	pi.registerTool({
+		name: "multi_review",
+		label: "Multi-Model Code Review",
+		description:
+			"Fan-out a code review to N configured reviewer models in parallel and have a judge " +
+			"synthesize the findings. Use when the user asks for a review, asks to double-check " +
+			"edits, or asks for a second opinion across models. Result lands in chat as a " +
+			"collapsible entry with per-model attribution. Same shape as `/multi-review`.",
+		promptSnippet:
+			"Run a multi-model code review on the current scope (PR, default-branch diff, or focus text).",
+		promptGuidelines: [
+			"Use multi_review when the user asks for a code review, wants another set of eyes, or asks for a security/perf/correctness check by name.",
+			"Pass either pr_number (numeric, no '#') or focus (free-text). Both can be combined.",
+			"Do NOT use multi_review to read or summarize a single file — use the read tool for that.",
+			"Do NOT use multi_review to write or edit code — it's read-only and returns findings attributed to each model.",
+		],
+		parameters: Type.Object({
+			pr_number: Type.Optional(Type.Number({
+				description: "PR number to review (e.g. 4321 from a GitHub PR URL).",
+				minimum: 0,
+			})),
+			focus: Type.Optional(Type.String({
+				description:
+					"Free-text hint about what to focus on. Examples: 'the auth/ subdirectory', " +
+					"'error handling in the diff', 'concurrency in the new code'.",
+				maxLength: 2000,
+			})),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const parts: string[] = [];
+			if (typeof params.pr_number === "number") parts.push(String(params.pr_number));
+			if (typeof params.focus === "string" && params.focus.trim()) parts.push(params.focus.trim());
+			const result = await runMultiReviewFromArgs(pi, ctx, parts.join(" "));
+			ctx.ui.notify(result.notifyMessage, result.notifyLevel);
+			if (!result.injectMessage) {
+				return {
+					content: [{ type: "text", text: result.notifyMessage }],
+					details: { ok: false, notifyLevel: result.notifyLevel },
+				};
 			}
-			if (!judge) {
-				ctx.ui.notify(
-					`multi-review: judge model missing in registry: ${cfg.judge}\n` +
-						`Add it to ~/.pi/agent/models.json (or /login) and /reload.\n` +
-						`Args: ${args.trim() || "(none)"}`,
-					"error",
-				);
-				return;
-			}
-
-			const parsed = parseReviewArgs(args);
-			setStatus(`multi-review · resolving scope…`, ctx);
-			const target = await buildReviewTarget(pi, parsed, ctx.cwd);
-			setStatus(`multi-review · target=${target.label}`, ctx);
-
-			// Build the shared reviewer-side prompt once.
-			const userPrompt = buildReviewUserPrompt(target);
-
-			// Progress notifies the user; final summarize wrapped here until
-			// dedupe + judge land in subsequent commits.
-			setStatus(`multi-review · fanning out to ${pool.resolved.length} reviewers (cap ${cfg.concurrency})`, ctx);
-			const completedRunResults = await runAllReviewers(
-				pool.resolved,
-				REVIEWER_SYSTEM_PROMPT,
-				userPrompt,
-				cfg.concurrency,
-				cfg.temperature,
-				undefined, // command context — wire signal in the polish commit
-				ctx,
-			);
-			setStatus(`multi-review · dedupe pass`, ctx);
-
-			const groups = dedupeReviewerFindings(completedRunResults);
-			setStatus(`multi-review · ${groups.length} groups · invoking judge ${cfg.judge}`, ctx);
-
-			const failedSpecs = completedRunResults.filter((r) => !r.ok).map((r) => r.spec);
-			const judgeResult = await runJudge(judge!, groups, target, failedSpecs, ctx, undefined, cfg.temperature);
-			setStatus(`multi-review · judge finished (${(judgeResult.durationMs / 1000).toFixed(1)}s)`, ctx);
-
-			const lines: string[] = [
-				`multi-review · done — review injected into chat`,
-				`scope: ${target.label}   files: ${target.files.length}   diff bytes: ${target.diffText.length}`,
-				`judge: ${cfg.judge}   (${(judgeResult.durationMs / 1000).toFixed(1)}s${judgeResult.usage ? `, $${judgeResult.usage.cost.toFixed(4)}` : ""})`,
-				`reviewers: ${completedRunResults.length}   dedupe groups: ${groups.length}   consensus: ${groups.filter((g) => g.consensus).length}`,
-				`Press Ctrl+O on the chat entry to expand the per-model attribution + full judge markdown.`,
-			];
-			ctx.ui.notify(lines.join("\n"), "info");
-
-			// Inject the synthesis as a custom-typed message so it lives in the
-			// session transcript and renders through pi.registerMessageRenderer.
-			pi.sendMessage({
-				customType: "multi-review",
-				content: judgeResult.markdown,
-				display: true,
-				details: {
-					target,
-					groups,
-					reviewerSpecs: completedRunResults.map((r) => r.spec),
-					failedSpecs: completedRunResults.filter((r) => !r.ok).map((r) => r.spec),
-					judge: cfg.judge,
-					judgeDurationMs: judgeResult.durationMs,
-					judgeUsage: judgeResult.usage,
-					consensusCount: groups.filter((g) => g.consensus).length,
-					totalFindings: groups.reduce((s, g) => s + g.members.length, 0),
-				} as MultiReviewDetails,
-			});
+			// Inject the synthesized review as a session message so the chat
+			// transcript is the canonical record (not just a tool result entry).
+			pi.sendMessage({ ...result.injectMessage, display: true });
+			const summary = `Multi-model review injected: ${result.injectMessage.details.groups.length} groups, ` +
+				`${result.injectMessage.details.consensusCount} consensus. ` +
+				`See chat for per-model attribution.`;
+			return {
+				content: [{ type: "text", text: summary }],
+				details: { ok: true, ...result.injectMessage.details },
+			};
 		},
 	});
 }
