@@ -127,6 +127,8 @@ multi-review · done
 | `git fetch origin pull/N/head failed` | Network or auth problem in the git remote; try running fetch by hand |
 | `gh pr view failed` | Either missing `gh`, unauthed, or repo isn't GitHub'd; we silently fall back to `git fetch`+`git diff` |
 | Judge output truncated | Most judges cap at 4-8k output tokens; trim your reviewer pool or lower judge maxTokens ask |
+| Directory listing empty in free-text mode | Either nothing tracked + nothing non-ignored-added by git, or all paths matched gitignore. Run `git ls-files --others --exclude-standard` in the project to see what we'd find. |
+| `.gitignore` patterns not honored | We support `*`/`?`/`[…]`/`**`/leading-`/`/trailing-`/`/`!` negation. No `{a,b}` alternation or extglob. Files that need deeper .gitignore features should be reviewed with `git` directly. |
 
 ## Uninstall
 

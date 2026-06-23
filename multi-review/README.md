@@ -46,9 +46,20 @@ override, never touches the file).
    - Default (no args) ⇒ `git diff <upstream>...HEAD`, falling back through
      `main` / `master` / `develop` / `origin/main` / `origin/master`, then
      `git show HEAD` if all diffs are empty. Not-a-git-repo ⇒ scan with
-     `find`, excluding `node_modules`/`.git`/`dist`/`build`/`.next`/lockfiles.
+     `discoverSourceFiles()` below.
    - Free text ⇒ no diff; the focus hint becomes the user's directive and a
      directory listing feeds reviewers enough scope to be useful.
+
+`discoverSourceFiles()` is shared by both default-mode and free-text-mode
+fallbacks. Strategy 1: `git ls-files --cached --others --exclude-standard -z`
+(native gitignore handling for repos). Strategy 2 (fallback when git
+isn't present or cwd isn't a repo): iterative DFS bounded at depth 12 and
+200k entries, hard-excluding `.git`/`node_modules`/`dist`/`build`/
+`.next`/`target`/`.cache`/`.turbo`/`coverage`/`.venv`/`__pycache__`, then
+applying every .gitignore found along each candidate's ancestry. The
+gitignore parser implements `*`, `?`, `[abc]`, `**/x`, `x/**`, leading-`/`
+anchoring, trailing-`/` directory-only, and `!` negation. No alternation or
+extglob — documented limitation.
 
 3. **Parallel fan-out** — `Promise.all` (capped by `multi-review.concurrency`,
    max 16) of `completeSimple()` per reviewer in a single shared in-process
