@@ -415,6 +415,242 @@ export async function buildReviewTarget(pi: ExtensionAPI, parsed: ParsedReviewAr
 	return buildTextTarget(pi, cwd, parsed.value);
 }
 
+// ---------- parallel fan-out ----------
+
+/**
+ * One finding produced by a single reviewer. The fields are deliberately
+ * permissive (line_start/line_end are nullable when the model picks a wider
+ * area than a single hunk) so a future free-form finding doesn't blow up
+ * the parser. Categories are free-form short labels (correctness / security /
+ * perf / style / docs / api-design) so the dedupe pass can group without
+ * caring about taxonomy.
+ */
+export interface ReviewerFinding {
+	file: string;
+	line_start: number | null;
+	line_end: number | null;
+	severity: "critical" | "high" | "medium" | "low" | "info" | "none";
+	category: string;
+	title: string;
+	comment: string;
+}
+
+export interface ReviewerRunResult {
+	spec: ModelSpec;
+	model: Model;
+	ok: boolean;
+	findings: ReviewerFinding[];
+	rawText: string;
+	stopReason: string;
+	errorMessage?: string;
+	usage?: { input: number; output: number; total: number; cost: number };
+	durationMs: number;
+}
+
+const REVIEWER_SYSTEM_PROMPT = `You are a senior code reviewer. Read the diff and the optional focus hint, then output ONLY a JSON array.
+
+Schema:
+[
+  {
+    "file": "relative/path/from/repo/root",
+    "line_start": <int|null>,
+    "line_end": <int|null>,
+    "severity": "critical"|"high"|"medium"|"low"|"info"|"none",
+    "category": "correctness"|"security"|"perf"|"style"|"docs"|"api-design"|"<short free-form label>",
+    "title": "<short, ≤80 chars>",
+    "comment": "<one paragraph explanation, ≤400 chars>"
+  }
+]
+
+Rules:
+- Output ONLY the JSON array. No prose, no markdown fences unless you must.
+- If you see no problems, output []. Do not pad.
+- Prefer one finding per concrete issue; do not bundle a file's worth of small things into one entry.
+- line_start/line_end should match the diff's "++ b/path" hunk (line numbers AFTER the change, not before).
+- If the diff is not a git diff but a directory listing, comment at the file level only and leave line_start/line_end null.
+- Severity: critical (security vulns, data loss), high (correctness bugs, race conditions), medium (perf cliffs, panic-on-bad-input), low (subtle), info (style, docs).`;
+
+/**
+ * Build the reviewer-side user prompt from a target. We truncate the diff
+ * conservatively because some reviewers have short context managers — the
+ * prompt keeps the head of the diff where hunk headers live and ditches the
+ * rest after a generous budget. Reviewers with larger windows still see the
+ * full diff.
+ */
+const DIFF_BUDGET_CHARS = 200_000; // ~50k tokens worst case
+function buildReviewUserPrompt(target: ReviewTarget): string {
+	const chunks: string[] = [];
+	if (target.metaLines.length > 0) {
+		chunks.push("## Context");
+		chunks.push(...target.metaLines);
+		chunks.push("");
+	}
+	if (target.diffText) {
+		const diff = target.diffText.length > DIFF_BUDGET_CHARS
+			? target.diffText.slice(0, DIFF_BUDGET_CHARS) +
+				`\n…(diff truncated to ${DIFF_BUDGET_CHARS} chars; ${target.diffText.length} total)\n`
+			: target.diffText;
+		chunks.push("## Diff");
+		chunks.push(diff);
+		chunks.push("");
+	} else if (target.files.length > 0) {
+		chunks.push("## Files in scope (no diff; review at the file level)");
+		for (const f of target.files) chunks.push(`- ${f.path}`);
+		chunks.push("");
+	}
+	if (target.focusHint) {
+		chunks.push("## Focus hint from caller");
+		chunks.push(target.focusHint);
+		chunks.push("");
+	}
+	chunks.push("Reminder: output ONLY the JSON array per the schema in the system prompt.");
+	return chunks.join("\n");
+}
+
+/**
+ * Strip a JSON-array-shaped response from any junk the model wraps around it.
+ * Some models — especially Fireworks-hosted ones — sometimes honor the
+ * 'ONLY JSON' rule by wrapping in a ```json fence. This is tolerant of both.
+ */
+function parseReviewerJson(rawText: string): ReviewerFinding[] {
+	const text = rawText.trim();
+	// Strip leading/trailing fences if present.
+	const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+	const inner = fenceMatch ? fenceMatch[1] : text;
+	// Find first '[' and last ']' to ignore any wrapper text.
+	const start = inner.indexOf("[");
+	const end = inner.lastIndexOf("]");
+	if (start === -1 || end === -1 || end <= start) return [];
+	const slice = inner.slice(start, end + 1);
+	const parsed = JSON.parse(slice);
+	if (!Array.isArray(parsed)) return [];
+	const findings: ReviewerFinding[] = [];
+	for (const item of parsed) {
+		if (!item || typeof item !== "object") continue;
+		const f = item as Partial<ReviewerFinding>;
+		const lineStart = typeof f.line_start === "number" && Number.isFinite(f.line_start) ? Math.floor(f.line_start) : null;
+		const lineEnd = typeof f.line_end === "number" && Number.isFinite(f.line_end) ? Math.floor(f.line_end) : null;
+		const severityCandidate = String(f.severity ?? "info").toLowerCase();
+		const severity: ReviewerFinding["severity"] = ["critical", "high", "medium", "low", "info", "none"].includes(severityCandidate)
+			? (severityCandidate as ReviewerFinding["severity"])
+			: "info";
+		const category = String(f.category ?? "general").slice(0, 32).toLowerCase().replace(/[^a-z0-9-]+/g, "-") || "general";
+		const title = String(f.title ?? "(untitled)").slice(0, 200);
+		const comment = String(f.comment ?? "").slice(0, 2000);
+		const filePath = String(f.file ?? "").trim();
+		if (!filePath) continue;
+		findings.push({ file: filePath, line_start: lineStart, line_end: lineEnd, severity, category, title, comment });
+	}
+	return findings;
+}
+
+async function runReviewer(
+	model: Model,
+	ctx: ExtensionContext,
+	systemPrompt: string,
+	userPrompt: string,
+	temperature: number,
+	abortSignal: AbortSignal | undefined,
+): Promise<Omit<ReviewerRunResult, "spec">> {
+	const started = Date.now();
+	const { completeSimple } = await import("@mariozechner/pi-ai");
+	const response = await completeSimple(
+		model,
+		{ systemPrompt, messages: [{ role: "user", content: [{ type: "text", text: userPrompt }] }] },
+		{ signal: abortSignal, temperature, maxTokens: 4096 },
+	);
+	const text = response.content
+		.filter((c) => c.type === "text")
+		.map((c) => (c as { type: "text"; text: string }).text)
+		.join("");
+	let findings: ReviewerFinding[] = [];
+	let ok = true;
+	let errorMessage: string | undefined;
+	try {
+		findings = parseReviewerJson(text);
+	} catch (err) {
+		ok = false;
+		errorMessage = `json-parse: ${err instanceof Error ? err.message : String(err)}`;
+	}
+	return {
+		model,
+		ok,
+		findings,
+		rawText: text,
+		stopReason: response.stopReason,
+		errorMessage,
+		usage: response.usage
+			? {
+				input: response.usage.input,
+				output: response.usage.output,
+				total: response.usage.totalTokens,
+				cost: response.usage.cost?.total ?? 0,
+			}
+			: undefined,
+		durationMs: Date.now() - started,
+	};
+}
+
+const MAX_PARALLEL = 16;
+
+/**
+ * Run every reviewer model against the same prompt with a concurrency cap.
+ * Use fail-soft: a single model crashing or producing unparseable JSON
+ * never aborts the rest of the fan-out. The Promise.all over per-slot promise
+ * arrays gives us the cap without a custom queue.
+ */
+async function runAllReviewers(
+	resolved: { spec: ModelSpec; model: Model }[],
+	systemPrompt: string,
+	userPrompt: string,
+	concurrency: number,
+	temperature: number,
+	abortSignal: AbortSignal | undefined,
+	ctx: ExtensionContext,
+	onProgress?: (done: number, total: number, latest: ReviewerRunResult) => void,
+): Promise<ReviewerRunResult[]> {
+	const cap = Math.max(1, Math.min(MAX_PARALLEL, concurrency, resolved.length));
+	const results: ReviewerRunResult[] = [];
+	let cursor = 0;
+	let done = 0;
+	const total = resolved.length;
+
+	// Worker slot: pulls next reviewer, runs, stores result. We launch `cap`
+	// workers up front; each races to grab via the shared cursor.
+	const worker = async (): Promise<void> => {
+		while (true) {
+			if (abortSignal?.aborted) return;
+			const idx = cursor++;
+			if (idx >= resolved.length) return;
+			const slot = resolved[idx];
+			try {
+				const partial = await runReviewer(slot.model, ctx, systemPrompt, userPrompt, temperature, abortSignal);
+				const full: ReviewerRunResult = { spec: slot.spec, ...partial };
+				results[idx] = full;
+				done++;
+				onProgress?.(done, total, full);
+			} catch (err) {
+				const full: ReviewerRunResult = {
+					spec: slot.spec,
+					model: slot.model,
+					ok: false,
+					findings: [],
+					rawText: "",
+					stopReason: "error",
+					errorMessage: err instanceof Error ? err.message : String(err),
+					durationMs: 0,
+				};
+				results[idx] = full;
+				done++;
+				onProgress?.(done, total, full);
+			}
+		}
+	};
+
+	await Promise.all(Array.from({ length: cap }, () => worker()));
+	return results;
+}
+
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		const cfg = loadConfig();
@@ -471,27 +707,38 @@ export default function (pi: ExtensionAPI) {
 			const target = await buildReviewTarget(pi, parsed, ctx.cwd);
 			setStatus(`multi-review · target=${target.label}`, ctx);
 
-			const lines: string[] = [
-				`multi-review · scope resolved`,
-				`kind: ${target.kind}   label: ${target.label}`,
-				`files: ${target.files.length}   diff bytes: ${target.diffText.length}`,
-				`--- meta ---`,
-				...target.metaLines,
-			];
-			if (target.warnings.length > 0) {
-				lines.push(`--- warnings ---`);
-				for (const w of target.warnings) lines.push(`! ${w}`);
-			}
-			if (target.kind === "pr" || target.kind === "default") {
-				lines.push(
-					``,
-					`--- first 600 chars of diff ---`,
-					target.diffText.slice(0, 600) + (target.diffText.length > 600 ? "…" : ""),
-				);
-			}
-			lines.push(``, `Parallel fan-out + dedupe + judge land in commit 4+.`);
+			// Build the shared reviewer-side prompt once.
+			const userPrompt = buildReviewUserPrompt(target);
 
-			ctx.ui.notify(lines.join("\n"), target.warnings.length > 0 ? "warning" : "info");
+			// Progress notifies the user; final summarize wrapped here until
+			// dedupe + judge land in subsequent commits.
+			setStatus(`multi-review · fanning out to ${pool.resolved.length} reviewers (cap ${cfg.concurrency})`, ctx);
+			const completedRunResults = await runAllReviewers(
+				pool.resolved,
+				REVIEWER_SYSTEM_PROMPT,
+				userPrompt,
+				cfg.concurrency,
+				cfg.temperature,
+				undefined, // command context — wire signal in the polish commit
+				ctx,
+			);
+			setStatus(`multi-review · aggregator passes land in commit 5+`, ctx);
+
+			const lines: string[] = [
+				`multi-review · fan-out finished`,
+				`scope: ${target.label}   files: ${target.files.length}   diff bytes: ${target.diffText.length}`,
+			];
+			for (const r of completedRunResults) {
+				const icon = r.ok ? (r.findings.length > 0 ? "✓" : "·") : "✗";
+				const dur = `${(r.durationMs / 1000).toFixed(1)}s`;
+				const usage = r.usage ? ` ↑${r.usage.input} ↓${r.usage.output} $${r.usage.cost.toFixed(4)}` : "";
+				lines.push(`${icon} ${r.spec}  findings=${r.findings.length}  ${dur}${usage}`);
+				if (!r.ok && r.errorMessage) lines.push(`    error: ${r.errorMessage.slice(0, 240)}`);
+			}
+			const totalFindings = completedRunResults.reduce((s, r) => s + r.findings.length, 0);
+			lines.push(``, `Total raw findings: ${totalFindings}. Dedupe + judge pass land in commit 5+.`);
+
+			ctx.ui.notify(lines.join("\n"), "info");
 		},
 	});
 }
