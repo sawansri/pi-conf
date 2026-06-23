@@ -17,19 +17,42 @@ that you can expand/collapse with `Ctrl+O` like any other entry.
 
 | Surface | How |
 |---------|-----|
-| Slash command | `/multi-review` (use defaults) · `/multi-review 4321` (review PR #4321) · `/multi-review focus the diff in `src/auth/*`` (free-text focus) |
+| Slash command | `/multi-review [--mode=balanced\|light\|triage] [PR-number \| free-text focus]` |
 | Slash command | `/multi-review-pick` — open the multi-select TUI picker to choose reviewer models from your registry (with optional persist-to-`multi-review.json`) |
-| LLM-callable tool | The active agent can invoke `multi_review` when it decides a review would help — same params as the command. |
+| LLM-callable tool | The active agent can invoke `multi_review({pr_number?, focus?, mode?})` when it decides a review would help |
 
 `/multi-review` registers argument autocompletion with a few example shapes
-(`#1234`, a PR URL, `focus: …`) so the call shape is discoverable without
-memorization.
+(`#1234`, a PR URL, `focus: …`, `--mode=...`) so the call shape is
+discoverable without memorization.
 
 If the configured reviewer pool is empty AND the agent has UI access,
 `/multi-review` opens the picker as a fallback so the user can set up the
 pool without leaving the active review. The user can opt to persist the
 choice (`/multi-review.json`) or use it for the current run only (transient
 override, never touches the file).
+
+## Review modes
+
+The run shape varies by `mode`. Set the default via `multi-review.mode` in
+the defaults file, override per-run with `--mode=X` on the slash command or
+the `mode` parameter on the `multi_review` tool.
+
+| Mode | What it does | When to use | Cost |
+|------|-------------|-----------|------|
+| `balanced` *(default)* | N reviewers structured prompt → dedupe → 1 judge synthesis markdown | Default: full review where the synthesis quality matters | ~1× baseline |
+| `light` | N reviewers structured prompt → dedupe → markdown synthesized directly from groups (no judge call) | Trust the per-model attribution; want speed / lower cost | ~0.5× (no judge) |
+| `triage` | N reviewers with verdict prompt (`escalate: bool`, `files_to_escalate`, `reasoning`). If ≥ `multi-review.triageEscalationThreshold` reviewers say escalate, automatically re-runs balanced on a follow-up target scoped to those files. | Big diffs where most areas are noise; you want a cheap first pass | ~0.4× (no escalate) to ~1.4× (deep) |
+
+Sample triage verdict from a reviewer:
+```json
+{"escalate": true, "files_to_escalate": ["src/auth/login.ts"], "reasoning": "Token refresh race window widened without lock acquisition."}
+```
+
+When triage escalates, the chat transcript shows the triage summary first
+then the deep review entry. When triage doesn't escalate, only the triage
+summary lands — no extra judge call. `multi-review.triageEscalationThreshold`
+defaults to 1 (any reviewer triggers). Bump it to 2+ if you want only
+multi-reviewer agreement before deep diving.
 
 ## Wire-up
 
@@ -112,7 +135,9 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
   "judge": "fireworks/accounts/fireworks/models/glm-5p2",
   "judgeThinking": "high",
   "concurrency": 4,
-  "temperature": 0.2
+  "temperature": 0.2,
+  "mode": "balanced",
+  "triageEscalationThreshold": 1
 }
 ```
 
@@ -120,6 +145,10 @@ This file stays optional — if absent, the extension warns on `/multi-review`
 and tells you the exact shape to drop. Unknown fields, wrong types, or
 malformed JSON all degrade silently to in-code defaults so the file is
 never load-bearing.
+
+`mode` accepts `balanced` | `light` | `triage` (default `balanced`).
+`triageEscalationThreshold` is the count of reviewers needed to escalate
+in `triage` mode (default `1`); bump it to 2+ for consensus-only escalation.
 
 ### Per-reviewer thinking level (optional)
 

@@ -26,6 +26,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext, ExecResult } from "@mariozechner/pi-coding-agent";
 import type { Model } from "@mariozechner/pi-ai";
+import { StringEnum } from "@mariozechner/pi-ai";
 import { getAgentDir, getMarkdownTheme } from "@mariozechner/pi-coding-agent";
 import { Box, Container, Key, Markdown, matchesKey, Spacer, Text, truncateToWidth } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
@@ -125,7 +126,14 @@ export interface MultiReviewConfig {
 	judgeThinking: ThinkingLevelAlias;
 	concurrency: number;
 	temperature: number;
+	/** Which review mode the run uses. Default "balanced". */
+	mode: ReviewMode;
+	/** In triage mode, ≥ N reviewer escalations trigger a deep follow-up. */
+	triageEscalationThreshold: number;
 }
+
+export const REVIEW_MODES = ["balanced", "light", "triage"] as const;
+export type ReviewMode = (typeof REVIEW_MODES)[number];
 
 const DEFAULTS: MultiReviewConfig = {
 	reviewers: [],
@@ -133,7 +141,26 @@ const DEFAULTS: MultiReviewConfig = {
 	judgeThinking: "high",
 	concurrency: 4,
 	temperature: 0.2,
+	mode: "balanced",
+	triageEscalationThreshold: 1,
 };
+
+/**
+ * Pull a `--mode=<value>` flag out of an args string. Returns the mode
+ * (or the fallback) and the stripped args. Lower-cased for matching so
+ * `--MODE=Triage` works. The flag may appear anywhere in the string.
+ */
+export function parseModeFlag(rawArgs: string, fallback: ReviewMode): { mode: ReviewMode; rest: string } {
+	const flagRe = /(^|\s)--mode=([a-z]+)(\s|$)/i;
+	const m = rawArgs.match(flagRe);
+	if (!m) return { mode: fallback, rest: rawArgs };
+	const candidate = m[2].toLowerCase();
+	if ((REVIEW_MODES as readonly string[]).includes(candidate)) {
+		const rest = rawArgs.replace(flagRe, "$1$3").trim();
+		return { mode: candidate as ReviewMode, rest };
+	}
+	return { mode: fallback, rest: rawArgs };
+}
 
 const STATUS_KEY = "multi-review";
 
@@ -157,7 +184,7 @@ function loadConfig(): MultiReviewConfig {
 		if (!parsed || typeof parsed !== "object") return cachedConfig;
 		if (Array.isArray(parsed.reviewers)) {
 			cachedConfig.reviewers = parsed.reviewers.filter(
-				(x): x is ModelSpec => typeof x === "string" && x.includes("/"),
+				(x): x is string => typeof x === "string" && x.includes("/"),
 			);
 		}
 		if (typeof parsed.judge === "string" && parsed.judge.includes("/")) {
@@ -172,6 +199,16 @@ function loadConfig(): MultiReviewConfig {
 		}
 		if (typeof parsed.temperature === "number" && parsed.temperature >= 0 && parsed.temperature <= 2) {
 			cachedConfig.temperature = parsed.temperature;
+		}
+		if (typeof parsed.mode === "string" && (REVIEW_MODES as readonly string[]).includes(parsed.mode)) {
+			cachedConfig.mode = parsed.mode as ReviewMode;
+		}
+		if (
+			typeof parsed.triageEscalationThreshold === "number"
+			&& parsed.triageEscalationThreshold >= 1
+			&& parsed.triageEscalationThreshold <= 16
+		) {
+			cachedConfig.triageEscalationThreshold = Math.floor(parsed.triageEscalationThreshold);
 		}
 	} catch {
 		cachedConfig = { ...DEFAULTS };
@@ -1298,6 +1335,220 @@ function renderGroupsForJudge(target: ReviewTarget, groups: DedupeGroup[]): stri
 	return lines.join("\n");
 }
 
+/**
+ * Light-mode markdown synthesis. Produces a structured markdown doc
+ * directly from the deduped groups (no judge call) so the user sees
+ * per-model attribution attached to every finding, sorted severity-desc.
+ * Schema mirrors what the prompted judge produces so downstream tooling
+ * doesn't need a separate light-mode branch.
+ */
+function synthesizeMarkdownFromGroups(
+	target: ReviewTarget,
+	groups: DedupeGroup[],
+	reviewerRuns: ReviewerRunResult[],
+): string {
+	const lines: string[] = [];
+	const failed = reviewerRuns.filter((r) => !r.ok);
+	lines.push("# Multi-Model Code Review (light, no-judge)");
+	lines.push("");
+	lines.push("## Summary");
+	const consensusCount = groups.filter((g) => g.consensus).length;
+	const totalMembers = groups.reduce((s, g) => s + g.members.length, 0);
+	const okCount = reviewerRuns.filter((r) => r.ok).length;
+	lines.push(
+		`Scope: \`${target.label}\`. ` +
+			`${groups.length} deduplicated finding${groups.length === 1 ? "" : "s"} across ` +
+			`${okCount} reviewer${okCount === 1 ? "" : "s"}; ` +
+			`${consensusCount} consensus, ${totalMembers} raw finding${totalMembers === 1 ? "" : "s"}.`,
+	);
+	lines.push("");
+	if (groups.length === 0) {
+		lines.push("_No findings across reviewers; no deep-dive warranted._");
+		lines.push("");
+	} else {
+		lines.push("## Findings");
+		for (const g of groups) {
+			const range = formatRange(g.line_start, g.line_end);
+			const head = g.consensus
+				? `### ${g.severity.toUpperCase()} · ${g.title}  [CONSENSUS ×${g.reviewerSpecs.length}]`
+				: `### ${g.severity.toUpperCase()} · ${g.title}`;
+			lines.push(head);
+			lines.push(`- **File:** \`${g.file}:${range}\``);
+			lines.push(`- **Category:** ${g.category}`);
+			lines.push(`- **Reviewers (${g.reviewerSpecs.length}):**`);
+			for (const m of g.members) {
+				lines.push(`    - \`${m.spec}\`: ${m.comment}`);
+			}
+			lines.push("");
+		}
+	}
+	if (failed.length > 0) {
+		lines.push("## Coverage");
+		for (const f of failed) lines.push(`- reviewer \`${f.formattedSpec}\` did not return: ${f.errorMessage?.slice(0, 120) ?? "(unknown)"}`);
+		lines.push("");
+	}
+	return lines.join("\n");
+}
+
+/**
+ * Triage reviewer prompt. Outputs a structured verdict instead of the
+ * structured findings array. The triage fan-out always uses medium
+ * thinking (configurable later via per-reviewer @level already supported
+ * by parseReviewerSpec).
+ */
+const TRIAGE_REVIEWER_SYSTEM_PROMPT = `You are a triage reviewer scanning a code change to decide whether a deep review would surface real issues.
+
+Read the diff (and optional focus hint) and output ONLY a JSON object:
+
+{
+  "escalate": true | false,
+  "files_to_escalate": ["src/foo.ts", "src/auth/login.ts"],
+  "reasoning": "<1-2 sentences: the change is small/benign, OR what concrete concern you saw>"
+}
+
+Rules:
+- escalate=true only when there is a concrete, specific concern (risk of correctness regression, security hole, performance cliff, etc.) — not stylistic preferences.
+- files_to_escalate: relative paths of files that warrant a deep pass. Empty list when escalate=false.
+- If the change is mechanical (rename, formatting, dependency bump) with no risky area, output false and explain the absence of concerns.
+- Output ONLY the JSON object. No prose, no markdown fences.`;
+
+export interface TriageVerdict {
+	escalate: boolean;
+	files_to_escalate: string[];
+	reasoning: string;
+}
+
+function parseTriageJson(rawText: string): TriageVerdict {
+	const text = rawText.trim();
+	const fence = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+	const inner = fence ? fence[1] : text;
+	const start = inner.indexOf("{");
+	const end = inner.lastIndexOf("}");
+	if (start === -1 || end === -1 || end <= start) {
+		return { escalate: false, files_to_escalate: [], reasoning: "" };
+	}
+	const slice = inner.slice(start, end + 1);
+	try {
+		const parsed = JSON.parse(slice);
+		return {
+			escalate: Boolean(parsed?.escalate),
+			files_to_escalate: Array.isArray(parsed?.files_to_escalate)
+				? parsed.files_to_escalate.filter((x: unknown): x is string => typeof x === "string" && x.length > 0).slice(0, 50)
+				: [],
+			reasoning: typeof parsed?.reasoning === "string" ? String(parsed.reasoning).slice(0, 1500) : "",
+		};
+	} catch {
+		return { escalate: false, files_to_escalate: [], reasoning: "" };
+	}
+}
+
+export interface TriageFanOutResult {
+	reviewerRuns: ReviewerRunResult[];
+	verdicts: Array<{ spec: string; verdict: TriageVerdict }>;
+	escalateCount: number;
+	escalatedFiles: string[];
+}
+
+/**
+ * Run reviewers in triage mode. Same plumbing as runAllReviewers but with
+ * the triage system prompt and a verdict parser. Each reviewer's verdict
+ * is stored alongside its run result so the post-triage notify can show
+ * who said what.
+ */
+async function runTriageFanOut(
+	resolved: Array<{ rs: ReviewerSpec; model: Model; clamped: boolean }>,
+	target: ReviewTarget,
+	userPrompt: string,
+	concurrency: number,
+	temperature: number,
+	abortSignal: AbortSignal | undefined,
+	ctx: ExtensionContext,
+): Promise<TriageFanOutResult> {
+	const runs: ReviewerRunResult[] = new Array(resolved.length);
+	const verdicts: Array<{ spec: string; verdict: TriageVerdict }> = new Array(resolved.length);
+	const cap = Math.max(1, Math.min(MAX_PARALLEL, concurrency, resolved.length));
+	let cursor = 0;
+	const worker = async (): Promise<void> => {
+		while (true) {
+			if (abortSignal?.aborted) return;
+			const idx = cursor++;
+			if (idx >= resolved.length) return;
+			const slot = resolved[idx];
+			try {
+				const r = await runReviewer(slot.model, slot.rs, ctx, TRIAGE_REVIEWER_SYSTEM_PROMPT, userPrompt, temperature, abortSignal);
+				const full: ReviewerRunResult = {
+					formattedSpec: formatReviewerSpec(slot.rs),
+					spec: slot.rs.spec,
+					thinking: slot.rs.thinking,
+					clamped: slot.clamped,
+					model: slot.model,
+					ok: r.ok,
+					findings: [],
+					rawText: r.rawText,
+					stopReason: r.stopReason,
+					errorMessage: r.errorMessage,
+					usage: r.usage,
+					durationMs: r.durationMs,
+				};
+				runs[idx] = full;
+				verdicts[idx] = { spec: full.formattedSpec, verdict: parseTriageJson(full.rawText) };
+			} catch (err) {
+				const full: ReviewerRunResult = {
+					formattedSpec: formatReviewerSpec(slot.rs),
+					spec: slot.rs.spec,
+					thinking: slot.rs.thinking,
+					clamped: slot.clamped,
+					model: slot.model,
+					ok: false,
+					findings: [],
+					rawText: "",
+					stopReason: "error",
+					errorMessage: err instanceof Error ? err.message : String(err),
+					durationMs: 0,
+				};
+				runs[idx] = full;
+				verdicts[idx] = { spec: full.formattedSpec, verdict: { escalate: false, files_to_escalate: [], reasoning: "" } };
+			}
+		}
+	};
+	await Promise.all(Array.from({ length: cap }, () => worker()));
+
+	let escalateCount = 0;
+	const fileSet = new Set<string>();
+	for (const v of verdicts) {
+		if (v.verdict.escalate) escalateCount++;
+		for (const f of v.verdict.files_to_escalate) fileSet.add(f);
+	}
+	return {
+		reviewerRuns: runs,
+		verdicts,
+		escalateCount,
+		escalatedFiles: Array.from(fileSet).sort(),
+	};
+}
+
+/**
+ * Build a follow-up ReviewTarget for triage → deep. Keeps the original
+ * diff (so reviewers still see hunks for those files when applicable) but
+ * tightens the focus hint to surface the escalation signals. If the
+ * original target had no diff (e.g. directory listing), the focus hint
+ * carries the file list — reviewers operate at the directory level.
+ */
+function buildEscalatedTarget(original: ReviewTarget, files: string[]): ReviewTarget {
+	if (files.length === 0) return original;
+	const focusHint = original.focusHint
+		? `${original.focusHint}\n\nTriage escalation — focus deep review on these files: ${files.join(", ")}`
+		: `Triage escalation — focus deep review on these files: ${files.join(", ")}`;
+	const fileRecords = files.map((p) => ({ path: p, lines: 0 }));
+	return {
+		...original,
+		focusHint,
+		files: fileRecords,
+		label: original.label ? `${original.label} · escalated` : "triage escalation",
+		warnings: original.warnings,
+	};
+}
+
 async function runJudge(
 	judgeModel: Model,
 	groups: DedupeGroup[],
@@ -1753,27 +2004,61 @@ async function runMultiReviewFromArgs(
 			notifyLevel: "error",
 		};
 	}
-	const judge = resolveJudge(ctx, cfg);
+	const parsedArgs = parseModeFlag(rawArgs, cfg.mode);
+	const mode = parsedArgs.mode;
+	const argsAfterMode = parsedArgs.rest;
 
-	if (!judge) {
+	// Judge is required for balanced mode and for triage → deep follow-up,
+	// but optional for pure light mode. Check now if any downstream path
+	// will need it so the user gets actionable feedback before fan-out.
+	const judge = resolveJudge(ctx, cfg);
+	const needsJudge = mode === "balanced" || mode === "triage";
+	if (needsJudge && !judge) {
 		return {
 			kind: "notify",
 			notifyMessage:
 				`multi-review: judge model missing in registry: ${cfg.judge}\n` +
 				`Add it to ~/.pi/agent/models.json (or /login) and /reload.\n` +
-				`\nArgs: ${rawArgs.trim() || "(none)"}`,
+				`\nArgs: ${(argsAfterMode || "").trim() || "(none)"}`,
 			notifyLevel: "error",
 		};
 	}
 
-	const parsed = parseReviewArgs(rawArgs);
-	setStatus(`multi-review · resolving scope…`, ctx);
+	const parsed = parseReviewArgs(argsAfterMode);
+	setStatus(`multi-review · mode=${mode} · resolving scope…`, ctx);
 	const target = await buildReviewTarget(pi, parsed, ctx.cwd);
 	const userPrompt = buildReviewUserPrompt(target);
 
-	setStatus(`multi-review · fanning out to ${resolved.length} reviewers (cap ${cfg.concurrency})`, ctx);
+	const resolvedRows = resolved.map((r) => ({ rs: r.rs, model: r.model, clamped: r.clamped }));
+
+	setStatus(`multi-review · mode=${mode} · fanning out to ${resolved.length} reviewers (cap ${cfg.concurrency})`, ctx);
+	if (mode === "balanced") {
+		return await runBalancedPipeline(target, resolvedRows, userPrompt, cfg, judge!, ctx, pi, signal);
+	}
+	if (mode === "light") {
+		return await runLightPipeline(target, resolvedRows, userPrompt, cfg, ctx, signal);
+	}
+	// mode === "triage"
+	return await runTriagePipeline(target, resolvedRows, userPrompt, cfg, ctx, pi, signal);
+}
+
+/**
+ * Balanced (default): full fan-out → dedupe → single judge synthesis →
+ * inject as a custom-typed chat entry. Same behavior as the original
+ * pre-modes pipeline. Factored out so mode dispatch stays readable.
+ */
+async function runBalancedPipeline(
+	target: ReviewTarget,
+	resolved: Array<{ rs: ReviewerSpec; model: Model; clamped: boolean }>,
+	userPrompt: string,
+	cfg: MultiReviewConfig,
+	judge: Model,
+	ctx: ExtensionContext,
+	pi: ExtensionAPI,
+	signal: AbortSignal | undefined,
+): Promise<MultiReviewRunResult> {
 	const completedRunResults = await runAllReviewers(
-		resolved.map((r) => ({ rs: r.rs, model: r.model, clamped: r.clamped })),
+		resolved,
 		REVIEWER_SYSTEM_PROMPT,
 		userPrompt,
 		cfg.concurrency,
@@ -1782,7 +2067,6 @@ async function runMultiReviewFromArgs(
 		ctx,
 	);
 	setStatus(`multi-review · dedupe pass`, ctx);
-
 	const groups = dedupeReviewerFindings(completedRunResults);
 	setStatus(`multi-review · ${groups.length} groups · invoking judge ${cfg.judge}`, ctx);
 
@@ -1801,11 +2085,10 @@ async function runMultiReviewFromArgs(
 		consensusCount: groups.filter((g) => g.consensus).length,
 		totalFindings: groups.reduce((s, g) => s + g.members.length, 0),
 	};
-
 	return {
 		kind: "inject",
 		notifyMessage:
-			`multi-review · done — review injected into chat\n` +
+			`multi-review · mode=balanced · done — review injected into chat\n` +
 			`scope: ${target.label}   files: ${target.files.length}   diff bytes: ${target.diffText.length}\n` +
 			`judge: ${cfg.judge}   (${(judgeResult.durationMs / 1000).toFixed(1)}s${judgeResult.usage ? `, $${judgeResult.usage.cost.toFixed(4)}` : ""})\n` +
 			`reviewers: ${completedRunResults.length}   dedupe groups: ${groups.length}   consensus: ${details.consensusCount}\n` +
@@ -1817,8 +2100,185 @@ async function runMultiReviewFromArgs(
 			details,
 		},
 	};
-	// Single-shot override clears after consumption.
-	if (transientReviewers === TRANSIENT_REVIEWERS) TRANSIENT_REVIEWERS = null;
+}
+
+/**
+ * Light mode: full fan-out → dedupe → synthesize markdown directly from
+ * the groups WITHOUT calling the judge. Approximate 50% latency + cost
+ * saving vs balanced at the price of no cross-model synthesis — per-
+ * reviewer comments are surfaced verbatim under each finding.
+ */
+async function runLightPipeline(
+	target: ReviewTarget,
+	resolved: Array<{ rs: ReviewerSpec; model: Model; clamped: boolean }>,
+	userPrompt: string,
+	cfg: MultiReviewConfig,
+	ctx: ExtensionContext,
+	signal: AbortSignal | undefined,
+): Promise<MultiReviewRunResult> {
+	const completedRunResults = await runAllReviewers(
+		resolved,
+		REVIEWER_SYSTEM_PROMPT,
+		userPrompt,
+		cfg.concurrency,
+		cfg.temperature,
+		signal,
+		ctx,
+	);
+	setStatus(`multi-review · mode=light · dedupe pass (no judge)`, ctx);
+	const groups = dedupeReviewerFindings(completedRunResults);
+	const markdown = synthesizeMarkdownFromGroups(target, groups, completedRunResults);
+	setStatus(`multi-review · mode=light · done`, ctx);
+
+	const details: MultiReviewDetails = {
+		target,
+		groups,
+		reviewerSpecs: completedRunResults.map((r) => r.spec),
+		failedSpecs: completedRunResults.filter((r) => !r.ok).map((r) => r.spec),
+		judge: "(none — light mode)",
+		judgeDurationMs: 0,
+		judgeUsage: undefined,
+		consensusCount: groups.filter((g) => g.consensus).length,
+		totalFindings: groups.reduce((s, g) => s + g.members.length, 0),
+	};
+	const totalUsage = completedRunResults.reduce(
+		(s, r) => s + (r.usage?.cost ?? 0),
+		0,
+	);
+	return {
+		kind: "inject",
+		notifyMessage:
+			`multi-review · mode=light · done — review injected into chat (no judge)\n` +
+			`scope: ${target.label}   files: ${target.files.length}   diff bytes: ${target.diffText.length}\n` +
+			`reviewers: ${completedRunResults.length}   dedupe groups: ${groups.length}   consensus: ${details.consensusCount}` +
+			(totalUsage > 0 ? `   $${totalUsage.toFixed(4)}` : "") + `\n` +
+			`Press Ctrl+O on the chat entry to expand per-model attribution.`,
+		notifyLevel: "info",
+		injectMessage: {
+			customType: "multi-review",
+			content: markdown,
+			details,
+		},
+	};
+}
+
+/**
+ * Triage → deep: run reviewers with the triage verdict prompt. If
+ * ≥ cfg.triageEscalationThreshold reviewers report escalate=true,
+ * automatically re-run the balanced pipeline on a follow-up target
+ * scoped to the union of escalated files. Otherwise, render a triage
+ * summary inline (saves the cost of a deep pass on a clean diff).
+ */
+async function runTriagePipeline(
+	target: ReviewTarget,
+	resolved: Array<{ rs: ReviewerSpec; model: Model; clamped: boolean }>,
+	userPrompt: string,
+	cfg: MultiReviewConfig,
+	ctx: ExtensionContext,
+	pi: ExtensionAPI,
+	signal: AbortSignal | undefined,
+): Promise<MultiReviewRunResult> {
+	setStatus(`multi-review · mode=triage · fanning out`, ctx);
+	const triage = await runTriageFanOut(
+		resolved,
+		target,
+		userPrompt,
+		cfg.concurrency,
+		cfg.temperature,
+		signal,
+		ctx,
+	);
+
+	const thresholdMet = triage.escalateCount >= cfg.triageEscalationThreshold;
+	const escalatedFiles = triage.escalatedFiles;
+
+	if (!thresholdMet || escalatedFiles.length === 0) {
+		setStatus(`multi-review · mode=triage · no escalation (${triage.escalateCount}/${cfg.triageEscalationThreshold})`, ctx);
+		return buildTriageSummaryResult(target, triage, cfg, "no escalation");
+	}
+
+	// Escalation: re-run balanced on the focused target. We need a judge
+	// (already checked upstream before entering this pipeline).
+	setStatus(`multi-review · mode=triage · escalation (${triage.escalateCount}/${cfg.triageEscalationThreshold}) → deep`, ctx);
+	const downstream = buildEscalatedTarget(target, escalatedFiles);
+	const downstreamPrompt = buildReviewUserPrompt(downstream);
+	const judge = resolveJudge(ctx, cfg);
+	if (!judge) {
+		return {
+			kind: "notify",
+			notifyMessage:
+				`multi-review: judge missing while escalating. Configure ${cfg.judge} and /reload.\n` +
+				`(Triage escalated ${escalatedFiles.length} files but no judge for the deep pass.)`,
+			notifyLevel: "error",
+		};
+	}
+	const deep = await runBalancedPipeline(downstream, resolved, downstreamPrompt, cfg, judge, ctx, pi, signal);
+	// Wrap the deep result's notify with a triage escalation banner.
+	const triageBanner =
+		`multi-review · mode=triage · escalated (${triage.escalateCount}/${cfg.triageEscalationThreshold} reviewers said escalate)\n` +
+		`escalated files: ${escalatedFiles.slice(0, 10).join(", ")}` +
+		(escalatedFiles.length > 10 ? `, +${escalatedFiles.length - 10} more` : "") +
+		`\n→ running balanced deep review on those files only:\n\n`;
+	return {
+		kind: deep.kind,
+		notifyMessage: triageBanner + deep.notifyMessage,
+		notifyLevel: "info",
+		injectMessage: deep.injectMessage,
+	};
+}
+
+function buildTriageSummaryResult(
+	target: ReviewTarget,
+	triage: TriageFanOutResult,
+	cfg: MultiReviewConfig,
+	verdict: string,
+): MultiReviewRunResult {
+	const lines: string[] = [];
+	lines.push(`# Multi-Model Code Review (triage · ${verdict})`);
+	lines.push("");
+	lines.push(`Scope: \`${target.label}\`.`);
+	lines.push(`Escalation threshold: ${cfg.triageEscalationThreshold} reviewer${cfg.triageEscalationThreshold === 1 ? "" : "s"}.`);
+	lines.push("");
+	lines.push("## Verdict distribution");
+	for (const v of triage.verdicts) {
+		const flag = v.verdict.escalate ? "ESCALATE" : "skip";
+		const reason = v.verdict.reasoning || "(no reasoning)";
+		lines.push(`- \`${v.spec}\` → **${flag}** — ${reason.slice(0, 200)}`);
+	}
+	lines.push("");
+	lines.push(`**Result:** ${triage.escalateCount}/${triage.verdicts.length} reviewers escalated → no deep review run.`);
+	lines.push("");
+	if (triage.reviewerRuns.some((r) => !r.ok)) {
+		lines.push("## Coverage issues");
+		for (const r of triage.reviewerRuns.filter((r) => !r.ok)) {
+			lines.push(`- reviewer \`${r.formattedSpec}\` did not return: ${r.errorMessage?.slice(0, 120) ?? "(unknown)"}`);
+		}
+	}
+	const content = lines.join("\n");
+	const details: MultiReviewDetails = {
+		target,
+		groups: [],
+		reviewerSpecs: triage.reviewerRuns.map((r) => r.spec),
+		failedSpecs: triage.reviewerRuns.filter((r) => !r.ok).map((r) => r.spec),
+		judge: "(none — triage mode)",
+		judgeDurationMs: 0,
+		judgeUsage: undefined,
+		consensusCount: 0,
+		totalFindings: 0,
+	};
+	return {
+		kind: "inject",
+		notifyMessage:
+			`multi-review · mode=triage · verdict=${verdict}\n` +
+			`scope: ${target.label}   reviewers: ${triage.reviewerRuns.length}   escalations: ${triage.escalateCount}/${cfg.triageEscalationThreshold}\n` +
+			`Press Ctrl+O on the chat entry to expand per-reviewer verdict + reasoning.`,
+		notifyLevel: "info",
+		injectMessage: {
+			customType: "multi-review",
+			content,
+			details,
+		},
+	};
 }
 
 export default function (pi: ExtensionAPI) {
@@ -1883,7 +2343,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("multi-review", {
 		description:
 			"Fan-out code review across configured models. Usage: " +
-			"/multi-review [PR-number | free-text focus].",
+			"/multi-review [--mode=balanced|light|triage] [PR-number | free-text focus]. " +
+			"Mode default reads multi-review.mode from ~/.pi/agent/multi-review.json.",
 		// Argument autocomplete hints the call shape so users don't have to
 		// remember to type '#' vs raw digits.
 		getArgumentCompletions: (_prefix): Array<{ value: string; label: string; description?: string }> | null => [
@@ -1891,6 +2352,9 @@ export default function (pi: ExtensionAPI) {
 			{ value: "#1234", label: "#1234", description: "review PR #1234" },
 			{ value: "https://github.com/owner/repo/pull/1234", label: "PR URL", description: "extract number from URL" },
 			{ value: "focus: ", label: "focus: <text>", description: "free-text focus hint, no PR" },
+			{ value: "--mode=balanced", label: "--mode=balanced", description: "fan-out + judge (default)" },
+			{ value: "--mode=light", label: "--mode=light", description: "fan-out only; no judge call (half cost, half latency)" },
+			{ value: "--mode=triage", label: "--mode=triage", description: "cheap verdict first; auto-escalates to balanced when N reviewers say escalate" },
 		],
 		handler: async (args, ctx) => {
 			// Slash commands fire outside active turns, so ctx.signal is
@@ -1974,9 +2438,18 @@ export default function (pi: ExtensionAPI) {
 					"'error handling in the diff', 'concurrency in the new code'.",
 				maxLength: 2000,
 			})),
+			mode: Type.Optional(StringEnum(REVIEW_MODES, {
+				description:
+					"Review mode. 'balanced' (default): fan-out + judge. " +
+					"'light': fan-out only, no judge (half cost, half latency). " +
+					"'triage': cheap verdict first; auto-escalates to balanced when ≥ cfg.triageEscalationThreshold reviewers say escalate.",
+			})),
 		}),
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const parts: string[] = [];
+			if (typeof params.mode === "string" && (REVIEW_MODES as readonly string[]).includes(params.mode)) {
+				parts.push(`--mode=${params.mode}`);
+			}
 			if (typeof params.pr_number === "number") parts.push(String(params.pr_number));
 			if (typeof params.focus === "string" && params.focus.trim()) parts.push(params.focus.trim());
 			const result = await runMultiReviewFromArgs(pi, ctx, parts.join(" "), signal);

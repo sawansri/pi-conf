@@ -46,7 +46,9 @@ cat > ~/.pi/agent/multi-review.json << 'EOF'
   "judge": "fireworks/accounts/fireworks/models/glm-5p2",
   "judgeThinking": "high",
   "concurrency": 4,
-  "temperature": 0.2
+  "temperature": 0.2,
+  "mode": "balanced",
+  "triageEscalationThreshold": 1
 }
 EOF
 ```
@@ -66,7 +68,8 @@ cat > ~/.pi/agent/multi-review.json << 'EOF'
     "fireworks/accounts/fireworks/models/minimax-m3@xhigh",
     "fireworks/accounts/fireworks/models/glm-5p2@high",
     "fireworks/accounts/fireworks/models/kimi-k2p7"
-  ]
+  ],
+  "mode": "balanced"
 }
 EOF
 ```
@@ -74,6 +77,18 @@ EOF
 Allowed levels: `off | minimal | low | medium | high | xhigh`. If a model
 clams a level (e.g. `xhigh`→`high` on Fireworks), the notify surfaces it
 under "clamped" so you can spot it without guessing.
+
+### Picking a mode
+
+Set `"mode"` in the defaults file (or override per-run with
+`--mode=balanced|light|triage`):
+
+- `balanced` — fan-out + judge. Default.
+- `light` — fan-out only; no judge. ~50% faster, halves token cost.
+  Use when you trust the per-model attribution and don't need synthesis.
+- `triage` — cheap verdict first; auto-escalates to balanced when at
+  least `triageEscalationThreshold` reviewers (default 1) report a
+  concrete concern. Use for big diffs where most areas are noise.
 
 ## 3. Verify the two surfaces
 
