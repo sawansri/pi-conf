@@ -21,7 +21,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext, ExecResult } from "@mariozechner/pi-coding-agent";
 import type { Model } from "@mariozechner/pi-ai";
-import { getAgentDir } from "@mariozechner/pi-coding-agent";
+import { getAgentDir, getMarkdownTheme } from "@mariozechner/pi-coding-agent";
+import { Box, Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 
 /** Provider/model-id pair as written in the defaults file and the picker. */
 export type ModelSpec = `${string}/${string}`;
@@ -919,12 +920,119 @@ async function runJudge(
 	};
 }
 
+// ---------- chat render ----------
+
+/**
+ * Payload attached to the message's `details` so the renderer can rebuild
+ * the structured layout without re-parsing the judge's markdown. The markdown
+ * itself is in `content` so it's selectable in the TUI.
+ */
+export interface MultiReviewDetails {
+	target: ReviewTarget;
+	groups: DedupeGroup[];
+	reviewerSpecs: ModelSpec[];
+	failedSpecs: ModelSpec[];
+	judge: ModelSpec;
+	judgeDurationMs: number;
+	judgeUsage?: { input: number; output: number; total: number; cost: number };
+	consensusCount: number;
+	totalFindings: number;
+}
+
+const SEVERITY_COLOR: Record<ReviewerFinding["severity"], "error" | "warning" | "accent" | "muted" | "dim"> = {
+	critical: "error",
+	high: "error",
+	medium: "warning",
+	low: "accent",
+	info: "muted",
+	none: "dim",
+};
+
+const SEVERITY_BAR: Record<ReviewerFinding["severity"], string> = {
+	critical: "█████",
+	high: "████░",
+	medium: "███░░",
+	low: "██░░░",
+	info: "█░░░░",
+	none: "░░░░░",
+};
+
+function renderMultiReviewMessage(
+	message: { content: string; details?: unknown },
+	options: { expanded: boolean },
+	theme: { fg: (color: string, text: string) => string; bg: (color: string, text: string) => string; bold: (text: string) => string },
+	_ctx: unknown,
+): unknown {
+	const details = (message.details ?? null) as MultiReviewDetails | null;
+	const container = new Container();
+	const box = new Box(1, 1, (t: string) => theme.bg("customMessageBg", t));
+	box.addChild(container);
+
+	const headline = `${theme.fg("toolTitle", theme.bold("multi-review"))} · ${
+		details ? `${details.groups.length} groups, ${details.consensusCount} consensus` : "(no payload)"
+	}`;
+	container.addChild(new Text(headline, 0, 0));
+
+	if (!details) {
+		// Fallback to plain markdown if we somehow got here without details.
+		container.addChild(new Spacer(1));
+		const mdTheme = getMarkdownTheme();
+		container.addChild(new Markdown(message.content, 0, 0, mdTheme));
+		return box;
+	}
+
+	// Severity tally
+	const tally: Record<string, number> = {};
+	for (const g of details.groups) tally[g.severity] = (tally[g.severity] ?? 0) + 1;
+	const tallyStr = (["critical", "high", "medium", "low", "info", "none"] as const)
+		.filter((s) => tally[s])
+		.map((s) => `${SEVERITY_BAR[s]} ${s}=${tally[s]}`)
+		.join("   ");
+	if (tallyStr) container.addChild(new Text(theme.fg("dim", tallyStr), 0, 0));
+
+	// Scope line
+	container.addChild(new Text(theme.fg("dim", `${details.target.label} · ${details.target.kind}`), 0, 0));
+	container.addChild(new Text(
+		theme.fg("dim", `judge: ${details.judge} · ${(details.judgeDurationMs / 1000).toFixed(1)}s`),
+		0, 0,
+	));
+
+	// Per-group brief (always shown)
+	for (const g of details.groups) {
+		container.addChild(new Spacer(1));
+		const head = `${SEVERITY_BAR[g.severity]} ${theme.fg(SEVERITY_COLOR[g.severity], g.severity.toUpperCase())} · ${theme.bold(g.title)}`;
+		const consensusTag = g.consensus ? theme.fg("accent", ` [CONSENSUS ×${g.reviewerSpecs.length}]`) : "";
+		container.addChild(new Text(`${head}${consensusTag}`, 0, 0));
+		container.addChild(new Text(theme.fg("dim", `  ${g.file}:${formatRange(g.line_start, g.line_end)} · ${g.category}`), 0, 0));
+		if (options.expanded) {
+			for (const m of g.members) {
+				const specShort = m.spec.split("/").pop() ?? m.spec;
+				container.addChild(new Text(`    · ${theme.fg("muted", `${specShort}:`)} ${m.comment}`, 0, 0));
+			}
+		}
+	}
+
+	// In expanded view, render the judge's full markdown.
+	if (options.expanded) {
+		container.addChild(new Spacer(1));
+		container.addChild(new Text(theme.fg("muted", "─── judge markdown ───"), 0, 0));
+		const mdTheme = getMarkdownTheme();
+		container.addChild(new Markdown(message.content, 0, 0, mdTheme));
+	} else {
+		container.addChild(new Text(theme.fg("dim", "(Ctrl+O to expand for full judge markdown + per-reviewer comments)"), 0, 0));
+	}
+
+	return box;
+}
+
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		const cfg = loadConfig();
 		setStatus(`multi-review · ${describePool(cfg)}`, ctx);
 		ctx.ui.notify(`multi-review loaded · ${describePool(cfg)}`, "info");
 	});
+
+	pi.registerMessageRenderer("multi-review", renderMultiReviewMessage as unknown as Parameters<ExtensionAPI["registerMessageRenderer"]>[1]);
 
 	pi.registerCommand("multi-review", {
 		description:
@@ -1000,29 +1108,32 @@ export default function (pi: ExtensionAPI) {
 			setStatus(`multi-review · judge finished (${(judgeResult.durationMs / 1000).toFixed(1)}s)`, ctx);
 
 			const lines: string[] = [
-				`multi-review · fan-out + dedupe + judge finished`,
+				`multi-review · done — review injected into chat`,
 				`scope: ${target.label}   files: ${target.files.length}   diff bytes: ${target.diffText.length}`,
 				`judge: ${cfg.judge}   (${(judgeResult.durationMs / 1000).toFixed(1)}s${judgeResult.usage ? `, $${judgeResult.usage.cost.toFixed(4)}` : ""})`,
-				``,
-				`per-reviewer:`,
+				`reviewers: ${completedRunResults.length}   dedupe groups: ${groups.length}   consensus: ${groups.filter((g) => g.consensus).length}`,
+				`Press Ctrl+O on the chat entry to expand the per-model attribution + full judge markdown.`,
 			];
-			for (const r of completedRunResults) {
-				const icon = r.ok ? (r.findings.length > 0 ? "✓" : "·") : "✗";
-				const dur = `${(r.durationMs / 1000).toFixed(1)}s`;
-				const usage = r.usage ? ` ↑${r.usage.input} ↓${r.usage.output} $${r.usage.cost.toFixed(4)}` : "";
-				lines.push(`  ${icon} ${r.spec}  findings=${r.findings.length}  ${dur}${usage}`);
-				if (!r.ok && r.errorMessage) lines.push(`      error: ${r.errorMessage.slice(0, 240)}`);
-			}
-			lines.push(`  → ${groups.length} deduped groups; consensus on ${groups.filter((g) => g.consensus).length}`);
-
-			// Show the first chunk of judge markdown inline (notify caps at a few KB anyway).
-			const previewChars = 4000;
-			const judgePreview = judgeResult.markdown.length > previewChars
-				? judgeResult.markdown.slice(0, previewChars) + "\n…(truncated for notify; full text lands in commit 7 render)"
-				: judgeResult.markdown;
-			lines.push(``, `--- judge output ---`, judgePreview);
-
 			ctx.ui.notify(lines.join("\n"), "info");
+
+			// Inject the synthesis as a custom-typed message so it lives in the
+			// session transcript and renders through pi.registerMessageRenderer.
+			pi.sendMessage({
+				customType: "multi-review",
+				content: judgeResult.markdown,
+				display: true,
+				details: {
+					target,
+					groups,
+					reviewerSpecs: completedRunResults.map((r) => r.spec),
+					failedSpecs: completedRunResults.filter((r) => !r.ok).map((r) => r.spec),
+					judge: cfg.judge,
+					judgeDurationMs: judgeResult.durationMs,
+					judgeUsage: judgeResult.usage,
+					consensusCount: groups.filter((g) => g.consensus).length,
+					totalFindings: groups.reduce((s, g) => s + g.members.length, 0),
+				} as MultiReviewDetails,
+			});
 		},
 	});
 }
