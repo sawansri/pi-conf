@@ -27,7 +27,7 @@ import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext, ExecResult } from "@mariozechner/pi-coding-agent";
 import type { Model } from "@mariozechner/pi-ai";
 import { getAgentDir, getMarkdownTheme } from "@mariozechner/pi-coding-agent";
-import { Box, Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
+import { Box, Container, Key, Markdown, matchesKey, Spacer, Text, truncateToWidth } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
 
 /** Provider/model-id pair as written in the defaults file and the picker. */
@@ -74,6 +74,9 @@ const STATUS_KEY = "multi-review";
  * users have one mental model across extensions in this repo.
  */
 let cachedConfig: MultiReviewConfig | null = null;
+function cacheConfigForFreshRead(): void {
+	cachedConfig = null;
+}
 function loadConfig(): MultiReviewConfig {
 	if (cachedConfig !== null) return cachedConfig;
 	cachedConfig = { ...DEFAULTS };
@@ -1044,6 +1047,245 @@ function renderMultiReviewMessage(
 	}
 
 	return box;
+}
+
+// ---------- interactive reviewer picker ----------
+
+interface PickerRow {
+	kind: "provider-header" | "model";
+	provider: string;
+	spec?: ModelSpec;
+	modelIndex?: number;
+	description?: string;
+}
+
+/**
+ * Build a flat row list grouped by provider. Mixed model sets render with
+ * provider separators so the user can chunk pick by source. Empty
+ * providers are skipped — happens with single-provider accounts.
+ */
+function buildPickerRows(models: Model[]): { rows: PickerRow[]; modelRowIndexToSpec: Map<number, ModelSpec> } {
+	const byProvider = new Map<string, Model[]>();
+	for (const m of models) {
+		const arr = byProvider.get(m.provider) ?? [];
+		arr.push(m);
+		byProvider.set(m.provider, arr);
+	}
+	const providers = Array.from(byProvider.keys()).sort();
+	const rows: PickerRow[] = [];
+	const modelRowIndexToSpec = new Map<number, ModelSpec>();
+	let modelIndex = 0;
+	for (const provider of providers) {
+		rows.push({ kind: "provider-header", provider });
+		for (const m of byProvider.get(provider)!.sort((a, b) => a.id.localeCompare(b.id))) {
+			rows.push({
+				kind: "model",
+				provider,
+				spec: `${m.provider}/${m.id}`,
+				modelIndex,
+				description: m.name && m.name !== m.id ? m.name : undefined,
+			});
+			modelRowIndexToSpec.set(modelIndex, `${m.provider}/${m.id}`);
+			modelIndex++;
+		}
+	}
+	return { rows, modelRowIndexToSpec };
+}
+
+/**
+ * Multi-select TUI picker for reviewer models. Returns the chosen specs
+ * (deduped) or null on cancel. Falls back to a single confirm dialog
+ * (limited UX, text-only, picking one model) when ctx.hasUI is false so
+ * non-interactive modes don't block entirely.
+ */
+async function pickReviewersViaTUI(
+	ctx: ExtensionContext,
+	models: Model[],
+	preSelect: ModelSpec[] = [],
+): Promise<ModelSpec[] | null> {
+	if (!ctx.hasUI) {
+		// Best-effort fallback for print/RPC modes: select first pre-existing
+		// spec that resolves else fail cleanly. We've already filtered the
+		// pool upstream so this should never be the only path.
+		const first = preSelect.find((s) => models.some((m) => `${m.provider}/${m.id}` === s));
+		return first ? [first] : null;
+	}
+
+	const { rows, modelRowIndexToSpec } = buildPickerRows(models);
+	const preSelectedModelIndices = new Set<number>();
+	for (const spec of preSelect) {
+		let idx = 0;
+		for (const m of models) {
+			if (`${m.provider}/${m.id}` === spec) {
+				preSelectedModelIndices.add(idx);
+				break;
+			}
+			idx++;
+		}
+	}
+
+	// Build a contiguous-of-model-rows cursor space. Provider headers are
+	// selectable-but-empty so navigation can land on them; hitting space on
+	// a header is a no-op (selected count stays 0). Cursor pre-positions on
+	// the first model row.
+	const cursorToModelIndex: number[] = rows.map((r) => (r.kind === "model" ? (r.modelIndex ?? -1) : -1));
+	let cursor = rows.findIndex((r) => r.kind === "model");
+	if (cursor < 0) cursor = 0;
+
+	const result = await ctx.ui.custom<{ spec: ModelSpec }[] | null>((_tui, theme, _kb, done) => {
+		const selected = new Set<number>(preSelectedModelIndices);
+		let cachedLines: string[] | undefined;
+
+		function refresh() {
+			cachedLines = undefined;
+			_tui.requestRender();
+		}
+
+		function commit(cancelled: boolean) {
+			if (cancelled) {
+				done(null);
+				return;
+			}
+			// Translate model indices back to specs in their picker order.
+			const specList: { spec: ModelSpec }[] = [];
+			const seen = new Set<ModelSpec>();
+			for (let i = 0; i < rows.length; i++) {
+				const r = rows[i];
+				if (r.kind !== "model" || r.modelIndex === undefined) continue;
+				if (!selected.has(r.modelIndex)) continue;
+				const spec = modelRowIndexToSpec.get(r.modelIndex)!;
+				if (seen.has(spec)) continue;
+				seen.add(spec);
+				specList.push({ spec });
+			}
+			done(specList);
+		}
+
+		function handleInput(data: string): void {
+			if (matchesKey(data, Key.escape)) {
+				commit(true);
+				return;
+			}
+			if (matchesKey(data, Key.enter)) {
+				commit(false);
+				return;
+			}
+			if (matchesKey(data, Key.up)) {
+				cursor = cursor > 0 ? cursor - 1 : rows.length - 1;
+				refresh();
+				return;
+			}
+			if (matchesKey(data, Key.down)) {
+				cursor = cursor < rows.length - 1 ? cursor + 1 : 0;
+				refresh();
+				return;
+			}
+			if (matchesKey(data, Key.space) || data === " ") {
+				const mi = cursorToModelIndex[cursor];
+				if (mi < 0) return;
+				if (selected.has(mi)) selected.delete(mi);
+				else selected.add(mi);
+				refresh();
+				return;
+			}
+			// Quick-select: number keys 0-9 toggle the Nth model row.
+			const num = data >= "0" && data <= "9" ? Number(data) : -1;
+			if (num >= 0) {
+				const modelRows = rows
+					.map((r, i) => ({ r, i }))
+					.filter(({ r }) => r.kind === "model")
+					.slice(num * 10, num * 10 + 10);
+				if (modelRows.length > 0) {
+					const row = modelRows[0];
+					cursor = row.i;
+					const mi = cursorToModelIndex[cursor];
+					if (mi >= 0) {
+						if (selected.has(mi)) selected.delete(mi);
+						else selected.add(mi);
+					}
+					refresh();
+				}
+			}
+		}
+
+		function render(width: number): string[] {
+			if (cachedLines) return cachedLines;
+			const lines: string[] = [];
+			const add = (s: string) => lines.push(truncateToWidth(s, width));
+			add(theme.fg("accent", "─".repeat(width)));
+			add(theme.fg("text", theme.bold(" Pick reviewer models ")));
+			add(theme.fg("dim", "Space toggles · ↑↓ moves · Enter confirms · Esc cancels"));
+			lines.push("");
+
+			for (let i = 0; i < rows.length; i++) {
+				const r = rows[i];
+				if (r.kind === "provider-header") {
+					add(theme.fg("dim", " " + r.provider));
+					continue;
+				}
+				const isCursor = i === cursor;
+				const mi = r.modelIndex ?? -1;
+				const isSelected = selected.has(mi);
+				const cursorMark = isCursor ? theme.fg("accent", "> ") : "  ";
+				const box = isSelected ? theme.fg("success", "[x]") : theme.fg("muted", "[ ]");
+				const label = theme.fg(isSelected ? "success" : "text", r.spec ?? "");
+				add(`${cursorMark}${isSelected ? box + " " + label : box + " " + label}`);
+				if (r.description) add(`     ${theme.fg("dim", r.description)}`);
+			}
+
+			lines.push("");
+			const n = selected.size;
+			add(theme.fg("muted", ` ${n} reviewer${n === 1 ? "" : "s"} selected.`));
+			if (n === 0) add(theme.fg("warning", " Tip: space-toggle at least one to enable Enter."));
+			add(theme.fg("accent", "─".repeat(width)));
+			cachedLines = lines;
+			return lines;
+		}
+
+		return {
+			render,
+			invalidate: () => {
+				cachedLines = undefined;
+			},
+			handleInput,
+		};
+	});
+
+	if (!result) return null;
+	return result.map((r) => r.spec);
+}
+
+/**
+ * Merge `chosen` into the currently-loaded config (in-memory) AND persist
+ * to ~/.pi/agent/multi-review.json so the choice survives `/reload`.
+ * Unknown keys in the file are preserved untouched; bad JSON triggers
+ * a clean fresh write of the merged content.
+ */
+function persistReviewerChoices(chosen: ModelSpec[]): { ok: boolean; error?: string; path: string } {
+	const path = `${getAgentDir()}/multi-review.json`;
+	let next: Record<string, unknown> = {};
+	try {
+		if (fs.existsSync(path)) {
+			const prev = JSON.parse(fs.readFileSync(path, "utf8"));
+			if (prev && typeof prev === "object" && !Array.isArray(prev)) {
+				next = { ...prev };
+			}
+		}
+	} catch {
+		next = {};
+	}
+	if (chosen.length > 0) next.reviewers = chosen;
+	if (!("judge" in next)) next.judge = DEFAULTS.judge;
+	try {
+		const dir = path.substring(0, path.lastIndexOf("/"));
+		if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(path, JSON.stringify(next, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+		return { ok: true, path };
+	} catch (err) {
+		return { ok: false, error: err instanceof Error ? err.message : String(err), path };
+	}
+}
+
 /**
  * Shared entry point used by both `/multi-review` and the `multi_review` tool.
  * Centralizes the ordering (pool → judge check → scope → fan-out → dedupe →
@@ -1057,16 +1299,29 @@ function renderMultiReviewMessage(
  * instead of synthesizing a fake signal so the user gets to see partial
  * results rather than a recall race.
  */
+/**
+ * Single-shot override: when set, runMultiReviewFromArgs uses these
+ * reviewers instead of cfg.reviewers. Cleared after each invocation.
+ * Set ONLY by the picker fallback when the user opts not to persist.
+ */
+let TRANSIENT_REVIEWERS: ModelSpec[] | null = null;
+
 async function runMultiReviewFromArgs(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	rawArgs: string,
 	signal: AbortSignal | undefined,
+	transientReviewers: ModelSpec[] | null = TRANSIENT_REVIEWERS,
 ): Promise<MultiReviewRunResult> {
 	const cfg = loadConfig();
-	const judge = resolveJudge(ctx, cfg);
-
-	if (cfg.reviewers.length === 0) {
+	// If the caller passes transientReviewers (e.g. from a one-off picker
+	// session that the user opted not to persist), bypass the configured
+	// pool for this run only. Keeping the override list distinct from cfg
+	// means we never silently mutate the user's persisted defaults.
+	const effectiveReviewerSpecs: ModelSpec[] = transientReviewers && transientReviewers.length > 0
+		? transientReviewers
+		: cfg.reviewers;
+	if (effectiveReviewerSpecs.length === 0) {
 		return {
 			kind: "notify",
 			notifyMessage:
@@ -1078,17 +1333,30 @@ async function runMultiReviewFromArgs(
 		};
 	}
 
-	const pool = await resolveReviewerPool(ctx, cfg);
-	if (!pool) {
+	// Resolve the override list against the live registry (same gate as the
+	// configured pool: missing API key or absent model → dropped with surface
+	// feedback in the notify).
+	const available = await ctx.modelRegistry.getAvailable();
+	const availableKeys = new Set(available.map((m) => `${m.provider}/${m.id}`));
+	const resolved: { spec: ModelSpec; model: Model }[] = [];
+	const missingPool: ModelSpec[] = [];
+	for (const spec of effectiveReviewerSpecs) {
+		if (!availableKeys.has(spec)) { missingPool.push(spec); continue; }
+		const model = findModel(ctx, spec)!;
+		resolved.push({ spec, model });
+	}
+	if (resolved.length === 0) {
 		return {
 			kind: "notify",
 			notifyMessage:
-				`multi-review: none of the configured reviewers resolved.\n` +
-				describeResolved([], cfg.reviewers) +
+				`multi-review: none of the ${transientReviewers ? "transient" : "configured"} reviewers resolved.\n` +
+				describeResolved([], effectiveReviewerSpecs) +
 				`\nArgs: ${rawArgs.trim() || "(none)"}`,
 			notifyLevel: "error",
 		};
 	}
+	const judge = resolveJudge(ctx, cfg);
+
 	if (!judge) {
 		return {
 			kind: "notify",
@@ -1105,9 +1373,9 @@ async function runMultiReviewFromArgs(
 	const target = await buildReviewTarget(pi, parsed, ctx.cwd);
 	const userPrompt = buildReviewUserPrompt(target);
 
-	setStatus(`multi-review · fanning out to ${pool.resolved.length} reviewers (cap ${cfg.concurrency})`, ctx);
+	setStatus(`multi-review · fanning out to ${resolved.length} reviewers (cap ${cfg.concurrency})`, ctx);
 	const completedRunResults = await runAllReviewers(
-		pool.resolved,
+		resolved,
 		REVIEWER_SYSTEM_PROMPT,
 		userPrompt,
 		cfg.concurrency,
@@ -1151,6 +1419,8 @@ async function runMultiReviewFromArgs(
 			details,
 		},
 	};
+	// Single-shot override clears after consumption.
+	if (transientReviewers === TRANSIENT_REVIEWERS) TRANSIENT_REVIEWERS = null;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -1161,6 +1431,55 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerMessageRenderer("multi-review", renderMultiReviewMessage as unknown as Parameters<ExtensionAPI["registerMessageRenderer"]>[1]);
+
+	/**
+	 * Run the full pipeline OR fall back to the picker when the pool is empty
+	 * AND UI is available. Centralized so both `/multi-review` and the tool
+	 * benefit from the same fallback behavior.
+	 */
+	async function runWithOptionalPicker(args: string, ctx: ExtensionContext): Promise<void> {
+		const cfg = loadConfig();
+		if (cfg.reviewers.length === 0 && ctx.hasUI) {
+			const available = await ctx.modelRegistry.getAvailable();
+			if (available.length > 0) {
+				const open = await ctx.ui.confirm(
+					"No reviewers configured — pick now?",
+					"multi-review.json has no 'reviewers' array. Open the picker so you can select models from your registry? (cancellable; existing file is preserved except for the 'reviewers' key on save.)",
+				);
+				if (open) {
+					ctx.ui.notify("multi-review: opening reviewer picker…", "info");
+					const picked = await pickReviewersViaTUI(ctx, available, []);
+					if (!picked || picked.length === 0) {
+						ctx.ui.notify("multi-review: picker cancelled; nothing to do.", "warning");
+						return;
+					}
+					const persist = await ctx.ui.confirm(
+						"Save reviewers to multi-review.json?",
+						`Persist ${picked.length} reviewer${picked.length === 1 ? "" : "s"} to ~/.pi/agent/multi-review.json so future /multi-review invocations use this pool without the picker? ` +
+							`(Pick "no" to use the selection for THIS run only without persisting.)`,
+					);
+					if (persist) {
+						const result = persistReviewerChoices(picked);
+						if (result.ok) {
+							ctx.ui.notify(`multi-review · saved ${picked.length} reviewers to ${result.path}`, "success");
+							cacheConfigForFreshRead();
+						} else {
+							ctx.ui.notify(`multi-review · could not save (${result.error}); proceeding for this run only`, "warning");
+							TRANSIENT_REVIEWERS = picked;
+						}
+					} else {
+						ctx.ui.notify("multi-review · using picked pool for this run only (not persisted)", "info");
+						TRANSIENT_REVIEWERS = picked;
+					}
+				}
+			}
+		}
+		const result = await runMultiReviewFromArgs(pi, ctx, args, undefined);
+		ctx.ui.notify(result.notifyMessage, result.notifyLevel);
+		if (result.injectMessage) {
+			pi.sendMessage({ ...result.injectMessage, display: true });
+		}
+	}
 
 	// Slash command — surface-level UI entry point.
 	pi.registerCommand("multi-review", {
@@ -1180,10 +1499,51 @@ export default function (pi: ExtensionAPI) {
 			// undefined; we pass undefined and accept that the user can't
 			// hard-cancel mid-fan-out from here. The tool surface (next
 			// sibling) does pass signal — ctrl+c in tool context works.
-			const result = await runMultiReviewFromArgs(pi, ctx, args, undefined);
-			ctx.ui.notify(result.notifyMessage, result.notifyLevel);
-			if (result.injectMessage) {
-				pi.sendMessage({ ...result.injectMessage, display: true });
+			await runWithOptionalPicker(args, ctx);
+		},
+	});
+
+	// Slash command — picker entry point. Opens the multi-select TUI
+	// directly without running the rest of the pipeline. Useful for
+	// configuring the pool in advance without dragging scope into it.
+	pi.registerCommand("multi-review-pick", {
+		description:
+			"Open the multi-select picker for reviewer models. " +
+			"Saves selection to ~/.pi/agent/multi-review.json on confirm.",
+		handler: async (_args, ctx) => {
+			const available = await ctx.modelRegistry.getAvailable();
+			if (available.length === 0) {
+				ctx.ui.notify(
+					"multi-review-pick: no models in registry. Add them to ~/.pi/agent/models.json or /login first.",
+					"error",
+				);
+				return;
+			}
+			const cfg = loadConfig();
+			const picked = await pickReviewersViaTUI(ctx, available, cfg.reviewers);
+			if (!picked || picked.length === 0) {
+				ctx.ui.notify("multi-review-pick: cancelled.", "info");
+				return;
+			}
+			const persist = await ctx.ui.confirm(
+				"Save reviewers to multi-review.json?",
+				`Persist ${picked.length} reviewer${picked.length === 1 ? "" : "s"} to ~/.pi/agent/multi-review.json? ` +
+					`${
+						cfg.judge
+							? `(existing judge ${cfg.judge} will be preserved)`
+							: `(existing judge ${DEFAULTS.judge} will be set as the default if missing)`
+					}`,
+			);
+			if (!persist) {
+				ctx.ui.notify("multi-review-pick: cancelled at persist step.", "info");
+				return;
+			}
+			const result = persistReviewerChoices(picked);
+			if (result.ok) {
+				ctx.ui.notify(`multi-review-pick · saved ${picked.length} reviewers to ${result.path}`, "success");
+				cacheConfigForFreshRead();
+			} else {
+				ctx.ui.notify(`multi-review-pick · save failed: ${result.error}`, "error");
 			}
 		},
 	});

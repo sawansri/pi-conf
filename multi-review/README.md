@@ -18,11 +18,18 @@ that you can expand/collapse with `Ctrl+O` like any other entry.
 | Surface | How |
 |---------|-----|
 | Slash command | `/multi-review` (use defaults) · `/multi-review 4321` (review PR #4321) · `/multi-review focus the diff in `src/auth/*`` (free-text focus) |
+| Slash command | `/multi-review-pick` — open the multi-select TUI picker to choose reviewer models from your registry (with optional persist-to-`multi-review.json`) |
 | LLM-callable tool | The active agent can invoke `multi_review` when it decides a review would help — same params as the command. |
 
 `/multi-review` registers argument autocompletion with a few example shapes
 (`#1234`, a PR URL, `focus: …`) so the call shape is discoverable without
 memorization.
+
+If the configured reviewer pool is empty AND the agent has UI access,
+`/multi-review` opens the picker as a fallback so the user can set up the
+pool without leaving the active review. The user can opt to persist the
+choice (`/multi-review.json`) or use it for the current run only (transient
+override, never touches the file).
 
 ## Wire-up
 

@@ -78,6 +78,20 @@ Run a free-text review:
 /multi-review focus: the auth/ subdirectory, especially error handling
 ```
 
+Open the reviewer picker to (re-)configure your pool without dragging
+scope into it:
+```
+/multi-review-pick
+```
+
+Space toggles a selection, ↑↓ moves, Enter confirms, Esc cancels. On
+confirm you'll be asked whether to persist the selection to
+`multi-review.json` or use it for the current run only.
+
+If you run `/multi-review` with an empty pool AND no UI is available
+(e.g. RPC mode), you'll get the regular fallback warning instead of
+the picker.
+
 ### LLM-callable tool
 
 Ask the active agent for a review:
