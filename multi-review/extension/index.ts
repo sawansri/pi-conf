@@ -789,6 +789,136 @@ function formatGroup(g: DedupeGroup): string {
 	return `${badge.padEnd(20)} ${g.severity.toUpperCase().padEnd(8)} ${g.file}:${range}  ${g.title}`;
 }
 
+// ---------- judge pass ----------
+
+/**
+ * The judge sees the deduped groups with every per-model comment attached,
+ * not a flattened list. The schema forces it to write a markdown summary
+ * where each finding carries an attribution strip — that's the
+ * 'per-model labels preserved' requirement from the design.
+ */
+const JUDGE_SYSTEM_PROMPT = `You are a senior engineering lead synthesizing multiple code reviews. You receive a structured adjudication tree — do NOT invent or remove findings; rewrite them.
+
+Output a markdown document with this exact shape:
+
+# Multi-Model Code Review
+
+## Summary
+Two- to four-sentence overall assessment, then a one-line "Top risks" list ordered by severity.
+
+## Findings
+For each finding, in the order provided, write:
+
+### <severity> · <title>
+- **File:** <path>:<lines> (or "file" if line numbers null)
+- **Category:** <category>
+- **Consensus:** <reviewer-count> reviewers: <comma-separated list>
+- **Comments:**
+  - <spec 1>: <comment 1>
+  - <spec 2>: <comment 2>
+  - …
+
+End each finding with a sub-bullet:
+  - **Judge's take:** <one sentence; explain mechanics, root cause, or suggest a concrete fix.>
+
+After the findings, if any models errored or produced unparseable output, add a final '## Coverage' section listing missing reviewers.
+
+Rules:
+- Never merge findings the user didn't ask to merge.
+- Keep each finding ≤ 80 words (excluding the per-model comments list).
+- Use file paths exactly as given — do not rewrite to absolute paths.
+- Severity ladder is critical > high > medium > low > info > none.
+- If two reviewers disagree in framing, surface both — do not pick one.`;
+
+interface JudgeResult {
+	markdown: string;
+	stopReason: string;
+	errorMessage?: string;
+	usage?: { input: number; output: number; total: number; cost: number };
+	durationMs: number;
+}
+
+function renderGroupsForJudge(target: ReviewTarget, groups: DedupeGroup[]): string {
+	const lines: string[] = [];
+	lines.push("## Review target");
+	lines.push(`kind: ${target.kind}`);
+	lines.push(`label: ${target.label}`);
+	if (target.metaLines.length > 0) {
+		lines.push("");
+		lines.push("metadata:");
+		lines.push(...target.metaLines);
+	}
+	if (target.focusHint) {
+		lines.push("");
+		lines.push(`focus hint: ${target.focusHint}`);
+	}
+	lines.push("");
+	lines.push("## Deduped findings (in severity order)");
+	if (groups.length === 0) {
+		lines.push("(no findings across reviewers)");
+	} else {
+		for (const g of groups) {
+			const range = formatRange(g.line_start, g.line_end);
+			lines.push(
+				`- ${g.severity.toUpperCase()}  ${g.file}:${range}  consensus=${g.consensus ? "yes" : "no"} (${g.reviewerSpecs.length} reviewers)`,
+			);
+			lines.push(`    category: ${g.category}`);
+			lines.push(`    titles:`);
+			for (const t of g.titles) lines.push(`      - ${t}`);
+			lines.push(`    per-reviewer:`);
+			for (const m of g.members) {
+				lines.push(`      - ${m.spec} (severity=${m.severity}):`);
+				// Indent the comment so the judge can paste it into the markdown verbatim.
+				for (const cl of m.comment.split("\n")) lines.push(`          ${cl}`);
+			}
+		}
+	}
+	return lines.join("\n");
+}
+
+async function runJudge(
+	judgeModel: Model,
+	groups: DedupeGroup[],
+	target: ReviewTarget,
+	failedSpecs: ModelSpec[],
+	ctx: ExtensionContext,
+	abortSignal: AbortSignal | undefined,
+	temperature: number,
+): Promise<JudgeResult> {
+	const started = Date.now();
+	const { completeSimple } = await import("@mariozechner/pi-ai");
+
+	const groupsPayload = renderGroupsForJudge(target, groups);
+	const coverage = failedSpecs.length > 0
+		? `, missing: ${failedSpecs.join(", ")}`
+		: "";
+	const userPrompt = `${groupsPayload}\n\n## Coverage notes\nReviewers that didn't return usable output: ${failedSpecs.length}${coverage}\n\nNow produce the markdown per the schema in the system prompt. Output ONLY markdown — no preamble, no "Here's the review:" opener.`;
+
+	const response = await completeSimple(
+		judgeModel,
+		{ systemPrompt: JUDGE_SYSTEM_PROMPT, messages: [{ role: "user", content: [{ type: "text", text: userPrompt }] }] },
+		{ signal: abortSignal, temperature, maxTokens: 8192 },
+	);
+	const text = response.content
+		.filter((c) => c.type === "text")
+		.map((c) => (c as { type: "text"; text: string }).text)
+		.join("");
+	return {
+		markdown: text,
+		stopReason: response.stopReason,
+		errorMessage: response.errorMessage,
+		usage: response.usage
+			? {
+				input: response.usage.input,
+				output: response.usage.output,
+				total: response.usage.totalTokens,
+				cost: response.usage.cost?.total ?? 0,
+			}
+			: undefined,
+		durationMs: Date.now() - started,
+	};
+}
+
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		const cfg = loadConfig();
@@ -863,11 +993,16 @@ export default function (pi: ExtensionAPI) {
 			setStatus(`multi-review · dedupe pass`, ctx);
 
 			const groups = dedupeReviewerFindings(completedRunResults);
-			setStatus(`multi-review · ${groups.length} groups (judge lands in commit 6)`, ctx);
+			setStatus(`multi-review · ${groups.length} groups · invoking judge ${cfg.judge}`, ctx);
+
+			const failedSpecs = completedRunResults.filter((r) => !r.ok).map((r) => r.spec);
+			const judgeResult = await runJudge(judge!, groups, target, failedSpecs, ctx, undefined, cfg.temperature);
+			setStatus(`multi-review · judge finished (${(judgeResult.durationMs / 1000).toFixed(1)}s)`, ctx);
 
 			const lines: string[] = [
-				`multi-review · fan-out + dedupe finished`,
+				`multi-review · fan-out + dedupe + judge finished`,
 				`scope: ${target.label}   files: ${target.files.length}   diff bytes: ${target.diffText.length}`,
+				`judge: ${cfg.judge}   (${(judgeResult.durationMs / 1000).toFixed(1)}s${judgeResult.usage ? `, $${judgeResult.usage.cost.toFixed(4)}` : ""})`,
 				``,
 				`per-reviewer:`,
 			];
@@ -878,16 +1013,14 @@ export default function (pi: ExtensionAPI) {
 				lines.push(`  ${icon} ${r.spec}  findings=${r.findings.length}  ${dur}${usage}`);
 				if (!r.ok && r.errorMessage) lines.push(`      error: ${r.errorMessage.slice(0, 240)}`);
 			}
-			lines.push(
-				``,
-				`deduped groups (${groups.length}):`,
-			);
-			for (const g of groups) {
-				lines.push(`  ${formatGroup(g)}`);
-				for (const m of g.members) {
-					lines.push(`      · ${m.spec}: ${m.comment.slice(0, 240)}`);
-				}
-			}
+			lines.push(`  → ${groups.length} deduped groups; consensus on ${groups.filter((g) => g.consensus).length}`);
+
+			// Show the first chunk of judge markdown inline (notify caps at a few KB anyway).
+			const previewChars = 4000;
+			const judgePreview = judgeResult.markdown.length > previewChars
+				? judgeResult.markdown.slice(0, previewChars) + "\n…(truncated for notify; full text lands in commit 7 render)"
+				: judgeResult.markdown;
+			lines.push(``, `--- judge output ---`, judgePreview);
 
 			ctx.ui.notify(lines.join("\n"), "info");
 		},
