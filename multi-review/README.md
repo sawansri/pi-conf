@@ -10,8 +10,11 @@ any provider that has an API key wired into `~/.pi/agent/auth.json`).
 A single command (or LLM tool call) sends the same review prompt + scope to
 several models in parallel, collects structured JSON findings, dedupes them
 across models, then asks one "judge" model to write a final markdown summary
-that preserves per-model labels. The result is injected as a session message
-that you can expand/collapse with `Ctrl+O` like any other entry.
+that preserves per-model labels. While it runs, pi shows live progress
+(reviewer count, latest completed model, judge/dedupe phase) in the status
+area/widget and streams tool updates when called via `multi_review`. The result
+is injected as a session message that you can expand/collapse with `Ctrl+O`
+like any other entry.
 
 ## Invocation surface
 
@@ -211,5 +214,6 @@ expose per-row level controls is tracked as future polish.
 - **Sub-process sharding.** Following the `completeSimple()` in-process
   pattern, not the `subagent`-style subprocess spawn. Single fire-time,
   no per-reviewer tool sandbox.
-- **Interactive reviewer picker.** Empty pool currently just notifies.
-  A `ctx.ui.custom()` multi-select picker is a future polish item.
+- **Full model configuration UI.** The picker selects reviewer models only.
+  Per-reviewer thinking levels and judge choice are still edited directly in
+  `multi-review.json`.

@@ -24,7 +24,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ExtensionAPI, ExtensionContext, ExecResult } from "@mariozechner/pi-coding-agent";
+import type { AgentToolUpdateCallback, ExtensionAPI, ExtensionContext, ExecResult } from "@mariozechner/pi-coding-agent";
 import type { Model } from "@mariozechner/pi-ai";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { getAgentDir, getMarkdownTheme } from "@mariozechner/pi-coding-agent";
@@ -335,6 +335,102 @@ function setStatus(text: string | undefined, ctx: ExtensionContext) {
 	ctx.ui.setStatus(STATUS_KEY, text);
 }
 
+// ---------- progress surface ----------
+
+const PROGRESS_WIDGET_KEY = "multi-review-progress";
+
+type ToolUpdateFn = AgentToolUpdateCallback<any> | undefined;
+
+interface MultiReviewProgressPatch {
+	phase: string;
+	done?: number;
+	total?: number;
+	latest?: string;
+}
+
+interface MultiReviewProgressReporter {
+	update(patch: MultiReviewProgressPatch): void;
+	finish(summary: string): void;
+	clear(): void;
+}
+
+function shortSpec(spec: string): string {
+	return spec.split("/").pop() || spec;
+}
+
+function formatReviewerProgressLine(done: number, total: number, latest: ReviewerRunResult): string {
+	const verdict = latest.ok ? "✓" : "✗";
+	const findings = latest.ok ? `${latest.findings.length} finding${latest.findings.length === 1 ? "" : "s"}` : (latest.errorMessage ?? "error");
+	const cost = latest.usage?.cost ? `, $${latest.usage.cost.toFixed(4)}` : "";
+	return `${verdict} ${shortSpec(latest.formattedSpec)} (${done}/${total}) — ${findings}, ${(latest.durationMs / 1000).toFixed(1)}s${cost}`;
+}
+
+function createProgressReporter(ctx: ExtensionContext, mode: ReviewMode, onUpdate?: ToolUpdateFn): MultiReviewProgressReporter {
+	const startedAt = Date.now();
+	const events: string[] = [];
+	let state: Required<Pick<MultiReviewProgressPatch, "phase">> & Omit<MultiReviewProgressPatch, "phase"> = {
+		phase: "starting",
+	};
+	let clearTimer: ReturnType<typeof setTimeout> | undefined;
+
+	function renderLines(theme: { fg: (color: string, text: string) => string }, width: number): string[] {
+		const elapsed = `${Math.max(0, Math.round((Date.now() - startedAt) / 1000))}s`;
+		const progress = state.done !== undefined && state.total !== undefined
+			? ` ${state.done}/${state.total}`
+			: "";
+		const pct = state.done !== undefined && state.total
+			? Math.max(0, Math.min(1, state.done / state.total))
+			: 0;
+		const barWidth = 12;
+		const filled = Math.round(pct * barWidth);
+		const bar = state.done !== undefined && state.total !== undefined
+			? ` ${"█".repeat(filled)}${"░".repeat(barWidth - filled)}`
+			: "";
+		const lines = [
+			truncateToWidth(theme.fg("accent", `multi-review · ${mode}`) + theme.fg("text", ` · ${state.phase}${progress}${bar} · ${elapsed}`), width),
+		];
+		if (state.latest) lines.push(truncateToWidth(theme.fg("dim", `latest: ${state.latest}`), width));
+		for (const ev of events.slice(-3)) lines.push(truncateToWidth(theme.fg("muted", `  ${ev}`), width));
+		return lines;
+	}
+
+	function publish(): void {
+		if (clearTimer) {
+			clearTimeout(clearTimer);
+			clearTimer = undefined;
+		}
+		setStatus(`multi-review · mode=${mode} · ${state.phase}${state.done !== undefined && state.total !== undefined ? ` (${state.done}/${state.total})` : ""}`, ctx);
+		if (ctx.hasUI) {
+			ctx.ui.setWidget(PROGRESS_WIDGET_KEY, (_tui, theme) => ({
+				render: (width: number) => renderLines(theme, width),
+				invalidate: () => {},
+			}), { placement: "belowEditor" });
+		}
+		onUpdate?.({
+			content: [{ type: "text", text: `multi-review · ${mode} · ${state.phase}${state.done !== undefined && state.total !== undefined ? ` (${state.done}/${state.total})` : ""}${state.latest ? `\n${state.latest}` : ""}` }],
+			details: { phase: state.phase, done: state.done, total: state.total, latest: state.latest, mode },
+		});
+	}
+
+	return {
+		update(patch: MultiReviewProgressPatch): void {
+			state = { ...state, ...patch };
+			if (patch.latest) events.push(patch.latest);
+			publish();
+		},
+		finish(summary: string): void {
+			state = { ...state, phase: summary, latest: undefined };
+			publish();
+			clearTimer = setTimeout(() => this.clear(), 4000);
+		},
+		clear(): void {
+			if (clearTimer) clearTimeout(clearTimer);
+			clearTimer = undefined;
+			ctx.ui.setWidget(PROGRESS_WIDGET_KEY, undefined);
+		},
+	};
+}
+
 // ---------- scope resolution ----------
 
 /**
@@ -629,7 +725,7 @@ function parseGitignore(content: string): GitignorePattern[] {
 /**
  * Adapt a parsed gitignore pattern into the string we feed to the regex
  * compiler. Unanchored patterns with no internal '/' behave like
- * `**/<body>` (match at any depth); anchored patterns stay as-is.
+ * a globstar-prefix form (match at any depth); anchored patterns stay as-is.
  */
 function patternSemanticsFor(p: GitignorePattern): { candidate: string; anchored: boolean } {
 	let body = p.pattern;
@@ -648,7 +744,7 @@ function patternSemanticsFor(p: GitignorePattern): { candidate: string; anchored
  *   `?`   any single char except '/'
  *   `[abc]` character class (uses JS regex semantics, including ranges)
  *   `**`  any chars including '/' (only meaningful when paired with `/`,
- *         either prefix `**/x` or suffix `x/**`)
+ *         either as a globstar prefix or suffix)
  *
  * Limitations (documented):
  * - No alternation `{a,b}` and no extglob `+(a|b)`.
@@ -1342,6 +1438,30 @@ function renderGroupsForJudge(target: ReviewTarget, groups: DedupeGroup[]): stri
  * Schema mirrors what the prompted judge produces so downstream tooling
  * doesn't need a separate light-mode branch.
  */
+function synthesizeNoFindingsMarkdown(target: ReviewTarget, reviewerRuns: ReviewerRunResult[], modeLabel = "balanced"): string {
+	const ok = reviewerRuns.filter((r) => r.ok);
+	const failed = reviewerRuns.filter((r) => !r.ok);
+	const lines: string[] = [];
+	lines.push(`# Multi-Model Code Review (${modeLabel})`);
+	lines.push("");
+	lines.push("## Summary");
+	lines.push(
+		`Scope: \`${target.label}\`. No findings were reported by ${ok.length} reviewer${ok.length === 1 ? "" : "s"}. ` +
+			"Judge synthesis was skipped because there were no deduplicated groups to adjudicate.",
+	);
+	lines.push("");
+	lines.push("## Reviewer coverage");
+	for (const r of reviewerRuns) {
+		const status = r.ok ? "ok" : `failed: ${r.errorMessage?.slice(0, 160) ?? "unknown"}`;
+		lines.push(`- \`${r.formattedSpec}\` — ${status}; ${(r.durationMs / 1000).toFixed(1)}s`);
+	}
+	if (failed.length > 0) {
+		lines.push("");
+		lines.push("Note: failed reviewers are excluded from the no-findings assessment.");
+	}
+	return lines.join("\n");
+}
+
 function synthesizeMarkdownFromGroups(
 	target: ReviewTarget,
 	groups: DedupeGroup[],
@@ -1463,11 +1583,14 @@ async function runTriageFanOut(
 	temperature: number,
 	abortSignal: AbortSignal | undefined,
 	ctx: ExtensionContext,
+	onProgress?: (done: number, total: number, latest: ReviewerRunResult) => void,
 ): Promise<TriageFanOutResult> {
 	const runs: ReviewerRunResult[] = new Array(resolved.length);
 	const verdicts: Array<{ spec: string; verdict: TriageVerdict }> = new Array(resolved.length);
 	const cap = Math.max(1, Math.min(MAX_PARALLEL, concurrency, resolved.length));
 	let cursor = 0;
+	let done = 0;
+	const total = resolved.length;
 	const worker = async (): Promise<void> => {
 		while (true) {
 			if (abortSignal?.aborted) return;
@@ -1492,6 +1615,8 @@ async function runTriageFanOut(
 				};
 				runs[idx] = full;
 				verdicts[idx] = { spec: full.formattedSpec, verdict: parseTriageJson(full.rawText) };
+				done++;
+				onProgress?.(done, total, full);
 			} catch (err) {
 				const full: ReviewerRunResult = {
 					formattedSpec: formatReviewerSpec(slot.rs),
@@ -1508,6 +1633,8 @@ async function runTriageFanOut(
 				};
 				runs[idx] = full;
 				verdicts[idx] = { spec: full.formattedSpec, verdict: { escalate: false, files_to_escalate: [], reasoning: "" } };
+				done++;
+				onProgress?.(done, total, full);
 			}
 		}
 	};
@@ -1953,11 +2080,14 @@ async function runCouncilRound2FanOut(
 	concurrency: number,
 	signal: AbortSignal | undefined,
 	ctx: ExtensionContext,
+	onProgress?: (done: number, total: number, latest: ReviewerRunResult) => void,
 ): Promise<Array<{ run: ReviewerRunResult; verdicts: Map<string, CouncilVerdict> }>> {
 	const aliases = computeCouncilAliases(resolved.length);
 	const r2Results: Array<{ run: ReviewerRunResult; verdicts: Map<string, CouncilVerdict> }> = new Array(resolved.length);
 	const cap = Math.max(1, Math.min(MAX_PARALLEL, concurrency, resolved.length));
 	let cursor = 0;
+	let done = 0;
+	const total = resolved.length;
 	const worker = async (): Promise<void> => {
 		while (true) {
 			if (signal?.aborted) return;
@@ -1985,6 +2115,8 @@ async function runCouncilRound2FanOut(
 				const expectedIds = new Set(groups.map((g) => g.id));
 				const parsed = parseCouncilJson(full.rawText, expectedIds);
 				r2Results[idx] = { run: full, verdicts: parsed.verdicts };
+				done++;
+				onProgress?.(done, total, full);
 			} catch (err) {
 				const full: ReviewerRunResult = {
 					formattedSpec: formatReviewerSpec(slot.rs),
@@ -2000,6 +2132,8 @@ async function runCouncilRound2FanOut(
 					durationMs: 0,
 				};
 				r2Results[idx] = { run: full, verdicts: new Map() };
+				done++;
+				onProgress?.(done, total, full);
 			}
 		}
 	};
@@ -2245,9 +2379,8 @@ async function pickReviewersViaTUI(
 ): Promise<ModelSpec[] | null> {
 	if (!ctx.hasUI) {
 		// Best-effort fallback for print/RPC modes: select first pre-existing
-		// spec that resolves else fail cleanly. We've already filtered the
-		// pool upstream so this should never be the only path. We keep the
-		// bare spec only (drop any @level suffix from the storage form).
+		// spec that resolves else fail cleanly. We keep the bare spec only
+		// (drop any @level suffix from the storage form).
 		const first = preSelect.find((s) => {
 			const bare = parseReviewerSpec(s)?.spec ?? s;
 			return models.some((m) => `${m.provider}/${m.id}` === bare);
@@ -2258,34 +2391,59 @@ async function pickReviewersViaTUI(
 	}
 
 	const { rows, modelRowIndexToSpec } = buildPickerRows(models);
+	const specToModelIndex = new Map<ModelSpec, number>();
+	for (const [idx, spec] of modelRowIndexToSpec) specToModelIndex.set(spec, idx);
+
 	const preSelectedModelIndices = new Set<number>();
 	for (const spec of preSelect) {
 		const parsed = parseReviewerSpec(spec);
-		const bareSpec = parsed?.spec ?? spec;
-		let idx = 0;
-		for (const m of models) {
-			if (`${m.provider}/${m.id}` === bareSpec) {
-				preSelectedModelIndices.add(idx);
-				break;
-			}
-			idx++;
-		}
+		const bareSpec = (parsed?.spec ?? spec) as ModelSpec;
+		const idx = specToModelIndex.get(bareSpec);
+		if (idx !== undefined) preSelectedModelIndices.add(idx);
 	}
 
-	// Build a contiguous-of-model-rows cursor space. Provider headers are
-	// selectable-but-empty so navigation can land on them; hitting space on
-	// a header is a no-op (selected count stays 0). Cursor pre-positions on
-	// the first model row.
 	const cursorToModelIndex: number[] = rows.map((r) => (r.kind === "model" ? (r.modelIndex ?? -1) : -1));
-	let cursor = rows.findIndex((r) => r.kind === "model");
-	if (cursor < 0) cursor = 0;
+	const firstModelRow = rows.findIndex((r) => r.kind === "model");
+	let cursor = firstModelRow >= 0 ? firstModelRow : 0;
+	let scrollTop = 0;
 
 	const result = await ctx.ui.custom<{ spec: ModelSpec }[] | null>((_tui, theme, _kb, done) => {
 		const selected = new Set<number>(preSelectedModelIndices);
 		let cachedLines: string[] | undefined;
+		let cachedWidth: number | undefined;
+		const visibleBodyRows = 16;
+
+		function isModelRow(i: number): boolean {
+			return i >= 0 && i < rows.length && rows[i].kind === "model";
+		}
+
+		function moveCursor(delta: number): void {
+			if (rows.length === 0) return;
+			let next = cursor;
+			for (let n = 0; n < rows.length; n++) {
+				next = (next + delta + rows.length) % rows.length;
+				if (isModelRow(next)) {
+					cursor = next;
+					return;
+				}
+			}
+		}
+
+		function jumpModels(delta: number): void {
+			const dir = delta < 0 ? -1 : 1;
+			for (let i = 0; i < Math.abs(delta); i++) moveCursor(dir);
+		}
+
+		function adjustScroll(): void {
+			if (cursor < scrollTop) scrollTop = cursor;
+			if (cursor >= scrollTop + visibleBodyRows) scrollTop = cursor - visibleBodyRows + 1;
+			scrollTop = Math.max(0, Math.min(scrollTop, Math.max(0, rows.length - visibleBodyRows)));
+		}
 
 		function refresh() {
 			cachedLines = undefined;
+			cachedWidth = undefined;
+			adjustScroll();
 			_tui.requestRender();
 		}
 
@@ -2294,7 +2452,6 @@ async function pickReviewersViaTUI(
 				done(null);
 				return;
 			}
-			// Translate model indices back to specs in their picker order.
 			const specList: { spec: ModelSpec }[] = [];
 			const seen = new Set<ModelSpec>();
 			for (let i = 0; i < rows.length; i++) {
@@ -2309,8 +2466,15 @@ async function pickReviewersViaTUI(
 			done(specList);
 		}
 
+		function toggleCursor(): void {
+			const mi = cursorToModelIndex[cursor];
+			if (mi < 0) return;
+			if (selected.has(mi)) selected.delete(mi);
+			else selected.add(mi);
+		}
+
 		function handleInput(data: string): void {
-			if (matchesKey(data, Key.escape)) {
+			if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
 				commit(true);
 				return;
 			}
@@ -2319,56 +2483,72 @@ async function pickReviewersViaTUI(
 				return;
 			}
 			if (matchesKey(data, Key.up)) {
-				cursor = cursor > 0 ? cursor - 1 : rows.length - 1;
+				moveCursor(-1);
 				refresh();
 				return;
 			}
 			if (matchesKey(data, Key.down)) {
-				cursor = cursor < rows.length - 1 ? cursor + 1 : 0;
+				moveCursor(1);
+				refresh();
+				return;
+			}
+			if (matchesKey(data, Key.pageUp)) {
+				jumpModels(-10);
+				refresh();
+				return;
+			}
+			if (matchesKey(data, Key.pageDown)) {
+				jumpModels(10);
+				refresh();
+				return;
+			}
+			if (matchesKey(data, Key.home)) {
+				cursor = firstModelRow >= 0 ? firstModelRow : 0;
+				refresh();
+				return;
+			}
+			if (matchesKey(data, Key.end)) {
+				for (let i = rows.length - 1; i >= 0; i--) {
+					if (isModelRow(i)) {
+						cursor = i;
+						break;
+					}
+				}
 				refresh();
 				return;
 			}
 			if (matchesKey(data, Key.space) || data === " ") {
-				const mi = cursorToModelIndex[cursor];
-				if (mi < 0) return;
-				if (selected.has(mi)) selected.delete(mi);
-				else selected.add(mi);
+				toggleCursor();
 				refresh();
 				return;
 			}
-			// Quick-select: number keys 0-9 toggle the Nth model row.
-			const num = data >= "0" && data <= "9" ? Number(data) : -1;
-			if (num >= 0) {
-				const modelRows = rows
-					.map((r, i) => ({ r, i }))
-					.filter(({ r }) => r.kind === "model")
-					.slice(num * 10, num * 10 + 10);
-				if (modelRows.length > 0) {
-					const row = modelRows[0];
-					cursor = row.i;
-					const mi = cursorToModelIndex[cursor];
-					if (mi >= 0) {
-						if (selected.has(mi)) selected.delete(mi);
-						else selected.add(mi);
-					}
-					refresh();
-				}
+			if (data === "a") {
+				for (const idx of modelRowIndexToSpec.keys()) selected.add(idx);
+				refresh();
+				return;
+			}
+			if (data === "A") {
+				selected.clear();
+				refresh();
 			}
 		}
 
 		function render(width: number): string[] {
-			if (cachedLines) return cachedLines;
+			if (cachedLines && cachedWidth === width) return cachedLines;
+			adjustScroll();
 			const lines: string[] = [];
 			const add = (s: string) => lines.push(truncateToWidth(s, width));
 			add(theme.fg("accent", "─".repeat(width)));
 			add(theme.fg("text", theme.bold(" Pick reviewer models ")));
-			add(theme.fg("dim", "Space toggles · ↑↓ moves · Enter confirms · Esc cancels"));
+			add(theme.fg("dim", "Space toggles · ↑↓ moves · PgUp/PgDn jumps · a selects all · A clears · Enter confirms · Esc cancels"));
 			lines.push("");
 
-			for (let i = 0; i < rows.length; i++) {
+			const end = Math.min(rows.length, scrollTop + visibleBodyRows);
+			if (scrollTop > 0) add(theme.fg("dim", ` … ${scrollTop} row${scrollTop === 1 ? "" : "s"} above`));
+			for (let i = scrollTop; i < end; i++) {
 				const r = rows[i];
 				if (r.kind === "provider-header") {
-					add(theme.fg("dim", " " + r.provider));
+					add(theme.fg("dim", ` ${r.provider}`));
 					continue;
 				}
 				const isCursor = i === cursor;
@@ -2377,16 +2557,18 @@ async function pickReviewersViaTUI(
 				const cursorMark = isCursor ? theme.fg("accent", "> ") : "  ";
 				const box = isSelected ? theme.fg("success", "[x]") : theme.fg("muted", "[ ]");
 				const label = theme.fg(isSelected ? "success" : "text", r.spec ?? "");
-				add(`${cursorMark}${isSelected ? box + " " + label : box + " " + label}`);
-				if (r.description) add(`     ${theme.fg("dim", r.description)}`);
+				const desc = r.description ? theme.fg("dim", ` — ${r.description}`) : "";
+				add(`${cursorMark}${box} ${label}${desc}`);
 			}
+			if (end < rows.length) add(theme.fg("dim", ` … ${rows.length - end} row${rows.length - end === 1 ? "" : "s"} below`));
 
 			lines.push("");
 			const n = selected.size;
-			add(theme.fg("muted", ` ${n} reviewer${n === 1 ? "" : "s"} selected.`));
+			add(theme.fg("muted", ` ${n} reviewer${n === 1 ? "" : "s"} selected · showing ${scrollTop + 1}-${end} of ${rows.length} rows.`));
 			if (n === 0) add(theme.fg("warning", " Tip: space-toggle at least one to enable Enter."));
 			add(theme.fg("accent", "─".repeat(width)));
 			cachedLines = lines;
+			cachedWidth = width;
 			return lines;
 		}
 
@@ -2394,9 +2576,13 @@ async function pickReviewersViaTUI(
 			render,
 			invalidate: () => {
 				cachedLines = undefined;
+				cachedWidth = undefined;
 			},
 			handleInput,
 		};
+	}, {
+		overlay: true,
+		overlayOptions: { width: "90%", minWidth: 60, maxHeight: "80%", anchor: "center" },
 	});
 
 	if (!result) return null;
@@ -2460,15 +2646,18 @@ async function runMultiReviewFromArgs(
 	rawArgs: string,
 	signal: AbortSignal | undefined,
 	transientReviewers: ModelSpec[] | null = TRANSIENT_REVIEWERS,
+	onUpdate?: ToolUpdateFn,
 ): Promise<MultiReviewRunResult> {
 	const cfg = loadConfig();
 	// If the caller passes transientReviewers (e.g. from a one-off picker
 	// session that the user opted not to persist), bypass the configured
 	// pool for this run only. Keeping the override list distinct from cfg
 	// means we never silently mutate the user's persisted defaults.
-	const effectiveReviewerSpecs: string[] = transientReviewers && transientReviewers.length > 0
+	const usingTransientReviewers = transientReviewers !== null && transientReviewers.length > 0;
+	const effectiveReviewerSpecs: string[] = usingTransientReviewers
 		? transientReviewers
 		: cfg.reviewers;
+	if (usingTransientReviewers && transientReviewers === TRANSIENT_REVIEWERS) TRANSIENT_REVIEWERS = null;
 	if (effectiveReviewerSpecs.length === 0) {
 		return {
 			kind: "notify",
@@ -2516,25 +2705,33 @@ async function runMultiReviewFromArgs(
 		};
 	}
 
-	const parsed = parseReviewArgs(argsAfterMode);
-	setStatus(`multi-review · mode=${mode} · resolving scope…`, ctx);
-	const target = await buildReviewTarget(pi, parsed, ctx.cwd);
-	const userPrompt = buildReviewUserPrompt(target);
+	const progress = createProgressReporter(ctx, mode, onUpdate);
+	try {
+		const parsed = parseReviewArgs(argsAfterMode);
+		progress.update({ phase: "resolving scope" });
+		const target = await buildReviewTarget(pi, parsed, ctx.cwd);
+		const userPrompt = buildReviewUserPrompt(target);
 
-	const resolvedRows = resolved.map((r) => ({ rs: r.rs, model: r.model, clamped: r.clamped }));
+		const resolvedRows = resolved.map((r) => ({ rs: r.rs, model: r.model, clamped: r.clamped }));
 
-	setStatus(`multi-review · mode=${mode} · fanning out to ${resolved.length} reviewers (cap ${cfg.concurrency})`, ctx);
-	if (mode === "balanced") {
-		return await runBalancedPipeline(target, resolvedRows, userPrompt, cfg, judge!, ctx, pi, signal);
+		progress.update({ phase: `fanning out to ${resolved.length} reviewers (cap ${cfg.concurrency})`, done: 0, total: resolved.length });
+		let result: MultiReviewRunResult;
+		if (mode === "balanced") {
+			result = await runBalancedPipeline(target, resolvedRows, userPrompt, cfg, judge!, ctx, pi, signal, progress);
+		} else if (mode === "light") {
+			result = await runLightPipeline(target, resolvedRows, userPrompt, cfg, ctx, signal, progress);
+		} else if (mode === "council") {
+			result = await runCouncilPipeline(target, resolvedRows, userPrompt, cfg, judge!, ctx, pi, signal, progress);
+		} else {
+			// mode === "triage"
+			result = await runTriagePipeline(target, resolvedRows, userPrompt, cfg, ctx, pi, signal, progress);
+		}
+		progress.finish("done");
+		return result;
+	} catch (err) {
+		progress.finish("failed");
+		throw err;
 	}
-	if (mode === "light") {
-		return await runLightPipeline(target, resolvedRows, userPrompt, cfg, ctx, signal);
-	}
-	if (mode === "council") {
-		return await runCouncilPipeline(target, resolvedRows, userPrompt, cfg, judge!, ctx, pi, signal);
-	}
-	// mode === "triage"
-	return await runTriagePipeline(target, resolvedRows, userPrompt, cfg, ctx, pi, signal);
 }
 
 /**
@@ -2551,6 +2748,7 @@ async function runBalancedPipeline(
 	ctx: ExtensionContext,
 	pi: ExtensionAPI,
 	signal: AbortSignal | undefined,
+	progress?: MultiReviewProgressReporter,
 ): Promise<MultiReviewRunResult> {
 	const completedRunResults = await runAllReviewers(
 		resolved,
@@ -2560,13 +2758,39 @@ async function runBalancedPipeline(
 		cfg.temperature,
 		signal,
 		ctx,
+		(done, total, latest) => progress?.update({ phase: "reviewers running", done, total, latest: formatReviewerProgressLine(done, total, latest) }),
 	);
+	progress?.update({ phase: "dedupe pass", done: resolved.length, total: resolved.length });
 	setStatus(`multi-review · dedupe pass`, ctx);
 	const groups = dedupeReviewerFindings(completedRunResults);
-	setStatus(`multi-review · ${groups.length} groups · invoking judge ${cfg.judge}`, ctx);
-
 	const failedSpecs = completedRunResults.filter((r) => !r.ok).map((r) => r.spec);
-	const judgeResult = await runJudge(judge, groups, target, failedSpecs, ctx, signal, cfg.temperature);
+	let judgeResult: JudgeResult;
+	let judgeLine: string;
+	if (groups.length === 0) {
+		progress?.update({ phase: "no findings · skipping judge", done: completedRunResults.length, total: completedRunResults.length });
+		setStatus(`multi-review · no findings · skipping judge`, ctx);
+		judgeResult = {
+			markdown: synthesizeNoFindingsMarkdown(target, completedRunResults, "balanced · judge skipped"),
+			stopReason: "skipped-no-findings",
+			durationMs: 0,
+		};
+		judgeLine = `judge: skipped (0 dedupe groups)`;
+	} else {
+		setStatus(`multi-review · ${groups.length} groups · invoking judge ${cfg.judge}`, ctx);
+		progress?.update({ phase: `${groups.length} groups · invoking judge ${shortSpec(cfg.judge)}`, done: undefined, total: undefined });
+		judgeResult = await runJudge(judge, groups, target, failedSpecs, ctx, signal, cfg.temperature);
+		if (!judgeResult.markdown.trim()) {
+			judgeResult = {
+				...judgeResult,
+				markdown:
+					`# Multi-Model Code Review (balanced · judge returned empty)\n\n` +
+					`Judge model \`${cfg.judge}\` returned no markdown (stopReason=${judgeResult.stopReason}${judgeResult.errorMessage ? `, error=${judgeResult.errorMessage}` : ""}). ` +
+					`Showing deterministic no-judge synthesis instead.\n\n` +
+					synthesizeMarkdownFromGroups(target, groups, completedRunResults),
+			};
+		}
+		judgeLine = `judge: ${cfg.judge}   (${(judgeResult.durationMs / 1000).toFixed(1)}s${judgeResult.usage ? `, $${judgeResult.usage.cost.toFixed(4)}` : ""}${judgeResult.errorMessage ? `, error: ${judgeResult.errorMessage.slice(0, 120)}` : ""})`;
+	}
 	setStatus(`multi-review · done`, ctx);
 
 	const details: MultiReviewDetails = {
@@ -2585,7 +2809,7 @@ async function runBalancedPipeline(
 		notifyMessage:
 			`multi-review · mode=balanced · done — review injected into chat\n` +
 			`scope: ${target.label}   files: ${target.files.length}   diff bytes: ${target.diffText.length}\n` +
-			`judge: ${cfg.judge}   (${(judgeResult.durationMs / 1000).toFixed(1)}s${judgeResult.usage ? `, $${judgeResult.usage.cost.toFixed(4)}` : ""})\n` +
+			`${judgeLine}\n` +
 			`reviewers: ${completedRunResults.length}   dedupe groups: ${groups.length}   consensus: ${details.consensusCount}\n` +
 			`Press Ctrl+O on the chat entry to expand per-model attribution + full judge markdown.`,
 		notifyLevel: "info",
@@ -2610,6 +2834,7 @@ async function runLightPipeline(
 	cfg: MultiReviewConfig,
 	ctx: ExtensionContext,
 	signal: AbortSignal | undefined,
+	progress?: MultiReviewProgressReporter,
 ): Promise<MultiReviewRunResult> {
 	const completedRunResults = await runAllReviewers(
 		resolved,
@@ -2619,7 +2844,9 @@ async function runLightPipeline(
 		cfg.temperature,
 		signal,
 		ctx,
+		(done, total, latest) => progress?.update({ phase: "reviewers running", done, total, latest: formatReviewerProgressLine(done, total, latest) }),
 	);
+	progress?.update({ phase: "dedupe pass (no judge)", done: resolved.length, total: resolved.length });
 	setStatus(`multi-review · mode=light · dedupe pass (no judge)`, ctx);
 	const groups = dedupeReviewerFindings(completedRunResults);
 	const markdown = synthesizeMarkdownFromGroups(target, groups, completedRunResults);
@@ -2686,6 +2913,7 @@ async function runCouncilPipeline(
 	ctx: ExtensionContext,
 	pi: ExtensionAPI,
 	signal: AbortSignal | undefined,
+	progress?: MultiReviewProgressReporter,
 ): Promise<MultiReviewRunResult> {
 	setStatus(`multi-review · mode=council · round 1 (raise)`, ctx);
 	const r1Runs = await runAllReviewers(
@@ -2696,7 +2924,9 @@ async function runCouncilPipeline(
 		cfg.temperature,
 		signal,
 		ctx,
+		(done, total, latest) => progress?.update({ phase: "council round 1", done, total, latest: formatReviewerProgressLine(done, total, latest) }),
 	);
+	progress?.update({ phase: "council dedupe pass", done: resolved.length, total: resolved.length });
 	setStatus(`multi-review · mode=council · dedupe pass`, ctx);
 	const groups = dedupeReviewerFindings(r1Runs);
 	const aliases = computeCouncilAliases(r1Runs.length);
@@ -2704,6 +2934,7 @@ async function runCouncilPipeline(
 	let r2DurationMs = 0;
 	let judgeResult: { decisions: Map<string, CouncilDecision>; durationMs: number; errorMessage?: string } = { decisions: new Map(), durationMs: 0 };
 	if (groups.length > 0) {
+		progress?.update({ phase: `council round 2 (${groups.length} groups)`, done: 0, total: resolved.length });
 		setStatus(`multi-review · mode=council · round 2 (deliberate, ${groups.length} groups)`, ctx);
 		const r2Start = Date.now();
 		r2Results = await runCouncilRound2FanOut(
@@ -2713,12 +2944,14 @@ async function runCouncilPipeline(
 			cfg.concurrency,
 			signal,
 			ctx,
+			(done, total, latest) => progress?.update({ phase: "council round 2", done, total, latest: formatReviewerProgressLine(done, total, latest) }),
 		);
 		r2DurationMs = Date.now() - r2Start;
 
 		const { recaps, disputedIds } = aggregateCouncil(groups, r1Runs, aliases, r2Results);
 		setStatus(`multi-review · mode=council · ${disputedIds.length} disputed of ${recaps.length}`, ctx);
 		if (disputedIds.length > 0) {
+			progress?.update({ phase: `${disputedIds.length} disputes · invoking judge ${shortSpec(cfg.judge)}`, done: undefined, total: undefined });
 			judgeResult = await runCouncilJudge(judge, groups, r1Runs, aliases, r2Results, signal, cfg.temperature);
 			setStatus(`multi-review · mode=council · judge deliberated (${(judgeResult.durationMs / 1000).toFixed(1)}s)`, ctx);
 		}
@@ -2738,7 +2971,10 @@ async function runCouncilPipeline(
 			target,
 			groups,
 			reviewerSpecs: r1Runs.map((r) => r.spec),
-			failedSpecs: [...r1Runs.filter((r) => !r.ok), ...r2Results.filter((r) => !r.run.ok)].map((r) => r.spec),
+			failedSpecs: [
+				...r1Runs.filter((r) => !r.ok).map((r) => r.spec),
+				...r2Results.filter((r) => !r.run.ok).map((r) => r.run.spec),
+			],
 			judge: cfg.judge,
 			judgeDurationMs: judgeResult.durationMs,
 			judgeUsage: undefined,
@@ -2810,6 +3046,7 @@ async function runTriagePipeline(
 	ctx: ExtensionContext,
 	pi: ExtensionAPI,
 	signal: AbortSignal | undefined,
+	progress?: MultiReviewProgressReporter,
 ): Promise<MultiReviewRunResult> {
 	setStatus(`multi-review · mode=triage · fanning out`, ctx);
 	const triage = await runTriageFanOut(
@@ -2820,18 +3057,21 @@ async function runTriagePipeline(
 		cfg.temperature,
 		signal,
 		ctx,
+		(done, total, latest) => progress?.update({ phase: "triage reviewers", done, total, latest: formatReviewerProgressLine(done, total, latest) }),
 	);
 
 	const thresholdMet = triage.escalateCount >= cfg.triageEscalationThreshold;
 	const escalatedFiles = triage.escalatedFiles;
 
 	if (!thresholdMet || escalatedFiles.length === 0) {
+		progress?.update({ phase: `no escalation (${triage.escalateCount}/${cfg.triageEscalationThreshold})`, done: triage.reviewerRuns.length, total: triage.reviewerRuns.length });
 		setStatus(`multi-review · mode=triage · no escalation (${triage.escalateCount}/${cfg.triageEscalationThreshold})`, ctx);
 		return buildTriageSummaryResult(target, triage, cfg, "no escalation");
 	}
 
 	// Escalation: re-run balanced on the focused target. We need a judge
 	// (already checked upstream before entering this pipeline).
+	progress?.update({ phase: `triage escalated (${triage.escalateCount}/${cfg.triageEscalationThreshold}) → deep`, done: undefined, total: undefined });
 	setStatus(`multi-review · mode=triage · escalation (${triage.escalateCount}/${cfg.triageEscalationThreshold}) → deep`, ctx);
 	const downstream = buildEscalatedTarget(target, escalatedFiles);
 	const downstreamPrompt = buildReviewUserPrompt(downstream);
@@ -2845,7 +3085,7 @@ async function runTriagePipeline(
 			notifyLevel: "error",
 		};
 	}
-	const deep = await runBalancedPipeline(downstream, resolved, downstreamPrompt, cfg, judge, ctx, pi, signal);
+	const deep = await runBalancedPipeline(downstream, resolved, downstreamPrompt, cfg, judge, ctx, pi, signal, progress);
 	// Wrap the deep result's notify with a triage escalation banner.
 	const triageBanner =
 		`multi-review · mode=triage · escalated (${triage.escalateCount}/${cfg.triageEscalationThreshold} reviewers said escalate)\n` +
@@ -3083,14 +3323,14 @@ export default function (pi: ExtensionAPI) {
 					"'council': 2 rounds (raise + de-identified deliberate); judge only invoked when round-2 disagrees on something.",
 			})),
 		}),
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const parts: string[] = [];
 			if (typeof params.mode === "string" && (REVIEW_MODES as readonly string[]).includes(params.mode)) {
 				parts.push(`--mode=${params.mode}`);
 			}
 			if (typeof params.pr_number === "number") parts.push(String(params.pr_number));
 			if (typeof params.focus === "string" && params.focus.trim()) parts.push(params.focus.trim());
-			const result = await runMultiReviewFromArgs(pi, ctx, parts.join(" "), signal);
+			const result = await runMultiReviewFromArgs(pi, ctx, parts.join(" "), signal, TRANSIENT_REVIEWERS, onUpdate);
 			ctx.ui.notify(result.notifyMessage, result.notifyLevel);
 			if (!result.injectMessage) {
 				return {

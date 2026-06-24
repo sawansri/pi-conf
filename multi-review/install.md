@@ -122,8 +122,10 @@ scope into it:
 /multi-review-pick
 ```
 
-Space toggles a selection, ↑↓ moves, Enter confirms, Esc cancels. On
-confirm you'll be asked whether to persist the selection to
+Space toggles a selection, ↑↓ moves between selectable model rows,
+PgUp/PgDn jumps, `a` selects all, `A` clears, Enter confirms, Esc cancels.
+The picker renders as a bounded overlay so large model registries don't flood
+the chat view. On confirm you'll be asked whether to persist the selection to
 `multi-review.json` or use it for the current run only.
 
 If you run `/multi-review` with an empty pool AND no UI is available
@@ -147,13 +149,17 @@ The status footer shows the loaded pool on session start:
 multi-review · pool: 3 (fireworks/.../minimax-m3, fireworks/.../glm-5p2, +1 more)
 ```
 
-Per-run status updates flow through the same status key:
+Per-run status updates flow through the same status key and a temporary
+progress widget below the editor:
 ```
-multi-review · resolving scope…
-multi-review · fanning out to 3 reviewers (cap 4)
-multi-review · 7 groups · invoking judge fireworks/.../glm-5p2
+multi-review · mode=balanced · resolving scope
+multi-review · mode=balanced · reviewers running (2/3)
+latest: ✓ glm-5p2 (2/3) — 1 finding, 18.4s, $0.0021
+multi-review · 7 groups · invoking judge glm-5p2
 multi-review · done
 ```
+When called through the `multi_review` tool, the same progress is also sent
+via tool updates so the pending tool row changes as reviewers complete.
 
 ## Failure recovery cheat-sheet
 
