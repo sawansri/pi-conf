@@ -132,7 +132,7 @@ export interface MultiReviewConfig {
 	triageEscalationThreshold: number;
 }
 
-export const REVIEW_MODES = ["balanced", "light", "triage"] as const;
+export const REVIEW_MODES = ["balanced", "light", "triage", "council"] as const;
 export type ReviewMode = (typeof REVIEW_MODES)[number];
 
 const DEFAULTS: MultiReviewConfig = {
@@ -1549,6 +1549,498 @@ function buildEscalatedTarget(original: ReviewTarget, files: string[]): ReviewTa
 	};
 }
 
+// ---------- council mode ----------
+
+/**
+ * A council verdict is a per-reviewer opinion on a single round-1 finding
+ * from round 2 of the council pipeline. Verdict semantics:
+ *   - agree:    finding is genuinely a problem.
+ *   - disagree: finding is wrong / non-issue / misread.
+ *   - extend:   finding is real but original framing is incomplete.
+ * suggested_severity only meaningful for disagree/extend.
+ */
+export interface CouncilVerdict {
+	target_finding_id: string;
+	verdict: "agree" | "disagree" | "extend";
+	comment: string;
+	suggested_severity?: ReviewerFinding["severity"];
+}
+
+/**
+ * Judge's per-finding decision for a disputed finding. Severity may be
+ * promoted or demoted from the original based on ground-truth evidence.
+ */
+export interface CouncilDecision {
+	target_finding_id: string;
+	final_severity: ReviewerFinding["severity"];
+	verdict_text: string;
+}
+
+/**
+ * Stable aliases per reviewer-index. A→0, B→1, ...; >26 reviewers get
+ * `Rn` form. The same alias map is shown to every reviewer in their
+ * round-2 prompt so attributions round-trip: each reviewer knows their
+ * own alias and recognizes it when it appears in the de-identified
+ * "raised by" lines.
+ */
+function computeCouncilAliases(reviewerCount: number): Map<number, string> {
+	const out = new Map<number, string>();
+	for (let i = 0; i < reviewerCount; i++) {
+		if (i < 26) out.set(i, String.fromCharCode(65 + i));
+		else out.set(i, `R${i}`);
+	}
+	return out;
+}
+
+/**
+ * Round 2 system prompt. Each reviewer receives a per-group verdict
+ * menu and outputs a JSON array of {target_finding_id, verdict, comment,
+ * suggested_severity?}. The same prompt is sent to all reviewers — only
+ * the user prompt (which names their alias and which groups they raised
+ * in round 1) differs.
+ */
+const COUNCIL_R2_SYSTEM_PROMPT = `You are a senior reviewer contributing to a multi-model council. In round 1, you and your peers each raised findings on the same diff. In round 2, you're being asked to weigh in on each finding — agree, disagree, or extend with extra context.
+
+For each finding shown in the user prompt, emit a verdict object as part of a JSON array per this schema:
+
+{
+  "target_finding_id": "<g#>",     // the group's id from the prompt
+  "verdict": "agree" | "disagree" | "extend",
+  "comment": "<≤400 chars>",
+  "suggested_severity": "critical"|"high"|"medium"|"low"|"info"|"none"   // ONLY when verdict=disagree|extend, optional
+}
+
+Rules:
+- "agree" — the finding is genuinely a problem; no new evidence required.
+- "disagree" — the finding is wrong or a non-issue; explain why with technical grounds.
+- "extend" — the finding is real but the cause/framing in the original comment is incomplete; add new context.
+- For findings YOU raised in round 1, a brief "agree" reason is enough; no new evidence needed.
+- Per-group verdict coverage is your choice — if you have no opinion, you may omit it; omission is treated as agreement.
+- Output ONLY the JSON array. No prose, no markdown fences, no trailing commentary.`;
+
+/**
+ * Council judge system prompt. Invoked only on disputed findings (those
+ * with ≥1 disagree or ≥1 extend). Synthesizes technical grounds into a
+ * per-finding decision: keep, drop severity, escalate severity, etc.
+ */
+const COUNCIL_JUDGE_SYSTEM_PROMPT = `You are the council judge for a multi-model code review pipeline. You receive the disputed findings only — those with ≥1 disagree or ≥1 extend verdict from round 2.
+
+For each disputed finding, output a JSON object (one element per dispute) per this schema:
+
+{
+  "target_finding_id": "<g#>",
+  "final_severity": "critical"|"high"|"medium"|"low"|"info"|"none",
+  "verdict_text": "<≤400 chars: technical grounds for the decision>"
+}
+
+Rules:
+- Disagreement without new technical evidence → uphold the original severity and explain why.
+- "extend" verdicts carrying new evidence shift the picture; merge the new framing into verdict_text.
+- Severity may be promoted or demoted by one step based on solid technical reasoning; multi-step jumps need explicit grounding in the verdict_text.
+- If a finding's author and at least one peer disagree, lean toward the more cautious severity when both sides have comparable rigor.
+- Output ONLY the JSON array. No preamble.`;
+
+/**
+ * Tolerant JSON-array parser for council verdicts/decisions. Same shape
+ * allowance as parseReviewerJson: strip fences, find first [ and last ],
+ * ignore wrappers. Map entries returned keyed by target_finding_id.
+ */
+function parseCouncilJson(
+	raw: string,
+	expectedGroupIds: Set<string>,
+): { verdicts: Map<string, CouncilVerdict>; decisions: Map<string, CouncilDecision>; ok: boolean; errorMessage?: string } {
+	const text = raw.trim();
+	const fence = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+	const inner = fence ? fence[1] : text;
+	const start = inner.indexOf("[");
+	const end = inner.lastIndexOf("]");
+	if (start === -1 || end === -1 || end <= start) {
+		return { verdicts: new Map(), decisions: new Map(), ok: false, errorMessage: "no-json-array" };
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(inner.slice(start, end + 1));
+	} catch (err) {
+		return { verdicts: new Map(), decisions: new Map(), ok: false, errorMessage: err instanceof Error ? err.message : String(err) };
+	}
+	if (!Array.isArray(parsed)) {
+		return { verdicts: new Map(), decisions: new Map(), ok: false, errorMessage: "not-an-array" };
+	}
+	const verdicts = new Map<string, CouncilVerdict>();
+	const decisions = new Map<string, CouncilDecision>();
+	for (const item of parsed) {
+		if (!item || typeof item !== "object") continue;
+		const anyItem = item as Record<string, unknown>;
+		const target = String(anyItem.target_finding_id ?? "");
+		if (!target || !expectedGroupIds.has(target)) continue;
+		if ("verdict" in anyItem) {
+			const v = String(anyItem.verdict).toLowerCase();
+			if (!["agree", "disagree", "extend"].includes(v)) continue;
+			const severityCandidate = anyItem.suggested_severity ? String(anyItem.suggested_severity).toLowerCase() : undefined;
+			const severityLevels: ReviewerFinding["severity"][] = ["critical", "high", "medium", "low", "info", "none"];
+			const suggested_severity = severityCandidate && (severityLevels as string[]).includes(severityCandidate)
+				? (severityCandidate as ReviewerFinding["severity"])
+				: undefined;
+			verdicts.set(target, {
+				target_finding_id: target,
+				verdict: v as CouncilVerdict["verdict"],
+				comment: String(anyItem.comment ?? "").slice(0, 2000),
+				suggested_severity,
+			});
+		} else if ("final_severity" in anyItem) {
+			const svCandidate = String(anyItem.final_severity).toLowerCase();
+			const severityLevels: ReviewerFinding["severity"][] = ["critical", "high", "medium", "low", "info", "none"];
+			if (!(severityLevels as string[]).includes(svCandidate)) continue;
+			decisions.set(target, {
+				target_finding_id: target,
+				final_severity: svCandidate as ReviewerFinding["severity"],
+				verdict_text: String(anyItem.verdict_text ?? "").slice(0, 2000),
+			});
+		}
+	}
+	return { verdicts, decisions, ok: true };
+}
+
+/**
+ * Round 2 user prompt for one reviewer. Lists every group from round 1,
+ * de-identified: peer reviewers' contributions are labeled by alias, the
+ * reviewer's own contributions are shown in plain (so they recognize their
+ * own findings without seeing themselves as a peer).
+ */
+function buildCouncilRound2Prompt(
+	groups: DedupeGroup[],
+	r1Runs: ReviewerRunResult[],
+	aliases: Map<number, string>,
+	myIndex: number,
+	myAlias: string,
+): string {
+	const lines: string[] = [];
+	lines.push("## Round 2 — Council deliberation");
+	lines.push("");
+	lines.push(
+		`You are reviewer alias "${myAlias}". The findings below were raised by your peers in round 1. ` +
+			`Peer aliases: A, B, C, ...; ${myAlias} is yours. Findings YOU raised are shown verbatim so you can recognize them; peers are de-identified.`,
+	);
+	lines.push("");
+	lines.push("## Findings");
+	lines.push("");
+	for (const g of groups) {
+		lines.push(`### ${g.id} — Severity ${g.severity.toUpperCase()} · ${g.title}`);
+		lines.push(`- File: \`${g.file}:${formatRange(g.line_start, g.line_end)}\``);
+		lines.push(`- Category: ${g.category}`);
+		const raisedByMe = g.reviewerSpecs.includes(r1Runs[myIndex].spec);
+		const peerAliases: string[] = [];
+		for (let i = 0; i < r1Runs.length; i++) {
+			if (i === myIndex) continue;
+			if (g.reviewerSpecs.includes(r1Runs[i].spec)) peerAliases.push(aliases.get(i) ?? String.fromCharCode(65 + i));
+		}
+		if (raisedByMe && peerAliases.length === 0) {
+			lines.push(`- Raised only by you (no peer co-signers).`);
+		} else {
+			lines.push(`- Raised by: ${peerAliases.join(", ")}${raisedByMe ? ` (and you)` : ""}`);
+		}
+		lines.push("- Original comments:");
+		for (const m of g.members) {
+			if (m.spec === r1Runs[myIndex].spec) {
+				lines.push(`    - (your own finding): ${m.comment}`);
+			} else {
+				const mIdx = r1Runs.findIndex((r) => r.spec === m.spec);
+				const alias = mIdx >= 0 ? (aliases.get(mIdx) ?? String.fromCharCode(65 + mIdx)) : m.spec;
+				lines.push(`    - ${alias}: ${m.comment}`);
+			}
+		}
+		lines.push("");
+	}
+	lines.push("## Your response (JSON only, per the system prompt schema)");
+	lines.push("Emit a JSON array of verdict objects, one per finding. You may omit findings you have no opinion on.");
+	return lines.join("\n");
+}
+
+/**
+ * Judge user prompt. Lists ONLY disputed findings with the full round-1
+ * + round-2 context for each. Judge responds per-finding JSON decisions.
+ */
+function buildCouncilJudgePrompt(
+	groups: DedupeGroup[],
+	r1Runs: ReviewerRunResult[],
+	aliases: Map<number, string>,
+	r2Results: Array<{ run: ReviewerRunResult; verdicts: Map<string, CouncilVerdict> }>,
+): string {
+	const lines: string[] = [];
+	lines.push("## Disputed findings (round-1 comments + round-2 verdicts)");
+	lines.push("");
+	lines.push("Each finding below has ≥1 disagree or ≥1 extend verdict. Use the technical grounds in the original comments and round-2 reasoning to decide final severity.");
+	lines.push("");
+	const disputedIds = new Set<string>();
+	for (const r2 of r2Results) {
+		for (const [gid, v] of r2.verdicts) {
+			if (v.verdict !== "agree") disputedIds.add(gid);
+		}
+	}
+	for (const g of groups) {
+		if (!disputedIds.has(g.id)) continue;
+		lines.push(`### ${g.id} — Severity ${g.severity.toUpperCase()} · ${g.title}`);
+		lines.push(`- File: \`${g.file}:${formatRange(g.line_start, g.line_end)}\``);
+		lines.push(`- Category: ${g.category}`);
+		lines.push("- Original raisers:");
+		for (const m of g.members) {
+			lines.push(`    - \`${m.spec}\`: ${m.comment}`);
+		}
+		lines.push("- Round-2 verdicts:");
+		for (const r2 of r2Results) {
+			const v = r2.verdicts.get(g.id);
+			const r2Idx = r2Results.indexOf(r2);
+			const alias = aliases.get(r2Idx)!;
+			if (v) {
+				const extra = v.suggested_severity ? ` (suggested=${v.suggested_severity})` : "";
+				lines.push(`    - ${alias} (\`${r2.run.spec}\`): ${v.verdict}${extra} — ${v.comment}`);
+			} else {
+				lines.push(`    - ${alias} (\`${r2.run.spec}\`): (no verdict)`);
+			}
+		}
+		lines.push("");
+	}
+	lines.push("## Your response (JSON only, per the system prompt schema)");
+	lines.push("Emit a JSON array of decision objects, one per disputed finding.");
+	return lines.join("\n");
+}
+
+/**
+ * Per-group verdict aggregation across round-2 reviewers.
+ * Omitted verdicts ("no opinion") count as agreement for the unanimous
+ * check so a single absent verdict doesn't manufacture a dispute.
+ */
+interface CouncilGroupRecap {
+	group: DedupeGroup;
+	agreeCount: number;
+	disagreeCount: number;
+	extendCount: number;
+	explicit: Array<{ alias: string; reviewerSpec: string; verdict: CouncilVerdict }>;
+	disputed: boolean;
+}
+
+function aggregateCouncil(
+	groups: DedupeGroup[],
+	r1Runs: ReviewerRunResult[],
+	aliases: Map<number, string>,
+	r2Results: Array<{ run: ReviewerRunResult }>,
+): { recaps: CouncilGroupRecap[]; disputedIds: string[] } {
+	const recaps: CouncilGroupRecap[] = [];
+	const disputedIds: string[] = [];
+	for (const g of groups) {
+		const explicit: CouncilGroupRecap["explicit"] = [];
+		let agreeCount = 0;
+		let disagreeCount = 0;
+		let extendCount = 0;
+		for (let i = 0; i < r2Results.length; i++) {
+			const r2 = r2Results[i];
+			const alias = aliases.get(i)!;
+			const v = (r2 as any).verdicts?.get?.(g.id) as CouncilVerdict | undefined;
+			if (v) {
+				explicit.push({ alias, reviewerSpec: r2.run.spec, verdict: v });
+				if (v.verdict === "agree") agreeCount++;
+				else if (v.verdict === "disagree") disagreeCount++;
+				else if (v.verdict === "extend") extendCount++;
+			} else {
+				// Treat omission as implicit agreement.
+				agreeCount++;
+			}
+		}
+		const disputed = disagreeCount > 0 || extendCount > 0;
+		recaps.push({ group: g, agreeCount, disagreeCount, extendCount, explicit, disputed });
+		if (disputed) disputedIds.push(g.id);
+	}
+	return { recaps, disputedIds };
+}
+
+/**
+ * Council-mode markdown synthesis. Same shape as balanced/light for the
+ * chat renderer, with a Council Decisions section that exposes disputed
+ * findings and the judge's rationale inline.
+ */
+function synthesizeCouncilMarkdown(
+	target: ReviewTarget,
+	r1Runs: ReviewerRunResult[],
+	recaps: CouncilGroupRecap[],
+	disputeDecisions: Map<string, CouncilDecision>,
+	round2DurationMs: number,
+	judgeDurationMs: number,
+	totalCost: number,
+	disputed: number,
+	unanimous: number,
+): string {
+	const lines: string[] = [];
+	lines.push("# Multi-Model Code Review (council · 2 rounds + judge-if-disputed)");
+	lines.push("");
+	lines.push("## Summary");
+	const verdictDistribution =
+		`${unanimous} unanimous · ${disputed} disputed`;
+	lines.push(
+		`Scope: \`${target.label}\`. ${recaps.length} finding${recaps.length === 1 ? "" : "s"}. ` +
+			`Round 2 ran (${(round2DurationMs / 1000).toFixed(1)}s); ${verdictDistribution}. ` +
+			(disputeDecisions.size > 0 ? `Judge deliberated ${disputeDecisions.size} dispute${disputeDecisions.size === 1 ? "" : "s"} (${(judgeDurationMs / 1000).toFixed(1)}s).` : "Judge skipped (no disputes).") +
+			(totalCost > 0 ? `   $${totalCost.toFixed(4)}` : ""),
+	);
+	lines.push("");
+	lines.push("## Findings");
+	for (const r of recaps) {
+		const g = r.group;
+		const range = formatRange(g.line_start, g.line_end);
+		lines.push(`### ${g.id} — ${g.severity.toUpperCase()} · ${g.title}`);
+		lines.push(`- **File:** \`${g.file}:${range}\``);
+		lines.push(`- **Category:** ${g.category}`);
+		if (!r.disputed) {
+			lines.push(`- **Council verdict:** unanimous (${r.agreeCount}/${r1Runs.length} agree)`);
+		} else {
+			const decision = disputeDecisions.get(g.id);
+			const finalSev = decision?.final_severity ?? g.severity;
+			const promoted = severityElevated(g.severity, decision?.final_severity);
+			const demoted = severityReduced(g.severity, decision?.final_severity);
+			const arrow = promoted || demoted ? ` (${g.severity} → ${finalSev})` : "";
+			lines.push(`- **Council verdict:** ${r.agreeCount} agree · ${r.disagreeCount} disagree · ${r.extendCount} extend → decision=${finalSev.toUpperCase()}${arrow}`);
+			if (decision) lines.push(`- **Reason:** ${decision.verdict_text}`);
+		}
+		lines.push("- **Round-1 comments:**");
+		for (const m of g.members) {
+			lines.push(`    - \`${m.spec}\`: ${m.comment}`);
+		}
+		if (r.explicit.length > 0) {
+			lines.push("- **Round-2 verdicts:**");
+			for (const e of r.explicit) {
+				const extra = e.verdict.suggested_severity ? ` (suggested=${e.verdict.suggested_severity})` : "";
+				lines.push(`    - \`${e.reviewerSpec}\` (alias ${e.alias}): ${e.verdict.verdict}${extra} — ${e.verdict.comment}`);
+			}
+		}
+		lines.push("");
+	}
+	return lines.join("\n");
+}
+
+function severityRank(s: ReviewerFinding["severity"]): number {
+	switch (s) {
+		case "critical": return 5;
+		case "high": return 4;
+		case "medium": return 3;
+		case "low": return 2;
+		case "info": return 1;
+		case "none": return 0;
+	}
+}
+
+function severityElevated(from: ReviewerFinding["severity"], to: ReviewerFinding["severity"] | undefined): boolean {
+	if (!to) return false;
+	return severityRank(to) > severityRank(from);
+}
+
+function severityReduced(from: ReviewerFinding["severity"], to: ReviewerFinding["severity"] | undefined): boolean {
+	if (!to) return false;
+	return severityRank(to) < severityRank(from);
+}
+
+/**
+ * Council round 2 fan-out. Same plumbing as runAllReviewers but:
+ *  - per-reviewer user prompt (each one sees the de-identified bundle
+ *    with their own alias visible to themselves only),
+ *  - parse via parseCouncilJson and bucket into per-group verdict Maps.
+ *
+ * Fail-soft: a single reviewer crashing / failing to parse yields empty
+ * verdict Map (treated as implicit agreement by aggregateCouncil).
+ */
+async function runCouncilRound2FanOut(
+	resolved: Array<{ rs: ReviewerSpec; model: Model; clamped: boolean }>,
+	groups: DedupeGroup[],
+	r1Runs: ReviewerRunResult[],
+	concurrency: number,
+	signal: AbortSignal | undefined,
+	ctx: ExtensionContext,
+): Promise<Array<{ run: ReviewerRunResult; verdicts: Map<string, CouncilVerdict> }>> {
+	const aliases = computeCouncilAliases(resolved.length);
+	const r2Results: Array<{ run: ReviewerRunResult; verdicts: Map<string, CouncilVerdict> }> = new Array(resolved.length);
+	const cap = Math.max(1, Math.min(MAX_PARALLEL, concurrency, resolved.length));
+	let cursor = 0;
+	const worker = async (): Promise<void> => {
+		while (true) {
+			if (signal?.aborted) return;
+			const idx = cursor++;
+			if (idx >= resolved.length) return;
+			const slot = resolved[idx];
+			const myAlias = aliases.get(idx)!;
+			const r2UserPrompt = buildCouncilRound2Prompt(groups, r1Runs, aliases, idx, myAlias);
+			try {
+				const r = await runReviewer(slot.model, slot.rs, ctx, COUNCIL_R2_SYSTEM_PROMPT, r2UserPrompt, /*temp*/ 0.2, signal);
+				const full: ReviewerRunResult = {
+					formattedSpec: formatReviewerSpec(slot.rs),
+					spec: slot.rs.spec,
+					thinking: slot.rs.thinking,
+					clamped: slot.clamped,
+					model: slot.model,
+					ok: r.ok,
+					findings: [],
+					rawText: r.rawText,
+					stopReason: r.stopReason,
+					errorMessage: r.errorMessage,
+					usage: r.usage,
+					durationMs: r.durationMs,
+				};
+				const expectedIds = new Set(groups.map((g) => g.id));
+				const parsed = parseCouncilJson(full.rawText, expectedIds);
+				r2Results[idx] = { run: full, verdicts: parsed.verdicts };
+			} catch (err) {
+				const full: ReviewerRunResult = {
+					formattedSpec: formatReviewerSpec(slot.rs),
+					spec: slot.rs.spec,
+					thinking: slot.rs.thinking,
+					clamped: slot.clamped,
+					model: slot.model,
+					ok: false,
+					findings: [],
+					rawText: "",
+					stopReason: "error",
+					errorMessage: err instanceof Error ? err.message : String(err),
+					durationMs: 0,
+				};
+				r2Results[idx] = { run: full, verdicts: new Map() };
+			}
+		}
+	};
+	await Promise.all(Array.from({ length: cap }, () => worker()));
+	return r2Results;
+}
+
+/**
+ * Council judge call. Single completeSimple per round; only invoked when
+ * there's at least one disputed finding (otherwise we skip runtime cost).
+ */
+async function runCouncilJudge(
+	judge: Model,
+	groups: DedupeGroup[],
+	r1Runs: ReviewerRunResult[],
+	aliases: Map<number, string>,
+	r2Results: Array<{ run: ReviewerRunResult; verdicts: Map<string, CouncilVerdict> }>,
+	signal: AbortSignal | undefined,
+	temperature: number,
+): Promise<{ decisions: Map<string, CouncilDecision>; durationMs: number; errorMessage?: string }> {
+	const started = Date.now();
+	const { completeSimple } = await import("@mariozechner/pi-ai");
+	const judgeUserPrompt = buildCouncilJudgePrompt(groups, r1Runs, aliases, r2Results);
+	const response = await completeSimple(
+		judge,
+		{ systemPrompt: COUNCIL_JUDGE_SYSTEM_PROMPT, messages: [{ role: "user", content: [{ type: "text", text: judgeUserPrompt }] }] },
+		{ signal, temperature, maxTokens: 8192 },
+	);
+	const text = response.content
+		.filter((c) => c.type === "text")
+		.map((c) => (c as { type: "text"; text: string }).text)
+		.join("");
+	const expectedIds = new Set(groups.map((g) => g.id));
+	const parsed = parseCouncilJson(text, expectedIds);
+	return {
+		decisions: parsed.decisions,
+		durationMs: Date.now() - started,
+		errorMessage: parsed.ok ? undefined : parsed.errorMessage,
+	};
+}
+
 async function runJudge(
 	judgeModel: Model,
 	groups: DedupeGroup[],
@@ -2012,7 +2504,7 @@ async function runMultiReviewFromArgs(
 	// but optional for pure light mode. Check now if any downstream path
 	// will need it so the user gets actionable feedback before fan-out.
 	const judge = resolveJudge(ctx, cfg);
-	const needsJudge = mode === "balanced" || mode === "triage";
+	const needsJudge = mode === "balanced" || mode === "triage" || mode === "council";
 	if (needsJudge && !judge) {
 		return {
 			kind: "notify",
@@ -2037,6 +2529,9 @@ async function runMultiReviewFromArgs(
 	}
 	if (mode === "light") {
 		return await runLightPipeline(target, resolvedRows, userPrompt, cfg, ctx, signal);
+	}
+	if (mode === "council") {
+		return await runCouncilPipeline(target, resolvedRows, userPrompt, cfg, judge!, ctx, pi, signal);
 	}
 	// mode === "triage"
 	return await runTriagePipeline(target, resolvedRows, userPrompt, cfg, ctx, pi, signal);
@@ -2153,6 +2648,144 @@ async function runLightPipeline(
 			`reviewers: ${completedRunResults.length}   dedupe groups: ${groups.length}   consensus: ${details.consensusCount}` +
 			(totalUsage > 0 ? `   $${totalUsage.toFixed(4)}` : "") + `\n` +
 			`Press Ctrl+O on the chat entry to expand per-model attribution.`,
+		notifyLevel: "info",
+		injectMessage: {
+			customType: "multi-review",
+			content: markdown,
+			details,
+		},
+	};
+}
+
+/**
+ * Council mode: 2 rounds + judge-if-disputed.
+ *
+ * Round 1: Same structured-reviewer prompt as balanced/light produces
+ *   per-reviewer JSON findings → dedupe → groups.
+ * Round 2: Each reviewer sees the de-identified bundle of round-1 groups
+ *   (peers' contributions labeled A/B/C/D by stable alias) and emits a
+ *   per-finding verdict (agree / disagree / extend).
+ * Judge:  invoked ONLY when ≥1 round-2 verdict is disagree or extend.
+ *   Synthesizes per-finding decisions; severity may be promoted or
+ *   demoted by one step based on technical grounds.
+ *
+ * Cost: round_1 + round_2 (~2× of balanced) + judge (only when there
+ * are real disputes, so on average <1.5×).
+ *
+ * Anonymity is approximate: aliases are stable per round (same A→spec
+ * across all reviewers) so an alert reviewer can infer their own
+ * involvement in a group. Real privacy would require randomizing the
+ * alias map per-recipient per-round; that's future polish.
+ */
+async function runCouncilPipeline(
+	target: ReviewTarget,
+	resolved: Array<{ rs: ReviewerSpec; model: Model; clamped: boolean }>,
+	userPrompt: string,
+	cfg: MultiReviewConfig,
+	judge: Model,
+	ctx: ExtensionContext,
+	pi: ExtensionAPI,
+	signal: AbortSignal | undefined,
+): Promise<MultiReviewRunResult> {
+	setStatus(`multi-review · mode=council · round 1 (raise)`, ctx);
+	const r1Runs = await runAllReviewers(
+		resolved,
+		REVIEWER_SYSTEM_PROMPT,
+		userPrompt,
+		cfg.concurrency,
+		cfg.temperature,
+		signal,
+		ctx,
+	);
+	setStatus(`multi-review · mode=council · dedupe pass`, ctx);
+	const groups = dedupeReviewerFindings(r1Runs);
+	const aliases = computeCouncilAliases(r1Runs.length);
+	let r2Results: Array<{ run: ReviewerRunResult; verdicts: Map<string, CouncilVerdict> }> = [];
+	let r2DurationMs = 0;
+	let judgeResult: { decisions: Map<string, CouncilDecision>; durationMs: number; errorMessage?: string } = { decisions: new Map(), durationMs: 0 };
+	if (groups.length > 0) {
+		setStatus(`multi-review · mode=council · round 2 (deliberate, ${groups.length} groups)`, ctx);
+		const r2Start = Date.now();
+		r2Results = await runCouncilRound2FanOut(
+			resolved,
+			groups,
+			r1Runs,
+			cfg.concurrency,
+			signal,
+			ctx,
+		);
+		r2DurationMs = Date.now() - r2Start;
+
+		const { recaps, disputedIds } = aggregateCouncil(groups, r1Runs, aliases, r2Results);
+		setStatus(`multi-review · mode=council · ${disputedIds.length} disputed of ${recaps.length}`, ctx);
+		if (disputedIds.length > 0) {
+			judgeResult = await runCouncilJudge(judge, groups, r1Runs, aliases, r2Results, signal, cfg.temperature);
+			setStatus(`multi-review · mode=council · judge deliberated (${(judgeResult.durationMs / 1000).toFixed(1)}s)`, ctx);
+		}
+
+		// Compose final markdown so we can build the inject payload.
+		const disputed = recaps.filter((r) => r.disputed).length;
+		const unanimous = recaps.length - disputed;
+		const totalCost =
+			(r1Runs.reduce((s, r) => s + (r.usage?.cost ?? 0), 0)) +
+			(r2Results.reduce((s, r) => s + (r.run.usage?.cost ?? 0), 0));
+		const markdown = synthesizeCouncilMarkdown(
+			target, r1Runs, recaps, judgeResult.decisions,
+			r2DurationMs, judgeResult.durationMs, totalCost, disputed, unanimous,
+		);
+		setStatus(`multi-review · mode=council · done`, ctx);
+		const details: MultiReviewDetails = {
+			target,
+			groups,
+			reviewerSpecs: r1Runs.map((r) => r.spec),
+			failedSpecs: [...r1Runs.filter((r) => !r.ok), ...r2Results.filter((r) => !r.run.ok)].map((r) => r.spec),
+			judge: cfg.judge,
+			judgeDurationMs: judgeResult.durationMs,
+			judgeUsage: undefined,
+			consensusCount: recaps.filter((r) => !r.disputed).length,
+			totalFindings: groups.reduce((s, g) => s + g.members.length, 0),
+		};
+		return {
+			kind: "inject",
+			notifyMessage:
+				`multi-review · mode=council · done — review injected into chat\n` +
+				`scope: ${target.label}   files: ${target.files.length}   diff bytes: ${target.diffText.length}\n` +
+				`round 1: ${r1Runs.length} reviewers (${(r1Runs.reduce((s, r) => s + r.durationMs, 0) / 1000).toFixed(1)}s)` +
+				`\nround 2: ${r2Results.length} reviewers (${(r2DurationMs / 1000).toFixed(1)}s)` +
+				(disputed > 0 ? `\njudge: ${cfg.judge} (${(judgeResult.durationMs / 1000).toFixed(1)}s, ${disputed} dispute${disputed === 1 ? "" : "s"})` : `\njudge: skipped (no disputes)`) +
+				(totalCost > 0 ? `   $${totalCost.toFixed(4)}` : "") + `\n` +
+				`recap: ${unanimous} unanimous · ${disputed} disputed.\n` +
+				`Press Ctrl+O to expand per-model attribution + council decisions.`,
+			notifyLevel: "info",
+			injectMessage: {
+				customType: "multi-review",
+				content: markdown,
+				details,
+			},
+		};
+	}
+
+	// No groups: skip round 2 + judge. Show a short summary so the run is
+	// still visible in chat.
+	const totalCost = r1Runs.reduce((s, r) => s + (r.usage?.cost ?? 0), 0);
+	const markdown = `# Multi-Model Code Review (council · 2 rounds)\n\nScope: \`${target.label}\`. No findings in round 1; council deliberation skipped.`;
+	const details: MultiReviewDetails = {
+		target,
+		groups: [],
+		reviewerSpecs: r1Runs.map((r) => r.spec),
+		failedSpecs: r1Runs.filter((r) => !r.ok).map((r) => r.spec),
+		judge: cfg.judge,
+		judgeDurationMs: 0,
+		judgeUsage: undefined,
+		consensusCount: 0,
+		totalFindings: 0,
+	};
+	return {
+		kind: "inject",
+		notifyMessage:
+			`multi-review · mode=council · round 1 raised no findings; deliberation skipped.\n` +
+			`scope: ${target.label}   reviewers: ${r1Runs.length}` +
+			(totalCost > 0 ? `   $${totalCost.toFixed(4)}` : ""),
 		notifyLevel: "info",
 		injectMessage: {
 			customType: "multi-review",
@@ -2343,7 +2976,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("multi-review", {
 		description:
 			"Fan-out code review across configured models. Usage: " +
-			"/multi-review [--mode=balanced|light|triage] [PR-number | free-text focus]. " +
+			"/multi-review [--mode=balanced|light|triage|council] [PR-number | free-text focus]. " +
 			"Mode default reads multi-review.mode from ~/.pi/agent/multi-review.json.",
 		// Argument autocomplete hints the call shape so users don't have to
 		// remember to type '#' vs raw digits.
@@ -2355,6 +2988,7 @@ export default function (pi: ExtensionAPI) {
 			{ value: "--mode=balanced", label: "--mode=balanced", description: "fan-out + judge (default)" },
 			{ value: "--mode=light", label: "--mode=light", description: "fan-out only; no judge call (half cost, half latency)" },
 			{ value: "--mode=triage", label: "--mode=triage", description: "cheap verdict first; auto-escalates to balanced when N reviewers say escalate" },
+			{ value: "--mode=council", label: "--mode=council", description: "2 rounds (raise + deliberate); judge only when round 2 disagrees on something" },
 		],
 		handler: async (args, ctx) => {
 			// Slash commands fire outside active turns, so ctx.signal is
@@ -2418,7 +3052,9 @@ export default function (pi: ExtensionAPI) {
 			"Fan-out a code review to N configured reviewer models in parallel and have a judge " +
 			"synthesize the findings. Use when the user asks for a review, asks to double-check " +
 			"edits, or asks for a second opinion across models. Result lands in chat as a " +
-			"collapsible entry with per-model attribution. Same shape as `/multi-review`.",
+			"collapsible entry with per-model attribution. Same shape as `/multi-review`. " +
+			"Supports modes: balanced (default), light (no judge), triage (escalate-to-deep), " +
+			"council (2 rounds of de-identified deliberation + judge-if-disputed).",
 		promptSnippet:
 			"Run a multi-model code review on the current scope (PR, default-branch diff, or focus text).",
 		promptGuidelines: [
@@ -2426,6 +3062,7 @@ export default function (pi: ExtensionAPI) {
 			"Pass either pr_number (numeric, no '#') or focus (free-text). Both can be combined.",
 			"Do NOT use multi_review to read or summarize a single file — use the read tool for that.",
 			"Do NOT use multi_review to write or edit code — it's read-only and returns findings attributed to each model.",
+			"Pass mode='council' for high-stakes architectural reviews where disagreement is the signal; mode='triage' for big diffs where most of the diff is noise; mode='light' when you trust per-model attribution and want speed; mode='balanced' (default) for general reviews.",
 		],
 		parameters: Type.Object({
 			pr_number: Type.Optional(Type.Number({
@@ -2442,7 +3079,8 @@ export default function (pi: ExtensionAPI) {
 				description:
 					"Review mode. 'balanced' (default): fan-out + judge. " +
 					"'light': fan-out only, no judge (half cost, half latency). " +
-					"'triage': cheap verdict first; auto-escalates to balanced when ≥ cfg.triageEscalationThreshold reviewers say escalate.",
+					"'triage': cheap verdict first; auto-escalates to balanced when ≥ cfg.triageEscalationThreshold reviewers say escalate. " +
+					"'council': 2 rounds (raise + de-identified deliberate); judge only invoked when round-2 disagrees on something.",
 			})),
 		}),
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {

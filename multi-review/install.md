@@ -81,7 +81,7 @@ under "clamped" so you can spot it without guessing.
 ### Picking a mode
 
 Set `"mode"` in the defaults file (or override per-run with
-`--mode=balanced|light|triage`):
+`--mode=balanced|light|triage|council`):
 
 - `balanced` — fan-out + judge. Default.
 - `light` — fan-out only; no judge. ~50% faster, halves token cost.
@@ -89,6 +89,10 @@ Set `"mode"` in the defaults file (or override per-run with
 - `triage` — cheap verdict first; auto-escalates to balanced when at
   least `triageEscalationThreshold` reviewers (default 1) report a
   concrete concern. Use for big diffs where most areas are noise.
+- `council` — 2 rounds of de-identified deliberation (raise, then
+  peer-aware verdicts) + judge iff round-2 disagreed/extended on
+  something. Roughly 2× cost; use for high-stakes architectural
+  reviews where disagreement is the signal.
 
 ## 3. Verify the two surfaces
 

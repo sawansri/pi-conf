@@ -42,17 +42,36 @@ the `mode` parameter on the `multi_review` tool.
 | `balanced` *(default)* | N reviewers structured prompt → dedupe → 1 judge synthesis markdown | Default: full review where the synthesis quality matters | ~1× baseline |
 | `light` | N reviewers structured prompt → dedupe → markdown synthesized directly from groups (no judge call) | Trust the per-model attribution; want speed / lower cost | ~0.5× (no judge) |
 | `triage` | N reviewers with verdict prompt (`escalate: bool`, `files_to_escalate`, `reasoning`). If ≥ `multi-review.triageEscalationThreshold` reviewers say escalate, automatically re-runs balanced on a follow-up target scoped to those files. | Big diffs where most areas are noise; you want a cheap first pass | ~0.4× (no escalate) to ~1.4× (deep) |
+| `council` | 2 rounds of de-identified deliberation + judge iff round-2 disagrees. Round-1 raises findings; round-2 has each reviewer weigh in on each peer finding (agree / disagree / extend); judge arbitrates only the disputed ones. | High-stakes architectural reviews where disagreement is the signal | ~2× baseline (always round-2) + judge when disputed |
+
+### Council-mode details
+
+Round 1 is the same structured `[{file, line, severity, ...}]` prompt that
+all other modes use. Round 2 takes the dedupe-pass output, de-identifies
+each reviewer's contributions behind stable letter aliases (A, B, C, …,
+aligned by `provider/id`), and asks each reviewer to emit per-finding
+verdicts:
+
+```json
+[
+  {"target_finding_id": "g1", "verdict": "agree", "comment": "real"},
+  {"target_finding_id": "g3", "verdict": "extend",  "comment": "also breaks on Windows path with backslash", "suggested_severity": "high"}
+]
+```
+
+A group's verdict distribution drives escalation:
+- **0 disagree + 0 extend** = unanimous; no judge call, finding is rendered with the per-model round-1+round-2 attribution directly.
+- **Any disagree or extend** = disputed; judge runs once over the disputed-only list and emits `{target_finding_id, final_severity, verdict_text}` per entry. Severity may be promoted or demoted by one step based on technical grounds.
+
+Anonymity is **approximate**: aliases are stable per round (same A→spec
+across all reviewers). An alert reviewer can pattern-match their own
+involvement in a finding. Randomizing the alias map per-recipient per-round
+would tighten this; that's a future polish item.
 
 Sample triage verdict from a reviewer:
 ```json
 {"escalate": true, "files_to_escalate": ["src/auth/login.ts"], "reasoning": "Token refresh race window widened without lock acquisition."}
 ```
-
-When triage escalates, the chat transcript shows the triage summary first
-then the deep review entry. When triage doesn't escalate, only the triage
-summary lands — no extra judge call. `multi-review.triageEscalationThreshold`
-defaults to 1 (any reviewer triggers). Bump it to 2+ if you want only
-multi-reviewer agreement before deep diving.
 
 ## Wire-up
 
@@ -146,7 +165,7 @@ and tells you the exact shape to drop. Unknown fields, wrong types, or
 malformed JSON all degrade silently to in-code defaults so the file is
 never load-bearing.
 
-`mode` accepts `balanced` | `light` | `triage` (default `balanced`).
+`mode` accepts `balanced` | `light` | `triage` | `council` (default `balanced`).
 `triageEscalationThreshold` is the count of reviewers needed to escalate
 in `triage` mode (default `1`); bump it to 2+ for consensus-only escalation.
 
