@@ -19,19 +19,23 @@ design constraint).
 
 ## 1. Install the extension
 
-```bash
-# Globally
-mkdir -p ~/.pi/agent/extensions/multi-review
-cp /home/sawan/Projects/pi-conf/multi-review/extension/index.ts \
-   ~/.pi/agent/extensions/multi-review/index.ts
+Symlink it (recommended when you edit this repo: changes go live on `/reload`):
 
-# Or project-local
-mkdir -p .pi/extensions/multi-review
-cp /home/sawan/Projects/pi-conf/multi-review/extension/index.ts \
-   .pi/extensions/multi-review/index.ts
+```bash
+mkdir -p ~/.pi/agent/extensions
+ln -sfn ~/Projects/pi-conf/multi-review/extension ~/.pi/agent/extensions/multi-review
 ```
 
-Reload inside pi with `/reload`, or restart.
+Or copy a snapshot:
+
+```bash
+mkdir -p ~/.pi/agent/extensions/multi-review
+cp ~/Projects/pi-conf/multi-review/extension/index.ts ~/.pi/agent/extensions/multi-review/index.ts
+```
+
+Project-local instead: use `.pi/extensions/multi-review` in the repo. Pi
+loads any subdirectory that contains an `index.ts`. Restart pi or run
+`/reload`.
 
 ## 2. (Optional) Drop a defaults file
 
@@ -210,7 +214,7 @@ via tool updates so the pending tool row changes as reviewers complete.
 ## Uninstall
 
 ```bash
-rm -rf ~/.pi/agent/extensions/multi-review
+rm -rf ~/.pi/agent/extensions/multi-review   # removes the symlink or the copy, not the repo
 ```
 
 No background processes, no global state damage. `models.json` left
