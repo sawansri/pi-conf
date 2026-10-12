@@ -85,9 +85,10 @@ under "clamped" so you can spot it without guessing.
 Set `"mode"` in the defaults file (or override per-run with
 `--mode=balanced|light|triage|council`):
 
-- `balanced` — fan-out + judge. Default.
-- `light` — fan-out only; no judge. ~50% faster, halves token cost.
-  Use when you trust the per-model attribution and don't need synthesis.
+- `balanced` — fan-out; the main agent judges (with `--direct`, an
+  external judge does). Default.
+- `light` — fan-out with deterministic synthesis. Only differs from
+  balanced in `--direct` runs, where it skips the judge call.
 - `triage` — cheap verdict first; auto-escalates to balanced when at
   least `triageEscalationThreshold` reviewers (default 1) report a
   concrete concern. Use for big diffs where most areas are noise.
@@ -100,10 +101,14 @@ Set `"mode"` in the defaults file (or override per-run with
 
 ### Slash command
 
-Inside pi, type `/multi-review` and you should see autocomplete entries
-for `(default)`, `#1234`, `PR URL`, `focus: …`.
+Inside pi, type `/multi-review ` and you should see completions for
+`--spec=`, `--mode=…`, `--direct`, `#`.
 
-Run a no-args review of your cwd:
+The command hands the task to your main agent. It reads the change, writes
+the reviewer brief, calls `multi_review`, and replies with an Act On /
+Consider / Noted / Dismissed verdict.
+
+Review the working tree (committed + uncommitted) against the default branch:
 ```
 /multi-review
 ```
@@ -113,9 +118,19 @@ Run a PR review:
 /multi-review 4321
 ```
 
-Run a free-text review:
+Review the implementation against a spec (adds a conformance table):
 ```
-/multi-review focus: the auth/ subdirectory, especially error handling
+/multi-review --spec=docs/feature-spec.md
+```
+
+Review an area of the codebase (no diff):
+```
+/multi-review the auth/ subdirectory, especially error handling
+```
+
+Skip the agent and use the configured judge (also what print/RPC modes do):
+```
+/multi-review --direct --mode=light
 ```
 
 Open the reviewer picker to (re-)configure your pool without dragging
@@ -141,8 +156,9 @@ Ask the active agent for a review:
 > please do a multi-model code review on PR 4321
 ```
 
-The agent should call `multi_review` automatically with the right args.
-The result lands as a chat entry — `Ctrl+O` to expand.
+The agent should write a brief and call `multi_review`. The tool result
+renders as the review panel (`Ctrl+O` to expand), and the agent's verdict
+follows it.
 
 ## 4. Inspect and tune
 
@@ -155,9 +171,9 @@ Per-run status updates flow through the same status key and a temporary
 progress widget below the editor:
 ```
 multi-review · mode=balanced · resolving scope
-multi-review · mode=balanced · reviewers running (2/3)
-latest: ✓ Grok-4.7@high (3/5) — 2 findings, 11.6s
-multi-review · 2 groups · invoking judge Claude-Opus-5.5
+multi-review · mode=balanced · reviewers running (4/5)
+latest: ✓ gpt-6-astra@xhigh (4/5) — 4 findings, 33.8s, 5 tool calls
+multi-review · mode=balanced · grouping findings (Claude-Opus-5.5)
 multi-review · done
 ```
 When called through the `multi_review` tool, the same progress is also sent
@@ -168,6 +184,8 @@ via tool updates so the pending tool row changes as reviewers complete.
 | Symptom | What to do |
 |---------|-----------|
 | `no reviewers configured` | Add `multi-review.json` per step 2 |
+| A reviewer shows `timed out after 300s` | Raise `reviewerTimeoutSec`, or lower that reviewer's `@level` (Grok-4.7@high takes ~3 min with tools) |
+| `cannot read spec …` | `--spec` paths are relative to pi's cwd; the run refuses to continue without the spec rather than silently dropping it |
 | `none of the configured reviewers resolved` | Confirm each spec is rule-typed in `~/.pi/agent/models.json` AND has its API key wired (`/login` or env var); the extension never adds models itself |
 | `judge model missing` | Same as above for `multi-review.json` → `judge` |
 | `git fetch origin pull/N/head failed` | Network or auth problem in the git remote; try running fetch by hand |

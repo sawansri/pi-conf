@@ -1,19 +1,21 @@
 /**
- * Multi-Review — fan-out code reviewer (DESIGN: ../README.md · ../install.md)
+ * Multi-Review — multi-model code review led by the main agent (DESIGN: ../README.md · ../install.md)
  *
  * Surfaces:
- *   /multi-review [PR-number | free-text focus]
- *   multi_review (tool) — same shape, agent-callable
+ *   /multi-review [--spec=path] [--mode=…] [--direct] [PR-number | focus]
+ *     → hands off to the main agent (buildHandoffPrompt), which drafts the
+ *       reviewer brief and calls the tool; --direct / print / RPC run the
+ *       pipeline here with an external judge instead.
+ *   multi_review (tool) — brief params (intent, spec_path, requirements,
+ *     context_files, focus, scope) + scope; returns findings + lead-judgment
+ *     instructions to the agent.
  *
- * Pipeline (shared by both):
- *   parseReviewArgs → resolve pool + judge
- *                     → buildReviewTarget (PR via gh, fallback to git fetch;
- *                                          default-branch diff; or directory listing)
- *                     → runAllReviewers (parallel modelRegistry.streamSimple, capped at concurrency)
- *                     → dedupeReviewerFindings (greedy overlap, consensus badge)
- *                     → runJudge (single call on configured judge)
- *                     → pi.sendMessage({ customType: "multi-review", … })
- *                     → pi.registerMessageRenderer collapses/expands it in TUI
+ * Pipeline:
+ *   buildReviewTarget (PR / working-tree diff / area) + buildBrief
+ *     → runAllReviewers (nested read-only agents or registry calls, per-reviewer timeout)
+ *     → groupFindings (semantic clustering, lexical fallback)
+ *     → agent lead judgment (tool result) | runJudge (direct mode)
+ *     → render via the multi-review renderer (tool result or custom message)
  *
  * Persistent defaults: $PI_CODING_AGENT_DIR/multi-review.json loaded once,
  * unknown keys / bad JSON / missing file → silent in-code defaults.
@@ -27,7 +29,7 @@ import * as path from "node:path";
 import type { AgentToolUpdateCallback, ExtensionAPI, ExtensionContext, ExecResult } from "@mariozechner/pi-coding-agent";
 import type { Api, Model as PiModel } from "@mariozechner/pi-ai";
 import { StringEnum } from "@mariozechner/pi-ai";
-import { getAgentDir, getMarkdownTheme } from "@mariozechner/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, getAgentDir, getMarkdownTheme, SessionManager, SettingsManager } from "@mariozechner/pi-coding-agent";
 import { Box, Container, Key, Markdown, matchesKey, Spacer, Text, truncateToWidth } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
 
@@ -118,6 +120,15 @@ export interface MultiReviewConfig {
 	mode: ReviewMode;
 	/** In triage mode, ≥ N reviewer escalations trigger a deep follow-up. */
 	triageEscalationThreshold: number;
+	/** Run finding reviewers as nested agents with read-only repo tools. */
+	reviewerTools: boolean;
+	/** Per-reviewer wall-clock limit; a reviewer past it is reported as failed. */
+	reviewerTimeoutSec: number;
+	/**
+	 * Model (`provider/id[@level]`) that groups findings into issues; defaults
+	 * to the judge at low thinking. "lexical" skips the model call.
+	 */
+	dedupeModel?: string;
 }
 
 export const REVIEW_MODES = ["balanced", "light", "triage", "council"] as const;
@@ -143,7 +154,13 @@ const DEFAULTS: MultiReviewConfig = {
 	temperature: 0.2,
 	mode: "balanced",
 	triageEscalationThreshold: 1,
+	reviewerTools: true,
+	reviewerTimeoutSec: 300,
 };
+
+function reviewerRunOptions(cfg: MultiReviewConfig): ReviewerRunOptions {
+	return { useTools: cfg.reviewerTools, timeoutMs: cfg.reviewerTimeoutSec * 1000 };
+}
 
 /**
  * Pull a `--mode=<value>` flag out of an args string. Returns the mode
@@ -161,6 +178,35 @@ export function parseModeFlag(rawArgs: string, fallback: ReviewMode): { mode: Re
 	}
 	return { mode: fallback, rest: rawArgs };
 }
+
+/** Extract a `--name=value` flag (value without spaces) anywhere in the args. */
+export function parseValueFlag(rawArgs: string, name: string): { value?: string; rest: string } {
+	const re = new RegExp(`(^|\\s)--${name}=(\\S+)(?=\\s|$)`);
+	const m = rawArgs.match(re);
+	if (!m) return { rest: rawArgs };
+	return { value: m[2], rest: rawArgs.replace(re, "$1").replace(/\s+/g, " ").trim() };
+}
+
+/** Extract a bare `--name` switch anywhere in the args. */
+export function parseBoolFlag(rawArgs: string, name: string): { present: boolean; rest: string } {
+	const re = new RegExp(`(^|\\s)--${name}(?=\\s|$)`);
+	if (!re.test(rawArgs)) return { present: false, rest: rawArgs };
+	return { present: true, rest: rawArgs.replace(re, "$1").replace(/\s+/g, " ").trim() };
+}
+
+/** Raw brief fields as they arrive from the tool call (or the --spec flag). */
+export interface BriefInput {
+	intent?: string;
+	requirements?: string[];
+	specPath?: string;
+	contextFiles?: string[];
+}
+
+function hasBriefInput(b: BriefInput): boolean {
+	return Boolean(b.intent?.trim() || b.specPath || b.requirements?.length || b.contextFiles?.length);
+}
+
+const AGENT_LEAD_LABEL = "balanced · main agent judges";
 
 const STATUS_KEY = "multi-review";
 
@@ -209,6 +255,13 @@ function loadConfig(): MultiReviewConfig {
 			&& parsed.triageEscalationThreshold <= 16
 		) {
 			cachedConfig.triageEscalationThreshold = Math.floor(parsed.triageEscalationThreshold);
+		}
+		if (typeof parsed.reviewerTools === "boolean") cachedConfig.reviewerTools = parsed.reviewerTools;
+		if (typeof parsed.dedupeModel === "string" && (parsed.dedupeModel === "lexical" || parsed.dedupeModel.includes("/"))) {
+			cachedConfig.dedupeModel = parsed.dedupeModel;
+		}
+		if (typeof parsed.reviewerTimeoutSec === "number" && parsed.reviewerTimeoutSec >= 10 && parsed.reviewerTimeoutSec <= 3600) {
+			cachedConfig.reviewerTimeoutSec = Math.floor(parsed.reviewerTimeoutSec);
 		}
 	} catch {
 		cachedConfig = { ...DEFAULTS };
@@ -341,8 +394,9 @@ function formatReviewerProgressLine(done: number, total: number, latest: Reviewe
 	const verdict = latest.ok ? "✓" : "✗";
 	const findings = latest.ok ? `${latest.findings.length} finding${latest.findings.length === 1 ? "" : "s"}` : (latest.errorMessage ?? "error");
 	const cost = latest.usage?.cost ? `, $${latest.usage.cost.toFixed(4)}` : "";
+	const tools = latest.toolCalls ? `, ${latest.toolCalls} tool call${latest.toolCalls === 1 ? "" : "s"}` : "";
 	const clamped = latest.clamped ? " [thinking clamped]" : "";
-	return `${verdict} ${shortSpec(latest.formattedSpec)}${clamped} (${done}/${total}) — ${findings}, ${(latest.durationMs / 1000).toFixed(1)}s${cost}`;
+	return `${verdict} ${shortSpec(latest.formattedSpec)}${clamped} (${done}/${total}) — ${findings}, ${(latest.durationMs / 1000).toFixed(1)}s${tools}${cost}`;
 }
 
 function createProgressReporter(ctx: ExtensionContext, mode: ReviewMode, onUpdate?: ToolUpdateFn): MultiReviewProgressReporter {
@@ -477,6 +531,78 @@ export interface ReviewTarget {
 	diffText: string;
 	metaLines: string[];
 	warnings: string[];
+	/** Reviewer brief, usually drafted by the main agent. Empty for bare runs. */
+	brief?: ReviewBrief;
+}
+
+/**
+ * What reviewers are told about the change beyond the diff. The main agent
+ * drafts this (it has the conversation context the reviewers lack); the
+ * spec, when given, is passed through verbatim as the source of truth.
+ */
+export interface ReviewBrief {
+	intent: string;
+	requirements: string[];
+	spec?: { path: string; text: string };
+	contextFiles: { path: string; text: string }[];
+}
+
+const SPEC_BUDGET_CHARS = 60_000;
+const CONTEXT_FILE_BUDGET_CHARS = 40_000;
+const CONTEXT_TOTAL_BUDGET_CHARS = 150_000;
+const MAX_CONTEXT_FILES = 12;
+
+function clip(text: string, budget: number, label: string): string {
+	if (text.length <= budget) return text;
+	return text.slice(0, budget) + `\n…(${label} truncated to ${budget} chars; ${text.length} total)\n`;
+}
+
+/**
+ * Resolve a spec path relative to cwd and read it. Returns an error string
+ * instead of throwing so callers can surface it as a notify.
+ */
+export function readSpecFile(cwd: string, specPath: string): { path: string; text: string } | { error: string } {
+	const abs = path.resolve(cwd, specPath);
+	try {
+		const text = fs.readFileSync(abs, "utf8");
+		if (!text.trim()) return { error: `spec file is empty: ${specPath}` };
+		return { path: path.relative(cwd, abs) || specPath, text: clip(text, SPEC_BUDGET_CHARS, "spec") };
+	} catch (err) {
+		return { error: `cannot read spec ${specPath}: ${err instanceof Error ? err.message : String(err)}` };
+	}
+}
+
+/** Read the files the brief asks reviewers to see in full; unreadable ones become warnings. */
+export function buildBrief(
+	cwd: string,
+	input: { intent?: string; requirements?: string[]; specPath?: string; contextFiles?: string[] },
+	warnings: string[],
+): ReviewBrief {
+	const brief: ReviewBrief = {
+		intent: input.intent?.trim() ?? "",
+		requirements: (input.requirements ?? []).map((r) => r.trim()).filter(Boolean),
+		contextFiles: [],
+	};
+	if (input.specPath) {
+		const spec = readSpecFile(cwd, input.specPath);
+		if ("error" in spec) warnings.push(spec.error);
+		else brief.spec = spec;
+	}
+	let total = 0;
+	for (const rel of (input.contextFiles ?? []).slice(0, MAX_CONTEXT_FILES)) {
+		try {
+			const text = clip(fs.readFileSync(path.resolve(cwd, rel), "utf8"), CONTEXT_FILE_BUDGET_CHARS, rel);
+			if (total + text.length > CONTEXT_TOTAL_BUDGET_CHARS) {
+				warnings.push(`context file skipped (total budget): ${rel}`);
+				continue;
+			}
+			total += text.length;
+			brief.contextFiles.push({ path: rel, text });
+		} catch (err) {
+			warnings.push(`context file unreadable: ${rel} (${err instanceof Error ? err.message : String(err)})`);
+		}
+	}
+	return brief;
 }
 
 async function exec(pi: ExtensionAPI, command: string, args: string[], cwd: string, timeoutMs = 30_000): Promise<ExecResult> {
@@ -965,6 +1091,8 @@ export interface ReviewerFinding {
 	category: string;
 	title: string;
 	comment: string;
+	/** Title + core comment (no evidence/suggestion), used for dedupe matching. */
+	match_text?: string;
 }
 
 export interface ReviewerRunResult {
@@ -981,31 +1109,46 @@ export interface ReviewerRunResult {
 	stopReason: string;
 	errorMessage?: string;
 	usage?: { input: number; output: number; total: number; cost: number };
+	toolCalls?: number;
 	durationMs: number;
 }
 
-const REVIEWER_SYSTEM_PROMPT = `You are a senior code reviewer. Read the diff and the optional focus hint, then output ONLY a JSON array.
+const REVIEWER_SYSTEM_PROMPT = `You are an adversarial code reviewer. Find real problems in the change: bugs, security holes, design flaws, maintainability risks, and — when a spec is provided — places where the implementation does not meet it. You are not here to be encouraging. Do not praise the code or restate what it does.
 
-Schema:
+You may be given an intent statement and a spec. Assume the goal is correct and challenge the execution: does the code actually achieve it?
+
+Evidence rules:
+- Reference specific code. "This could be null" is only a finding if you show the path that makes it null.
+- For security findings, trace the input from its source to the dangerous sink.
+- Distinguish "this is broken" from "I would have done it differently". The second is not a finding unless you show a concrete problem.
+- Don't inflate nits to fill the review. An empty review is a valid outcome.
+
+Output ONLY a JSON array:
 [
   {
     "file": "relative/path/from/repo/root",
     "line_start": <int|null>,
     "line_end": <int|null>,
-    "severity": "critical"|"high"|"medium"|"low"|"info"|"none",
-    "category": "correctness"|"security"|"perf"|"style"|"docs"|"api-design"|"<short free-form label>",
-    "title": "<short, ≤80 chars>",
-    "comment": "<one paragraph explanation, ≤400 chars>"
+    "severity": "critical"|"high"|"medium"|"low"|"info",
+    "category": "correctness"|"security"|"spec"|"design"|"perf"|"tests"|"<short label>",
+    "title": "<≤80 chars>",
+    "comment": "<what is wrong, ≤400 chars>",
+    "evidence": "<the execution path / spec clause / lines that prove it, ≤400 chars>",
+    "suggestion": "<optional concrete fix, ≤200 chars>"
   }
 ]
 
 Rules:
-- Output ONLY the JSON array. No prose, no markdown fences unless you must.
-- If you see no problems, output []. Do not pad.
-- Prefer one finding per concrete issue; do not bundle a file's worth of small things into one entry.
-- line_start/line_end should match the diff's "++ b/path" hunk (line numbers AFTER the change, not before).
-- If the diff is not a git diff but a directory listing, comment at the file level only and leave line_start/line_end null.
-- Severity: critical (security vulns, data loss), high (correctness bugs, race conditions), medium (perf cliffs, panic-on-bad-input), low (subtle), info (style, docs).`;
+- If you find nothing wrong, output []. Nothing else counts as "no findings".
+- One finding per concrete issue.
+- line_start/line_end are post-change line numbers in the new file. Use null for file-level findings.
+- category "spec": a requirement that is missing, partially implemented, or contradicted. Quote the requirement in evidence.
+- Severity: critical (security hole, data loss, spec requirement fundamentally unmet), high (correctness bug, race, broken edge case), medium (perf cliff, fragile design that will bite soon), low (minor correctness/maintainability), info (style, docs).`;
+
+/** Appended when the reviewer runs as a nested agent with read-only tools. */
+const REVIEWER_TOOLS_ADDENDUM = `
+
+You have read-only tools (read, grep, find, ls) on the repository. Use them to trace callers, types, and tests before asserting a finding — a diff alone hides most cross-file bugs. Stay focused: investigate what the change touches, not the whole repo. Your FINAL message must be only the JSON array.`;
 
 /**
  * Build the reviewer-side user prompt from a target. We truncate the diff
@@ -1023,6 +1166,23 @@ function budgetDiff(diffText: string): string {
 
 function buildReviewUserPrompt(target: ReviewTarget): string {
 	const chunks: string[] = [];
+	const brief = target.brief;
+	if (brief?.intent) {
+		chunks.push("## Intent (from the author)");
+		chunks.push(brief.intent);
+		chunks.push("");
+	}
+	if (brief?.spec) {
+		chunks.push(`## Spec — source of truth (${brief.spec.path})`);
+		chunks.push(brief.spec.text);
+		chunks.push("");
+	}
+	if (brief && brief.requirements.length > 0) {
+		chunks.push("## Requirements to verify");
+		chunks.push("Check each one against the implementation; report unmet or contradicted ones as category \"spec\".");
+		brief.requirements.forEach((r, i) => chunks.push(`${i + 1}. ${r}`));
+		chunks.push("");
+	}
 	if (target.metaLines.length > 0) {
 		chunks.push("## Context");
 		chunks.push(...target.metaLines);
@@ -1037,8 +1197,18 @@ function buildReviewUserPrompt(target: ReviewTarget): string {
 		for (const f of target.files) chunks.push(`- ${f.path}`);
 		chunks.push("");
 	}
+	if (brief && brief.contextFiles.length > 0) {
+		chunks.push("## Related files (full contents)");
+		for (const f of brief.contextFiles) {
+			chunks.push(`### ${f.path}`);
+			chunks.push("```");
+			chunks.push(f.text);
+			chunks.push("```");
+		}
+		chunks.push("");
+	}
 	if (target.focusHint) {
-		chunks.push("## Focus hint from caller");
+		chunks.push("## Focus");
 		chunks.push(target.focusHint);
 		chunks.push("");
 	}
@@ -1080,10 +1250,16 @@ function parseReviewerJson(rawText: string): ReviewerFinding[] {
 			: "info";
 		const category = String(f.category ?? "general").slice(0, 32).toLowerCase().replace(/[^a-z0-9-]+/g, "-") || "general";
 		const title = String(f.title ?? "(untitled)").slice(0, 200);
-		const comment = String(f.comment ?? "").slice(0, 2000);
+		const raw = item as Record<string, unknown>;
+		const evidence = typeof raw.evidence === "string" && raw.evidence.trim() ? `\nEvidence: ${raw.evidence.trim()}` : "";
+		const suggestion = typeof raw.suggestion === "string" && raw.suggestion.trim() ? `\nSuggestion: ${raw.suggestion.trim()}` : "";
+		const comment = (String(f.comment ?? "") + evidence + suggestion).slice(0, 2400);
 		const filePath = String(f.file ?? "").trim();
 		if (!filePath) continue;
-		findings.push({ file: filePath, line_start: lineStart, line_end: lineEnd, severity, category, title, comment });
+		findings.push({
+			file: filePath, line_start: lineStart, line_end: lineEnd, severity, category, title, comment,
+			match_text: `${title} ${String(f.comment ?? "")}`,
+		});
 	}
 	return findings;
 }
@@ -1094,6 +1270,8 @@ interface ModelCallResult {
 	/** Set when the call failed outright (auth, HTTP, abort) or was truncated. */
 	errorMessage?: string;
 	usage?: { input: number; output: number; total: number; cost: number };
+	/** Tool calls made, for agentic reviewers. */
+	toolCalls?: number;
 	durationMs: number;
 }
 
@@ -1170,6 +1348,89 @@ async function callModel(
 	}
 }
 
+/**
+ * Run a reviewer as a nested pi agent with read-only tools so it can follow
+ * callers, types, and tests instead of guessing from the diff. The child
+ * session loads no extensions/skills/context files (no recursion into
+ * multi-review, no project prompt drift) and lives in memory only.
+ */
+async function runAgenticReviewer(
+	ctx: ExtensionContext,
+	model: Model,
+	thinking: ThinkingLevelAlias,
+	systemPrompt: string,
+	userPrompt: string,
+	signal: AbortSignal,
+): Promise<ModelCallResult> {
+	const started = Date.now();
+	const settingsManager = SettingsManager.inMemory({});
+	const resourceLoader = new DefaultResourceLoader({
+		cwd: ctx.cwd,
+		agentDir: getAgentDir(),
+		settingsManager,
+		noExtensions: true,
+		noSkills: true,
+		noPromptTemplates: true,
+		noThemes: true,
+		noContextFiles: true,
+		systemPrompt,
+	});
+	await resourceLoader.reload();
+	const { session } = await createAgentSession({
+		cwd: ctx.cwd,
+		model,
+		thinkingLevel: thinking,
+		tools: ["read", "grep", "find", "ls"],
+		resourceLoader,
+		settingsManager,
+		sessionManager: SessionManager.inMemory(ctx.cwd),
+	});
+	const onAbort = () => void session.abort();
+	signal.addEventListener("abort", onAbort, { once: true });
+	try {
+		if (signal.aborted) throw new Error("aborted before start");
+		await session.prompt(userPrompt);
+		const stats = session.getSessionStats();
+		const last = [...session.messages].reverse().find((m) => (m as { role?: string }).role === "assistant") as
+			| { stopReason?: string; errorMessage?: string }
+			| undefined;
+		const stopReason = last?.stopReason ?? "stop";
+		let errorMessage: string | undefined;
+		if (signal.aborted) errorMessage = `aborted: ${String(signal.reason ?? "cancelled")}`;
+		else if (stopReason === "error" || stopReason === "aborted") errorMessage = `${stopReason}: ${last?.errorMessage ?? "(no message)"}`;
+		return {
+			text: session.getLastAssistantText() ?? "",
+			stopReason,
+			errorMessage,
+			usage: { input: stats.tokens.input, output: stats.tokens.output, total: stats.tokens.total, cost: stats.cost },
+			toolCalls: stats.toolCalls,
+			durationMs: Date.now() - started,
+		};
+	} catch (err) {
+		return {
+			text: "",
+			stopReason: "error",
+			errorMessage: signal.aborted ? `aborted: ${String(signal.reason ?? "cancelled")}` : (err instanceof Error ? err.message : String(err)),
+			durationMs: Date.now() - started,
+		};
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+		session.dispose();
+	}
+}
+
+/** Caller's signal plus a per-reviewer deadline, so one hung model can't stall the run. */
+function withTimeout(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
+	const timeout = AbortSignal.timeout(timeoutMs);
+	return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+export interface ReviewerRunOptions {
+	/** Nested agent with read-only repo tools instead of a single completion. */
+	useTools: boolean;
+	timeoutMs: number;
+}
+
 async function runReviewer(
 	model: Model,
 	reviewerSpec: ReviewerSpec,
@@ -1178,13 +1439,20 @@ async function runReviewer(
 	userPrompt: string,
 	temperature: number,
 	abortSignal: AbortSignal | undefined,
+	runOpts: ReviewerRunOptions,
 	parse: (text: string) => ReviewerFinding[] = parseReviewerJson,
 ): Promise<Omit<ReviewerRunResult, "formattedSpec" | "spec" | "thinking" | "clamped">> {
-	const call = await callModel(ctx, model, systemPrompt, userPrompt, {
-		thinking: reviewerSpec.thinking,
-		temperature,
-		signal: abortSignal,
-	});
+	const signal = withTimeout(abortSignal, runOpts.timeoutMs);
+	const call = runOpts.useTools
+		? await runAgenticReviewer(ctx, model, reviewerSpec.thinking, systemPrompt + REVIEWER_TOOLS_ADDENDUM, userPrompt, signal)
+		: await callModel(ctx, model, systemPrompt, userPrompt, {
+			thinking: reviewerSpec.thinking,
+			temperature,
+			signal,
+		});
+	if (call.errorMessage && signal.aborted && !abortSignal?.aborted) {
+		call.errorMessage = `timed out after ${Math.round(runOpts.timeoutMs / 1000)}s`;
+	}
 	let findings: ReviewerFinding[] = [];
 	let errorMessage = call.errorMessage;
 	if (!errorMessage) {
@@ -1203,6 +1471,7 @@ async function runReviewer(
 		stopReason: call.stopReason,
 		errorMessage,
 		usage: call.usage,
+		toolCalls: call.toolCalls,
 		durationMs: call.durationMs,
 	};
 }
@@ -1243,6 +1512,7 @@ async function runAllReviewers(
 	temperature: number,
 	abortSignal: AbortSignal | undefined,
 	ctx: ExtensionContext,
+	runOpts: ReviewerRunOptions,
 	onProgress?: (done: number, total: number, latest: ReviewerRunResult) => void,
 ): Promise<ReviewerRunResult[]> {
 	const cap = Math.max(1, Math.min(MAX_PARALLEL, concurrency, resolved.length));
@@ -1260,7 +1530,7 @@ async function runAllReviewers(
 			if (idx >= resolved.length) return;
 			const slot = resolved[idx];
 			try {
-				const partial = await runReviewer(slot.model, slot.rs, ctx, systemPrompt, userPrompt, temperature, abortSignal);
+				const partial = await runReviewer(slot.model, slot.rs, ctx, systemPrompt, userPrompt, temperature, abortSignal, runOpts);
 				const full: ReviewerRunResult = {
 					formattedSpec: formatReviewerSpec(slot.rs),
 					spec: slot.rs.spec,
@@ -1323,7 +1593,14 @@ export interface DedupeGroup {
 }
 
 /** Models cite slightly different lines for the same issue; allow this much slack. */
-const LINE_MATCH_SLACK = 3;
+const LINE_MATCH_SLACK = 2;
+/**
+ * Minimum word overlap (Jaccard over title+comment keywords) for two nearby
+ * findings to count as one issue. Same category lowers the bar but never to
+ * zero: adjacent "spec" findings are usually different requirements.
+ */
+const TEXT_MATCH_JACCARD = 0.2;
+const TEXT_MATCH_JACCARD_SAME_CATEGORY = 0.08;
 
 function normalizedRange(start: number | null, end: number | null): [number, number] | null {
 	if (start === null && end === null) return null;
@@ -1332,18 +1609,39 @@ function normalizedRange(start: number | null, end: number | null): [number, num
 	return a <= b ? [a, b] : [b, a];
 }
 
+const STOPWORDS = new Set(["this", "that", "with", "from", "when", "then", "than", "into", "which", "will", "would", "should", "could", "there", "their", "because", "returns", "return", "value", "code", "line", "lines", "function", "method", "call", "calls"]);
+
+function keywords(text: string): Set<string> {
+	return new Set(text.toLowerCase().split(/[^a-z0-9_]+/).filter((w) => w.length >= 4 && !STOPWORDS.has(w)));
+}
+
+function jaccard(a: Set<string>, b: Set<string>): number {
+	if (a.size === 0 || b.size === 0) return 0;
+	let inter = 0;
+	for (const w of a) if (b.has(w)) inter++;
+	return inter / (a.size + b.size - inter);
+}
+
+interface GroupMemberFinding {
+	finding: ReviewerFinding;
+	words: Set<string>;
+}
+
 /**
- * Same file AND either both file-level, or line ranges within LINE_MATCH_SLACK.
- * A file-level finding never matches a line-anchored one: otherwise one vague
- * "this file has issues" comment absorbs every finding in the file and
- * manufactures consensus.
+ * Same file, near some member's own lines (never a widened union — that
+ * chains unrelated findings across small files), and the same issue:
+ * enough shared vocabulary, with a lower bar within one category. File-level findings only match
+ * file-level findings, so one vague comment can't absorb a whole file.
  */
-function groupAccepts(group: DedupeGroup, f: ReviewerFinding): boolean {
-	if (group.file !== f.file) return false;
-	const g = normalizedRange(group.line_start, group.line_end);
-	const r = normalizedRange(f.line_start, f.line_end);
-	if (g === null || r === null) return g === r;
-	return r[0] <= g[1] + LINE_MATCH_SLACK && g[0] <= r[1] + LINE_MATCH_SLACK;
+function sameIssue(members: GroupMemberFinding[], f: ReviewerFinding, words: Set<string>): boolean {
+	return members.some(({ finding: m, words: mw }) => {
+		if (m.file !== f.file) return false;
+		const g = normalizedRange(m.line_start, m.line_end);
+		const r = normalizedRange(f.line_start, f.line_end);
+		if ((g === null) !== (r === null)) return false;
+		if (g && r && !(r[0] <= g[1] + LINE_MATCH_SLACK && g[0] <= r[1] + LINE_MATCH_SLACK)) return false;
+		return jaccard(mw, words) >= (m.category === f.category ? TEXT_MATCH_JACCARD_SAME_CATEGORY : TEXT_MATCH_JACCARD);
+	});
 }
 
 /**
@@ -1353,52 +1651,47 @@ function groupAccepts(group: DedupeGroup, f: ReviewerFinding): boolean {
  *
  * Each reviewer contributes at most one finding per group: two findings
  * from the same model at nearby lines are that model saying "these are
- * different issues", so they stay separate. Group ranges widen to the
- * union of their members.
+ * different issues", so they stay separate. The displayed group range is
+ * the union of its members; matching uses member ranges (see sameIssue).
  */
-export function dedupeReviewerFindings(results: ReviewerRunResult[]): DedupeGroup[] {
-	const groups: DedupeGroup[] = [];
-	for (const r of results) {
-		if (!r?.ok) continue;
-		for (const finding of r.findings) {
-			const member = {
-				spec: r.spec,
-				comment: finding.comment,
-				severity: finding.severity,
-				line_start: finding.line_start,
-				line_end: finding.line_end,
-			};
-			const group = groups.find((g) => !g.reviewerSpecs.includes(r.spec) && groupAccepts(g, finding));
-			if (!group) {
-				groups.push({
-					id: "",
-					file: finding.file,
-					line_start: finding.line_start,
-					line_end: finding.line_end,
-					severity: finding.severity,
-					category: finding.category,
-					title: finding.title,
-					titles: [finding.title],
-					members: [member],
-					reviewerSpecs: [r.spec],
-					consensus: false,
-				});
-				continue;
-			}
-			group.members.push(member);
-			group.reviewerSpecs.push(r.spec);
-			group.consensus = true;
-			if (!group.titles.includes(finding.title)) group.titles.push(finding.title);
-			if (SEVERITY_RANK[finding.severity] > SEVERITY_RANK[group.severity]) group.severity = finding.severity;
-			const g = normalizedRange(group.line_start, group.line_end);
-			const f = normalizedRange(finding.line_start, finding.line_end);
-			if (g && f) {
-				group.line_start = Math.min(g[0], f[0]);
-				group.line_end = Math.max(g[1], f[1]);
-			}
-		}
-	}
+/** Stable id for one reviewer finding: `<run index>:<finding index>`. */
+export type FindingKey = string;
 
+function newGroup(spec: ModelSpec, finding: ReviewerFinding): DedupeGroup {
+	return {
+		id: "",
+		file: finding.file,
+		line_start: finding.line_start,
+		line_end: finding.line_end,
+		severity: finding.severity,
+		category: finding.category,
+		title: finding.title,
+		titles: [finding.title],
+		members: [memberOf(spec, finding)],
+		reviewerSpecs: [spec],
+		consensus: false,
+	};
+}
+
+function memberOf(spec: ModelSpec, finding: ReviewerFinding): DedupeGroup["members"][number] {
+	return { spec, comment: finding.comment, severity: finding.severity, line_start: finding.line_start, line_end: finding.line_end };
+}
+
+function addToGroup(group: DedupeGroup, spec: ModelSpec, finding: ReviewerFinding): void {
+	group.members.push(memberOf(spec, finding));
+	group.reviewerSpecs.push(spec);
+	group.consensus = true;
+	if (!group.titles.includes(finding.title)) group.titles.push(finding.title);
+	if (SEVERITY_RANK[finding.severity] > SEVERITY_RANK[group.severity]) group.severity = finding.severity;
+	const g = normalizedRange(group.line_start, group.line_end);
+	const f = normalizedRange(finding.line_start, finding.line_end);
+	if (g && f) {
+		group.line_start = Math.min(g[0], f[0]);
+		group.line_end = Math.max(g[1], f[1]);
+	}
+}
+
+function finalizeGroups(groups: DedupeGroup[]): DedupeGroup[] {
 	// Sort by severity desc, consensus first, then file, then line_start.
 	groups.sort((a, b) => {
 		const s = SEVERITY_RANK[b.severity] - SEVERITY_RANK[a.severity];
@@ -1412,6 +1705,154 @@ export function dedupeReviewerFindings(results: ReviewerRunResult[]): DedupeGrou
 	// Ids follow display order so council/judge references read naturally.
 	groups.forEach((g, i) => { g.id = `g${i + 1}`; });
 	return groups;
+}
+
+/**
+ * Group findings into issues. With `clusters` (a validated partition from
+ * clusterFindingsWithModel) the grouping is taken as given; otherwise a
+ * lexical fallback matches on file, nearby lines, and distinctive words.
+ */
+export function dedupeReviewerFindings(results: ReviewerRunResult[], clusters?: FindingKey[][]): DedupeGroup[] {
+	if (clusters) {
+		const groups: DedupeGroup[] = [];
+		for (const cluster of clusters) {
+			let group: DedupeGroup | undefined;
+			for (const key of cluster) {
+				const [ri, fi] = key.split(":").map(Number);
+				const r = results[ri];
+				const finding = r?.findings[fi];
+				if (!r || !finding) continue;
+				if (!group) group = newGroup(r.spec, finding);
+				else addToGroup(group, r.spec, finding);
+			}
+			if (group) groups.push(group);
+		}
+		return finalizeGroups(groups);
+	}
+
+	const groups: DedupeGroup[] = [];
+	const memberFindings: GroupMemberFinding[][] = [];
+	// Words most findings share (the file's domain, "spec", quoted spec text)
+	// say nothing about WHICH issue a finding is; drop them before matching.
+	const allTexts = results.filter((r) => r?.ok).flatMap((r) => r.findings.map((f) => keywords(f.match_text ?? `${f.title} ${f.comment}`)));
+	const docFreq = new Map<string, number>();
+	for (const ws of allTexts) for (const w of ws) docFreq.set(w, (docFreq.get(w) ?? 0) + 1);
+	const commonCutoff = Math.max(3, Math.ceil(allTexts.length * 0.4));
+	const distinctive = (ws: Set<string>) => new Set([...ws].filter((w) => (docFreq.get(w) ?? 0) < commonCutoff));
+	for (const r of results) {
+		if (!r?.ok) continue;
+		for (const finding of r.findings) {
+			const words = distinctive(keywords(finding.match_text ?? `${finding.title} ${finding.comment}`));
+			const gi = groups.findIndex((g, i) => !g.reviewerSpecs.includes(r.spec) && sameIssue(memberFindings[i], finding, words));
+			if (gi >= 0) {
+				addToGroup(groups[gi], r.spec, finding);
+				memberFindings[gi].push({ finding, words });
+			} else {
+				groups.push(newGroup(r.spec, finding));
+				memberFindings.push([{ finding, words }]);
+			}
+		}
+	}
+	return finalizeGroups(groups);
+}
+
+const CLUSTER_SYSTEM_PROMPT = `You group code-review findings from several independent reviewers into distinct issues.
+
+Two findings belong together only if they describe the SAME underlying defect (same root cause, same fix) — not merely the same file, nearby lines, or the same spec. Different requirements, different bugs on adjacent lines, and a bug vs. a missing test are separate issues.
+
+Output ONLY a JSON array of clusters; each cluster is an array of finding ids, e.g. [["0:1","2:0"],["1:3"]].
+- Every id appears in exactly one cluster.
+- Never put two findings from the same reviewer (same number before the colon) in one cluster.
+- Singletons are fine.`;
+
+/**
+ * Semantic grouping: one cheap model call that partitions findings into
+ * issues. Consensus counts are the main signal this tool produces, and
+ * lexical matching can't tell "same bug" from "different bug two lines
+ * down". The model's answer is validated into a strict partition (each id
+ * once, ≤1 finding per reviewer per cluster); anything invalid → null and
+ * the caller falls back to lexical grouping.
+ */
+async function clusterFindingsWithModel(
+	ctx: ExtensionContext,
+	model: Model,
+	thinking: ThinkingLevelAlias,
+	results: ReviewerRunResult[],
+	signal: AbortSignal | undefined,
+	timeoutMs: number,
+): Promise<{ clusters: FindingKey[][] } | { error: string }> {
+	const items: string[] = [];
+	const known = new Set<FindingKey>();
+	results.forEach((r, ri) => {
+		if (!r?.ok) return;
+		r.findings.forEach((f, fi) => {
+			const key = `${ri}:${fi}`;
+			known.add(key);
+			const core = (f.match_text ?? f.comment).replace(/\s+/g, " ").slice(0, 500);
+			items.push(`- id ${key} | ${f.file}:${formatRange(f.line_start, f.line_end)} | ${f.category} | ${f.title} — ${core}`);
+		});
+	});
+	if (known.size < 2) return { clusters: [...known].map((k) => [k]) };
+	const call = await callModel(ctx, model, CLUSTER_SYSTEM_PROMPT, `## Findings\n${items.join("\n")}`, {
+		thinking,
+		temperature: 0,
+		signal: withTimeout(signal, timeoutMs),
+		maxTokens: 8_000,
+	});
+	if (call.errorMessage) return { error: call.errorMessage };
+	let parsed: unknown;
+	try {
+		const start = call.text.indexOf("[");
+		const end = call.text.lastIndexOf("]");
+		parsed = JSON.parse(call.text.slice(start, end + 1));
+	} catch (err) {
+		return { error: `cluster JSON: ${err instanceof Error ? err.message : String(err)}` };
+	}
+	if (!Array.isArray(parsed)) return { error: "cluster reply is not an array" };
+	const seen = new Set<FindingKey>();
+	const clusters: FindingKey[][] = [];
+	for (const raw of parsed) {
+		if (!Array.isArray(raw)) continue;
+		const cluster: FindingKey[] = [];
+		const reviewers = new Set<string>();
+		for (const id of raw) {
+			const key = String(id);
+			if (!known.has(key) || seen.has(key)) continue;
+			const reviewer = key.split(":")[0];
+			seen.add(key);
+			// A same-reviewer collision means the model merged two of one
+			// reviewer's distinct findings; split it out rather than trust it.
+			if (reviewers.has(reviewer)) clusters.push([key]);
+			else {
+				reviewers.add(reviewer);
+				cluster.push(key);
+			}
+		}
+		if (cluster.length > 0) clusters.push(cluster);
+	}
+	for (const key of known) if (!seen.has(key)) clusters.push([key]);
+	return { clusters };
+}
+
+/** Semantic grouping with lexical fallback; never fails the run. */
+async function groupFindings(
+	ctx: ExtensionContext,
+	cfg: MultiReviewConfig,
+	results: ReviewerRunResult[],
+	signal: AbortSignal | undefined,
+	progress?: MultiReviewProgressReporter,
+): Promise<DedupeGroup[]> {
+	if (cfg.dedupeModel === "lexical") return dedupeReviewerFindings(results);
+	const parsedSpec = parseReviewerSpec(cfg.dedupeModel ?? cfg.judge, "low");
+	const model = parsedSpec ? findModel(ctx, parsedSpec.spec) : null;
+	if (!parsedSpec || !model) return dedupeReviewerFindings(results);
+	progress?.update({ phase: `grouping findings (${shortSpec(parsedSpec.spec)})`, done: undefined, total: undefined });
+	const out = await clusterFindingsWithModel(ctx, model, parsedSpec.thinking, results, signal, 120_000);
+	if ("error" in out) {
+		progress?.update({ phase: "grouping fell back to lexical", latest: `grouping model failed: ${out.error.slice(0, 120)}` });
+		return dedupeReviewerFindings(results);
+	}
+	return dedupeReviewerFindings(results, out.clusters);
 }
 
 function formatRange(start: number | null, end: number | null): string {
@@ -1482,6 +1923,20 @@ function renderGroupsForJudge(target: ReviewTarget, groups: DedupeGroup[]): stri
 		lines.push("");
 		lines.push(`focus hint: ${target.focusHint}`);
 	}
+	if (target.brief?.intent) {
+		lines.push("");
+		lines.push(`intent: ${target.brief.intent}`);
+	}
+	if (target.brief?.spec) {
+		lines.push("");
+		lines.push(`## Spec (${target.brief.spec.path})`);
+		lines.push(target.brief.spec.text);
+	}
+	if (target.brief && target.brief.requirements.length > 0) {
+		lines.push("");
+		lines.push("## Requirements");
+		target.brief.requirements.forEach((r, i) => lines.push(`${i + 1}. ${r}`));
+	}
 	lines.push("");
 	lines.push("## Deduped findings (in severity order)");
 	if (groups.length === 0) {
@@ -1546,10 +2001,11 @@ function synthesizeMarkdownFromGroups(
 	target: ReviewTarget,
 	groups: DedupeGroup[],
 	reviewerRuns: ReviewerRunResult[],
+	modeLabel = "light, no-judge",
 ): string {
 	const lines: string[] = [];
 	const failed = reviewerRuns.filter((r) => !r.ok);
-	lines.push("# Multi-Model Code Review (light, no-judge)");
+	lines.push(`# Multi-Model Code Review (${modeLabel})`);
 	lines.push("");
 	lines.push("## Summary");
 	const consensusCount = groups.filter((g) => g.consensus).length;
@@ -1582,11 +2038,16 @@ function synthesizeMarkdownFromGroups(
 			lines.push("");
 		}
 	}
-	if (failed.length > 0) {
-		lines.push("## Coverage");
-		for (const f of failed) lines.push(`- reviewer \`${f.formattedSpec}\` did not return: ${f.errorMessage?.slice(0, 120) ?? "(unknown)"}`);
-		lines.push("");
+	lines.push("## Reviewers");
+	for (const r of reviewerRuns) {
+		const status = r.ok
+			? `${r.findings.length} finding${r.findings.length === 1 ? "" : "s"}`
+			: `FAILED — ${r.errorMessage?.slice(0, 160) ?? "(unknown)"}`;
+		const tools = r.toolCalls ? `, ${r.toolCalls} tool calls` : "";
+		lines.push(`- \`${r.formattedSpec}\`${r.clamped ? " (thinking clamped)" : ""}: ${status} (${(r.durationMs / 1000).toFixed(1)}s${tools})`);
 	}
+	if (failed.length > 0) lines.push("", "Failed reviewers are excluded from consensus counts.");
+	lines.push("");
 	return lines.join("\n");
 }
 
@@ -1663,6 +2124,7 @@ async function runTriageFanOut(
 	temperature: number,
 	abortSignal: AbortSignal | undefined,
 	ctx: ExtensionContext,
+	runOpts: ReviewerRunOptions,
 	onProgress?: (done: number, total: number, latest: ReviewerRunResult) => void,
 ): Promise<TriageFanOutResult> {
 	const runs: ReviewerRunResult[] = new Array(resolved.length);
@@ -1678,7 +2140,7 @@ async function runTriageFanOut(
 			if (idx >= resolved.length) return;
 			const slot = resolved[idx];
 			try {
-				const r = await runReviewer(slot.model, slot.rs, ctx, TRIAGE_REVIEWER_SYSTEM_PROMPT, userPrompt, temperature, abortSignal, () => []);
+				const r = await runReviewer(slot.model, slot.rs, ctx, TRIAGE_REVIEWER_SYSTEM_PROMPT, userPrompt, temperature, abortSignal, { ...runOpts, useTools: false }, () => []);
 				const full: ReviewerRunResult = {
 					formattedSpec: formatReviewerSpec(slot.rs),
 					spec: slot.rs.spec,
@@ -2162,6 +2624,7 @@ async function runCouncilRound2FanOut(
 	temperature: number,
 	signal: AbortSignal | undefined,
 	ctx: ExtensionContext,
+	runOpts: ReviewerRunOptions,
 	onProgress?: (done: number, total: number, latest: ReviewerRunResult) => void,
 ): Promise<Array<{ run: ReviewerRunResult; verdicts: Map<string, CouncilVerdict> }>> {
 	const aliases = computeCouncilAliases(resolved.length);
@@ -2179,7 +2642,7 @@ async function runCouncilRound2FanOut(
 			const myAlias = aliases.get(idx)!;
 			const r2UserPrompt = buildCouncilRound2Prompt(groups, r1Runs, aliases, idx, myAlias);
 			try {
-				const r = await runReviewer(slot.model, slot.rs, ctx, COUNCIL_R2_SYSTEM_PROMPT, r2UserPrompt, temperature, signal, () => []);
+				const r = await runReviewer(slot.model, slot.rs, ctx, COUNCIL_R2_SYSTEM_PROMPT, r2UserPrompt, temperature, signal, { ...runOpts, useTools: false }, () => []);
 				const full: ReviewerRunResult = {
 					formattedSpec: formatReviewerSpec(slot.rs),
 					spec: slot.rs.spec,
@@ -2293,6 +2756,8 @@ export interface MultiReviewDetails {
 	judgeUsage?: { input: number; output: number; total: number; cost: number };
 	consensusCount: number;
 	totalFindings: number;
+	/** Review markdown, kept apart from tool-result text (which adds lead instructions). */
+	markdown?: string;
 }
 
 const SEVERITY_COLOR: Record<ReviewerFinding["severity"], "error" | "warning" | "accent" | "muted" | "dim"> = {
@@ -2698,6 +3163,80 @@ function persistReviewerChoices(chosen: ModelSpec[]): { ok: boolean; error?: str
  */
 let TRANSIENT_REVIEWERS: ModelSpec[] | null = null;
 
+/**
+ * Turn a `/multi-review` invocation into a task for the main agent. The agent
+ * has the conversation context the reviewers lack, so it drafts the brief
+ * (intent, spec requirements, related files, focus) and calls multi_review,
+ * then acts as lead reviewer on the results.
+ */
+export function buildHandoffPrompt(rawArgs: string, mode: ReviewMode, specPath: string | undefined): string {
+	const parsed = parseReviewArgs(rawArgs);
+	const focus = parsed.kind === "text" ? parsed.value : parsed.kind === "pr" ? parsed.raw : "";
+	const scope = parsed.kind === "pr"
+		? `PR #${parsed.number} (\`gh pr view ${parsed.number}\` / \`gh pr diff ${parsed.number}\`)`
+		: parsed.kind === "text"
+			? "the area the user described below (no diff — reviewers get the focus text and the repo)"
+			: "the working-tree diff against the default branch, committed and uncommitted (`git diff $(git merge-base origin/HEAD HEAD)` or similar)";
+	const lines: string[] = [];
+	lines.push(`The user ran \`/multi-review ${rawArgs.trim()}\`. You are the lead reviewer for a multi-model code review. Do not edit code during this task.`);
+	lines.push("");
+	lines.push(`1. **Scope.** Under review: ${scope}. Look at the change yourself so you understand it before briefing anyone.`);
+	if (specPath) {
+		lines.push(`2. **Spec.** Read \`${specPath}\` in full. It is the source of truth: the review checks the implementation against it.`);
+	} else {
+		lines.push("2. **Intent.** Work out what the change is supposed to do from this conversation, commit messages, and the PR description. If you genuinely can't tell, ask the user instead of calling the tool.");
+	}
+	lines.push("3. **Brief.** Call the `multi_review` tool once. Reviewers are other model families with read-only repo access; they do NOT see this conversation, so the brief must carry everything they need:");
+	lines.push("   - `intent`: one paragraph — what the change must accomplish and the constraints that matter. Reviewers challenge the execution, not the intent.");
+	if (specPath) {
+		lines.push("   - `requirements`: every concrete, checkable requirement / acceptance criterion in the spec, one per item, quoted or tightly paraphrased. Include the edge cases and error behaviour the spec pins down.");
+		lines.push(`   - \`spec_path\`: "${specPath}" (the full spec is passed to reviewers verbatim).`);
+	} else {
+		lines.push("   - `requirements`: only if the user stated explicit acceptance criteria.");
+	}
+	lines.push("   - `context_files`: up to 8 repo paths reviewers should read in full beyond the diff — callers, types/interfaces, tests that pin the behaviour. Skip files the diff already shows whole.");
+	lines.push(`   - \`focus\`: risky spots that deserve extra scrutiny${focus ? `, plus the user's request: "${focus}"` : ""}.`);
+	if (parsed.kind === "pr") lines.push(`   - \`pr_number\`: ${parsed.number}`);
+	if (parsed.kind === "text") lines.push(`   - \`scope\`: "area" (and put the area description in \`focus\`)`);
+	lines.push(`   - \`mode\`: "${mode}"`);
+	lines.push("4. **Verdict.** When results return, follow the lead-judgment instructions in the tool result.");
+	return lines.join("\n");
+}
+
+/** Appended to the tool result: the main agent is the final judge (pstack-style buckets). */
+function leadJudgmentInstructions(hasSpec: boolean): string {
+	const lines = [
+		"---",
+		"## Lead judgment (you)",
+		"You are the lead reviewer, not an aggregator. Reviewers saw only your brief and the repo; you have the conversation and can read the code. Before putting a single-reviewer finding in Act On, verify it yourself. Findings raised independently by ≥2 models are the strongest signal, but check them too. Be slow to dismiss correctness and security findings.",
+		"Dismiss: hypotheticals the call sites rule out, \"I would have done it differently\", findings about code the change didn't touch, and nits inflated to fill a review.",
+		"",
+		"Reply to the user in this format:",
+		"### Intent",
+		"> the intent you briefed",
+		"### Reviewers",
+		"- model — N findings (or why it failed)",
+	];
+	if (hasSpec) {
+		lines.push("### Spec conformance", "| Requirement | Status (met / partial / missing / contradicted) | Evidence (file:line) |");
+	}
+	lines.push(
+		"### Act On",
+		"Real issues that would block a PR: what, where (file:line), which models raised it, why it matters, the fix. Aim for ≤5; more means you aren't filtering hard enough.",
+		"### Consider",
+		"Legitimate but debatable now — state the tradeoff.",
+		"### Noted",
+		"Valid but not actionable; one line each.",
+		"### Dismissed",
+		"Each with a one-line reason, so the user can override you.",
+		"### Agreement Map",
+		"Where models agreed or diverged, and what that pattern suggests.",
+		"",
+		"Do not apply fixes unless the user asks.",
+	);
+	return lines.join("\n");
+}
+
 async function runMultiReviewFromArgs(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
@@ -2705,8 +3244,20 @@ async function runMultiReviewFromArgs(
 	signal: AbortSignal | undefined,
 	transientReviewers: ModelSpec[] | null = TRANSIENT_REVIEWERS,
 	onUpdate?: ToolUpdateFn,
+	runOptions: { agentLead?: boolean; brief?: BriefInput; focus?: string } = {},
 ): Promise<MultiReviewRunResult> {
 	const cfg = loadConfig();
+	const agentLead = runOptions.agentLead ?? false;
+	const specFlag = parseValueFlag(rawArgs, "spec");
+	rawArgs = specFlag.rest;
+	const briefInput: BriefInput = { ...runOptions.brief };
+	if (specFlag.value && !briefInput.specPath) briefInput.specPath = specFlag.value;
+	if (briefInput.specPath) {
+		// An explicitly requested spec that can't be read must not silently
+		// degrade into a spec-less review.
+		const spec = readSpecFile(ctx.cwd, briefInput.specPath);
+		if ("error" in spec) return { kind: "notify", notifyMessage: `multi-review: ${spec.error}`, notifyLevel: "error" };
+	}
 	// If the caller passes transientReviewers (e.g. from a one-off picker
 	// session that the user opted not to persist), bypass the configured
 	// pool for this run only. Keeping the override list distinct from cfg
@@ -2751,7 +3302,9 @@ async function runMultiReviewFromArgs(
 	// but optional for pure light mode. Check now if any downstream path
 	// will need it so the user gets actionable feedback before fan-out.
 	const judge = resolveJudge(ctx, cfg);
-	const needsJudge = mode === "balanced" || mode === "triage" || mode === "council";
+	// When the main agent is the lead reviewer it replaces the external judge,
+	// except in council mode where the judge arbitrates round-2 disputes.
+	const needsJudge = mode === "council" || (!agentLead && (mode === "balanced" || mode === "triage"));
 	if (needsJudge && !judge) {
 		return {
 			kind: "notify",
@@ -2768,13 +3321,23 @@ async function runMultiReviewFromArgs(
 		const parsed = parseReviewArgs(argsAfterMode);
 		progress.update({ phase: "resolving scope" });
 		const target = await buildReviewTarget(pi, parsed, ctx.cwd);
+		// A focus hint narrows attention within the diff; it never replaces the diff.
+		if (runOptions.focus?.trim()) {
+			target.focusHint = target.focusHint ? `${target.focusHint}\n\n${runOptions.focus.trim()}` : runOptions.focus.trim();
+		}
+		if (hasBriefInput(briefInput)) target.brief = buildBrief(ctx.cwd, briefInput, target.warnings);
+		if (target.kind === "pr" && cfg.reviewerTools) {
+			target.metaLines.push("(files on disk are the local checkout, not necessarily the PR head — the diff is authoritative)");
+		}
 		const userPrompt = buildReviewUserPrompt(target);
 
 		const resolvedRows = resolved.map((r) => ({ rs: r.rs, model: r.model, clamped: r.clamped }));
 
 		progress.update({ phase: `fanning out to ${resolved.length} reviewers (cap ${cfg.concurrency})`, done: 0, total: resolved.length });
 		let result: MultiReviewRunResult;
-		if (mode === "balanced") {
+		if (mode === "balanced" && agentLead) {
+			result = await runLightPipeline(target, resolvedRows, userPrompt, cfg, ctx, signal, progress, AGENT_LEAD_LABEL);
+		} else if (mode === "balanced") {
 			result = await runBalancedPipeline(target, resolvedRows, userPrompt, cfg, judge!, ctx, pi, signal, progress);
 		} else if (mode === "light") {
 			result = await runLightPipeline(target, resolvedRows, userPrompt, cfg, ctx, signal, progress);
@@ -2782,7 +3345,7 @@ async function runMultiReviewFromArgs(
 			result = await runCouncilPipeline(target, resolvedRows, userPrompt, cfg, judge!, ctx, pi, signal, progress);
 		} else {
 			// mode === "triage"
-			result = await runTriagePipeline(target, resolvedRows, userPrompt, cfg, ctx, pi, signal, progress);
+			result = await runTriagePipeline(target, resolvedRows, userPrompt, cfg, ctx, pi, signal, progress, agentLead);
 		}
 		progress.finish("done");
 		return result;
@@ -2816,13 +3379,14 @@ async function runBalancedPipeline(
 		cfg.temperature,
 		signal,
 		ctx,
+		reviewerRunOptions(cfg),
 		(done, total, latest) => progress?.update({ phase: "reviewers running", done, total, latest: formatReviewerProgressLine(done, total, latest) }),
 	);
 	const balancedFailure = allReviewersFailedResult(completedRunResults, "balanced");
 	if (balancedFailure) return balancedFailure;
 	progress?.update({ phase: "dedupe pass", done: resolved.length, total: resolved.length });
 	setStatus(`multi-review · dedupe pass`, ctx);
-	const groups = dedupeReviewerFindings(completedRunResults);
+	const groups = await groupFindings(ctx, cfg, completedRunResults, signal, progress);
 	const failedSpecs = completedRunResults.filter((r) => !r.ok).map((r) => r.spec);
 	let judgeResult: JudgeResult;
 	let judgeLine: string;
@@ -2895,6 +3459,7 @@ async function runLightPipeline(
 	ctx: ExtensionContext,
 	signal: AbortSignal | undefined,
 	progress?: MultiReviewProgressReporter,
+	modeLabel = "light, no-judge",
 ): Promise<MultiReviewRunResult> {
 	const completedRunResults = await runAllReviewers(
 		resolved,
@@ -2904,14 +3469,15 @@ async function runLightPipeline(
 		cfg.temperature,
 		signal,
 		ctx,
+		reviewerRunOptions(cfg),
 		(done, total, latest) => progress?.update({ phase: "reviewers running", done, total, latest: formatReviewerProgressLine(done, total, latest) }),
 	);
 	const lightFailure = allReviewersFailedResult(completedRunResults, "light");
 	if (lightFailure) return lightFailure;
 	progress?.update({ phase: "dedupe pass (no judge)", done: resolved.length, total: resolved.length });
 	setStatus(`multi-review · mode=light · dedupe pass (no judge)`, ctx);
-	const groups = dedupeReviewerFindings(completedRunResults);
-	const markdown = synthesizeMarkdownFromGroups(target, groups, completedRunResults);
+	const groups = await groupFindings(ctx, cfg, completedRunResults, signal, progress);
+	const markdown = synthesizeMarkdownFromGroups(target, groups, completedRunResults, modeLabel);
 	setStatus(`multi-review · mode=light · done`, ctx);
 
 	const details: MultiReviewDetails = {
@@ -2919,7 +3485,7 @@ async function runLightPipeline(
 		groups,
 		reviewerSpecs: completedRunResults.map((r) => r.spec),
 		failedSpecs: completedRunResults.filter((r) => !r.ok).map((r) => r.spec),
-		judge: "(none — light mode)",
+		judge: modeLabel === "light, no-judge" ? "(none — light mode)" : "(main agent)",
 		judgeDurationMs: 0,
 		judgeUsage: undefined,
 		consensusCount: groups.filter((g) => g.consensus).length,
@@ -2932,7 +3498,7 @@ async function runLightPipeline(
 	return {
 		kind: "inject",
 		notifyMessage:
-			`multi-review · mode=light · done — review injected into chat (no judge)\n` +
+			`multi-review · mode=${modeLabel} · done\n` +
 			`scope: ${target.label}   files: ${target.files.length}   diff bytes: ${target.diffText.length}\n` +
 			`reviewers: ${completedRunResults.length}   dedupe groups: ${groups.length}   consensus: ${details.consensusCount}` +
 			(totalUsage > 0 ? `   $${totalUsage.toFixed(4)}` : "") + `\n` +
@@ -2986,13 +3552,14 @@ async function runCouncilPipeline(
 		cfg.temperature,
 		signal,
 		ctx,
+		reviewerRunOptions(cfg),
 		(done, total, latest) => progress?.update({ phase: "council round 1", done, total, latest: formatReviewerProgressLine(done, total, latest) }),
 	);
 	const councilFailure = allReviewersFailedResult(r1Runs, "council");
 	if (councilFailure) return councilFailure;
 	progress?.update({ phase: "council dedupe pass", done: resolved.length, total: resolved.length });
 	setStatus(`multi-review · mode=council · dedupe pass`, ctx);
-	const groups = dedupeReviewerFindings(r1Runs);
+	const groups = await groupFindings(ctx, cfg, r1Runs, signal, progress);
 	const aliases = computeCouncilAliases(r1Runs.length);
 	let r2Results: Array<{ run: ReviewerRunResult; verdicts: Map<string, CouncilVerdict> }> = [];
 	let r2DurationMs = 0;
@@ -3009,6 +3576,7 @@ async function runCouncilPipeline(
 			cfg.temperature,
 			signal,
 			ctx,
+			reviewerRunOptions(cfg),
 			(done, total, latest) => progress?.update({ phase: "council round 2", done, total, latest: formatReviewerProgressLine(done, total, latest) }),
 		);
 		r2DurationMs = Date.now() - r2Start;
@@ -3113,6 +3681,7 @@ async function runTriagePipeline(
 	pi: ExtensionAPI,
 	signal: AbortSignal | undefined,
 	progress?: MultiReviewProgressReporter,
+	agentLead = false,
 ): Promise<MultiReviewRunResult> {
 	setStatus(`multi-review · mode=triage · fanning out`, ctx);
 	const triage = await runTriageFanOut(
@@ -3123,6 +3692,7 @@ async function runTriagePipeline(
 		cfg.temperature,
 		signal,
 		ctx,
+		reviewerRunOptions(cfg),
 		(done, total, latest) => progress?.update({ phase: "triage reviewers", done, total, latest: formatReviewerProgressLine(done, total, latest) }),
 	);
 
@@ -3143,6 +3713,10 @@ async function runTriagePipeline(
 	setStatus(`multi-review · mode=triage · escalation (${triage.escalateCount}/${cfg.triageEscalationThreshold}) → deep`, ctx);
 	const downstream = buildEscalatedTarget(target, escalatedFiles);
 	const downstreamPrompt = buildReviewUserPrompt(downstream);
+	if (agentLead) {
+		const deepLead = await runLightPipeline(downstream, resolved, downstreamPrompt, cfg, ctx, signal, progress, AGENT_LEAD_LABEL);
+		return { ...deepLead, notifyMessage: `multi-review · triage escalated (${triage.escalateCount}/${cfg.triageEscalationThreshold}) → deep pass on ${escalatedFiles.length} files\n` + deepLead.notifyMessage };
+	}
 	const judge = resolveJudge(ctx, cfg);
 	if (!judge) {
 		return {
@@ -3222,6 +3796,32 @@ function buildTriageSummaryResult(
 	};
 }
 
+const ARG_COMPLETIONS: Array<{ token: string; label: string; description: string }> = [
+	{ token: "--spec=", label: "--spec=<path>", description: "review the implementation against a spec file" },
+	{ token: "--mode=balanced", label: "--mode=balanced", description: "fan-out; main agent judges (default)" },
+	{ token: "--mode=triage", label: "--mode=triage", description: "cheap verdict first; deep pass on escalated files" },
+	{ token: "--mode=council", label: "--mode=council", description: "2 rounds of deliberation; judge arbitrates disputes" },
+	{ token: "--mode=light", label: "--mode=light", description: "fan-out, deterministic synthesis" },
+	{ token: "--direct", label: "--direct", description: "skip the main agent; external judge synthesizes" },
+	{ token: "#", label: "#<pr>", description: "review a PR by number" },
+];
+
+/**
+ * Complete only the token being typed. The returned value replaces the whole
+ * argument string, so it must carry everything before that token — a static
+ * list (or an empty "(default)" item) would wipe typed args on Enter.
+ */
+export function completeReviewArgs(prefix: string): Array<{ value: string; label: string; description?: string }> | null {
+	const lastSpace = prefix.lastIndexOf(" ");
+	const head = prefix.slice(0, lastSpace + 1);
+	const token = prefix.slice(lastSpace + 1);
+	if (token && !token.startsWith("-") && !token.startsWith("#")) return null;
+	const items = ARG_COMPLETIONS
+		.filter((c) => c.token.startsWith(token) && c.token !== token)
+		.map((c) => ({ value: head + c.token, label: c.label, description: c.description }));
+	return items.length > 0 ? items : null;
+}
+
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		const cfg = loadConfig();
@@ -3273,6 +3873,25 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 		}
+		// Hand off to the main agent unless asked not to, or there's no agent
+		// turn to hand off to (print/RPC modes exit when the command returns).
+		const direct = parseBoolFlag(args, "direct");
+		args = direct.rest;
+		if (!direct.present && ctx.hasUI && ctx.model) {
+			const { mode, rest: afterMode } = parseModeFlag(args, cfg.mode);
+			const { value: specPath, rest } = parseValueFlag(afterMode, "spec");
+			if (specPath) {
+				const spec = readSpecFile(ctx.cwd, specPath);
+				if ("error" in spec) {
+					ctx.ui.notify(`multi-review: ${spec.error}`, "error");
+					return;
+				}
+			}
+			const prompt = buildHandoffPrompt(rest, mode, specPath);
+			if (ctx.isIdle()) pi.sendUserMessage(prompt);
+			else pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+			return;
+		}
 		const result = await runMultiReviewFromArgs(pi, ctx, args, undefined);
 		ctx.ui.notify(result.notifyMessage, result.notifyLevel);
 		if (result.injectMessage) {
@@ -3284,20 +3903,12 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("multi-review", {
 		description:
 			"Fan-out code review across configured models. Usage: " +
-			"/multi-review [--mode=balanced|light|triage|council] [PR-number | free-text focus]. " +
-			"Mode default reads multi-review.mode from ~/.pi/agent/multi-review.json.",
+			"/multi-review [--spec=path] [--mode=balanced|light|triage|council] [--direct] [PR-number | free-text focus]. " +
+			"The main agent drafts the reviewer brief from your args (and spec), then judges the results. " +
+			"--direct skips the agent and uses the configured judge.",
 		// Argument autocomplete hints the call shape so users don't have to
 		// remember to type '#' vs raw digits.
-		getArgumentCompletions: (_prefix): Array<{ value: string; label: string; description?: string }> | null => [
-			{ value: "", label: "(default)", description: "review current cwd's diff vs main/master" },
-			{ value: "#1234", label: "#1234", description: "review PR #1234" },
-			{ value: "https://github.com/owner/repo/pull/1234", label: "PR URL", description: "extract number from URL" },
-			{ value: "focus: ", label: "focus: <text>", description: "free-text focus hint, no PR" },
-			{ value: "--mode=balanced", label: "--mode=balanced", description: "fan-out + judge (default)" },
-			{ value: "--mode=light", label: "--mode=light", description: "fan-out only; no judge call (half cost, half latency)" },
-			{ value: "--mode=triage", label: "--mode=triage", description: "cheap verdict first; auto-escalates to balanced when N reviewers say escalate" },
-			{ value: "--mode=council", label: "--mode=council", description: "2 rounds (raise + deliberate); judge only when round 2 disagrees on something" },
-		],
+		getArgumentCompletions: (prefix) => completeReviewArgs(prefix),
 		handler: async (args, ctx) => {
 			// Slash commands fire outside active turns, so ctx.signal is
 			// undefined; we pass undefined and accept that the user can't
@@ -3352,43 +3963,59 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// LLM-callable tool — agent-driven UI entry point.
+	// LLM-callable tool — the main agent briefs the reviewers and judges the results.
 	pi.registerTool({
 		name: "multi_review",
 		label: "Multi-Model Code Review",
 		description:
-			"Fan-out a code review to N configured reviewer models in parallel and have a judge " +
-			"synthesize the findings. Use when the user asks for a review, asks to double-check " +
-			"edits, or asks for a second opinion across models. Result lands in chat as a " +
-			"collapsible entry with per-model attribution. Same shape as `/multi-review`. " +
-			"Supports modes: balanced (default), light (no judge), triage (escalate-to-deep), " +
-			"council (2 rounds of de-identified deliberation + judge-if-disputed).",
+			"Send a code change to N reviewer models (other model families, each with read-only repo access) in parallel. " +
+			"You write the brief: intent, optional spec + requirements, related files, focus. Returns deduplicated findings " +
+			"with per-model attribution; you then act as lead reviewer and give the user a verdict. Read-only — never edits code.",
 		promptSnippet:
-			"Run a multi-model code review on the current scope (PR, default-branch diff, or focus text).",
+			"Run a multi-model code review on the current change (PR, working-tree diff, or a described area), optionally against a spec.",
 		promptGuidelines: [
-			"Use multi_review when the user asks for a code review, wants another set of eyes, or asks for a security/perf/correctness check by name.",
-			"Pass either pr_number (numeric, no '#') or focus (free-text). Both can be combined.",
-			"Do NOT use multi_review to read or summarize a single file — use the read tool for that.",
-			"Do NOT use multi_review to write or edit code — it's read-only and returns findings attributed to each model.",
-			"Pass mode='council' for high-stakes architectural reviews where disagreement is the signal; mode='triage' for big diffs where most of the diff is noise; mode='light' when you trust per-model attribution and want speed; mode='balanced' (default) for general reviews.",
+			"Use multi_review when the user asks for a code review, a second opinion, or a check of an implementation against a spec.",
+			"Before calling, understand the change yourself and write the brief: reviewers do not see the conversation.",
+			"`intent` is one paragraph on what the change must accomplish. With a spec, pass spec_path and list its checkable requirements.",
+			"`context_files` are repo paths reviewers should read in full (callers, types, tests) — not files already whole in the diff.",
+			"mode: 'balanced' (default) general review; 'triage' cheap first pass for big diffs; 'council' two-round deliberation for high-stakes changes; 'light' same as balanced.",
+			"After results return, follow the lead-judgment instructions in the result. Do not apply fixes unless asked.",
 		],
 		parameters: Type.Object({
+			intent: Type.Optional(Type.String({
+				description: "One paragraph: what the change is supposed to accomplish and which constraints matter.",
+				maxLength: 4000,
+			})),
+			spec_path: Type.Optional(Type.String({
+				description: "Repo-relative path to a spec/design doc. Passed verbatim to reviewers as the source of truth.",
+			})),
+			requirements: Type.Optional(Type.Array(Type.String({ maxLength: 600 }), {
+				description: "Concrete, checkable requirements (usually from the spec) reviewers must verify one by one.",
+				maxItems: 40,
+			})),
+			context_files: Type.Optional(Type.Array(Type.String(), {
+				description: "Repo-relative paths reviewers should see in full beyond the diff (callers, types, tests). Max 12.",
+				maxItems: 12,
+			})),
+			scope: Type.Optional(StringEnum(["diff", "area"] as const, {
+				description:
+					"'diff' (default): the working-tree diff vs the default branch, or the PR when pr_number is set. " +
+					"'area': no diff — review the part of the codebase described in `focus` (reviewers explore it with tools).",
+			})),
 			pr_number: Type.Optional(Type.Number({
-				description: "PR number to review (e.g. 4321 from a GitHub PR URL).",
+				description: "PR number to review (e.g. 4321 from a GitHub PR URL). Omit to review the working-tree diff.",
 				minimum: 0,
 			})),
 			focus: Type.Optional(Type.String({
 				description:
-					"Free-text hint about what to focus on. Examples: 'the auth/ subdirectory', " +
-					"'error handling in the diff', 'concurrency in the new code'.",
+					"Risky areas to scrutinize, or — with no diff — the area to review. Examples: 'the token refresh path', " +
+					"'error handling in the new parser'.",
 				maxLength: 2000,
 			})),
 			mode: Type.Optional(StringEnum(REVIEW_MODES, {
 				description:
-					"Review mode. 'balanced' (default): fan-out + judge. " +
-					"'light': fan-out only, no judge (half cost, half latency). " +
-					"'triage': cheap verdict first; auto-escalates to balanced when ≥ cfg.triageEscalationThreshold reviewers say escalate. " +
-					"'council': 2 rounds (raise + de-identified deliberate); judge only invoked when round-2 disagrees on something.",
+					"'balanced' (default): fan-out, you judge. 'light': same. 'triage': cheap verdict first, deep pass on escalated files. " +
+					"'council': 2 rounds of de-identified deliberation; an external judge arbitrates disputes before you judge.",
 			})),
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -3396,26 +4023,45 @@ export default function (pi: ExtensionAPI) {
 			if (typeof params.mode === "string" && (REVIEW_MODES as readonly string[]).includes(params.mode)) {
 				parts.push(`--mode=${params.mode}`);
 			}
+			const focus = typeof params.focus === "string" ? params.focus.trim() : "";
 			if (typeof params.pr_number === "number") parts.push(String(params.pr_number));
-			if (typeof params.focus === "string" && params.focus.trim()) parts.push(params.focus.trim());
-			const result = await runMultiReviewFromArgs(pi, ctx, parts.join(" "), signal, TRANSIENT_REVIEWERS, onUpdate);
-			ctx.ui.notify(result.notifyMessage, result.notifyLevel);
-			if (!result.injectMessage) {
-				return {
-					content: [{ type: "text", text: result.notifyMessage }],
-					details: { ok: false, notifyLevel: result.notifyLevel },
-				};
+			else if (params.scope === "area") {
+				if (!focus) throw new Error("multi_review: scope='area' needs `focus` describing the area to review.");
+				parts.push(focus);
 			}
-			// Inject the synthesized review as a session message so the chat
-			// transcript is the canonical record (not just a tool result entry).
-			pi.sendMessage({ ...result.injectMessage, display: true });
-			const summary = `Multi-model review injected: ${result.injectMessage.details.groups.length} groups, ` +
-				`${result.injectMessage.details.consensusCount} consensus. ` +
-				`See chat for per-model attribution.`;
-			return {
-				content: [{ type: "text", text: summary }],
-				details: { ok: true, ...result.injectMessage.details },
+			const brief: BriefInput = {
+				intent: params.intent,
+				specPath: params.spec_path,
+				requirements: params.requirements,
+				contextFiles: params.context_files,
 			};
+			const result = await runMultiReviewFromArgs(pi, ctx, parts.join(" "), signal, TRANSIENT_REVIEWERS, onUpdate, {
+				agentLead: true,
+				brief,
+				focus: params.scope === "area" ? undefined : focus,
+			});
+			if (!result.injectMessage) {
+				throw new Error(result.notifyMessage);
+			}
+			const { content: markdown, details } = result.injectMessage;
+			const hasSpec = Boolean(params.spec_path || params.requirements?.length);
+			return {
+				content: [{ type: "text", text: `${markdown}\n\n${leadJudgmentInstructions(hasSpec)}` }],
+				details: { ...details, markdown },
+			};
+		},
+		renderResult(result, options, theme) {
+			const details = result.details as MultiReviewDetails | undefined;
+			if (options.isPartial || !details?.groups) {
+				const text = result.content.find((c) => c.type === "text");
+				return new Text(theme.fg("dim", text && "text" in text ? text.text : "multi-review running…"), 0, 0);
+			}
+			return renderMultiReviewMessage(
+				{ content: details.markdown ?? "", details },
+				{ expanded: options.expanded },
+				theme as unknown as Parameters<typeof renderMultiReviewMessage>[2],
+				undefined,
+			) as ReturnType<NonNullable<Parameters<ExtensionAPI["registerTool"]>[0]["renderResult"]>>;
 		},
 	});
 }
