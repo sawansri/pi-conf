@@ -8,7 +8,7 @@
   `@mariozechner/pi-coding-agent`).
 - One or more models registered in your pi config with valid credentials.
   Anywhere `ctx.modelRegistry.getAvailable()` returns a model is fair game
-  — Fireworks, Kimi, MiniMax, Z.AI, Anthropic, OpenAI, etc.
+  (any provider with credentials).
 - For PR-number input: `gh` CLI authenticated (`gh auth status`), or a git
   repo where `git fetch origin pull/<N>/head:pr-<N>` is reachable without
   GH-aware tooling.
@@ -39,11 +39,9 @@ Reload inside pi with `/reload`, or restart.
 cat > ~/.pi/agent/multi-review.json << 'EOF'
 {
   "reviewers": [
-    "amd-gateway/gpt-6-astra@xhigh",
-    "amd-gateway/Grok-4.7@high",
-    "amd-gateway/DeepSeek-V4-Pro@high",
-    "amd-gateway/Kimi-K2.7-Code@high",
-    "amd-gateway/gemini-3.8-flash@high"
+    "amd-gateway-anthropic/Claude-Sonnet-5.5@high",
+    "amd-gateway/gpt-6-sol@xhigh",
+    "amd-gateway/gpt-6-luna@high"
   ],
   "judge": "amd-gateway-anthropic/Claude-Opus-5.5",
   "judgeThinking": "high",
@@ -52,12 +50,12 @@ cat > ~/.pi/agent/multi-review.json << 'EOF'
   "verify": false,
   "verifiersPerFinding": 2,
   "quickReviewers": [
-    "amd-gateway/Kimi-K2.7-Code@low",
-    "amd-gateway/DeepSeek-V4-Pro@low",
+    "amd-gateway/gpt-6-luna@low",
+    "amd-gateway-anthropic/Claude-Haiku-5.5",
     "amd-gateway/gemini-3.8-flash@low"
   ],
   "reviewerTools": true,
-  "reviewerTimeoutSec": 300
+  "reviewerTimeoutSec": 420
 }
 EOF
 ```
@@ -74,9 +72,9 @@ suffix on each reviewer entry; bare entries use the model default:
 cat > ~/.pi/agent/multi-review.json << 'EOF'
 {
   "reviewers": [
-    "amd-gateway/gpt-6-astra@xhigh",
-    "amd-gateway/Grok-4.7@max",
-    "amd-gateway/Kimi-K2.7-Code"
+    "amd-gateway-anthropic/Claude-Sonnet-5.5@high",
+    "amd-gateway/gpt-6-sol@xhigh",
+    "amd-gateway/gpt-6-luna"
   ]
 }
 EOF
@@ -92,7 +90,7 @@ under "clamped" so you can spot it without guessing.
 - `--verify` — each issue is cross-checked by 2 reviewers who didn't
   raise it (confirmed / refuted / uncertain, with evidence). ~1.5–2× cost.
   Set `"verify": true` to make it the default.
-- `--quick` — the `quickReviewers` pool, no tools. 20–40s.
+- `--quick` — the `quickReviewers` pool, no tools. 10–50s.
 - `--direct` — skip the agent; the configured judge synthesizes.
 
 Old `--mode=` values still parse: `council` → `--verify`,
@@ -175,18 +173,18 @@ follows it.
 
 The status footer shows the loaded pool on session start:
 ```
-multi-review · pool: 5 (amd-gateway/gpt-6-astra@xhigh, amd-gateway/Grok-4.7@high, amd-gateway/DeepSeek-V4-Pro@high, +2 more)
+multi-review · pool: 3 (amd-gateway-anthropic/Claude-Sonnet-5.5@high, amd-gateway/gpt-6-sol@xhigh, amd-gateway/gpt-6-luna@high)
 ```
 
 Per-run status updates flow through the same status key and a temporary
 progress widget below the editor:
 ```
 multi-review · mode=balanced+verify · resolving scope
-multi-review · mode=balanced+verify · reviewers running (4/5)
-latest: ✓ gpt-6-astra@xhigh (4/5) — 4 findings, 33.8s, 5 tool calls
+multi-review · mode=balanced+verify · reviewers running (2/3)
+latest: ✓ gpt-6-sol@xhigh (2/3) — 11 findings, 132.5s, 24 tool calls
 multi-review · mode=balanced+verify · grouping findings (Claude-Opus-5.5)
-multi-review · mode=balanced+verify · verifying findings (3/5)
-latest: ✓ DeepSeek-V4-Pro@high verified 3/3 (2 confirmed, 1 refuted), 8.9s
+multi-review · mode=balanced+verify · verifying findings (2/3)
+latest: ✓ gpt-6-luna@high verified 3/3 (2 confirmed, 1 refuted), 8.9s
 multi-review · done
 ```
 When called through the `multi_review` tool, the same progress is also sent
@@ -197,7 +195,7 @@ via tool updates so the pending tool row changes as reviewers complete.
 | Symptom | What to do |
 |---------|-----------|
 | `no reviewers configured` | Add `multi-review.json` per step 2 |
-| A reviewer shows `timed out after 300s` | Raise `reviewerTimeoutSec`, or lower that reviewer's `@level` (Grok-4.7@high takes ~3 min with tools) |
+| A reviewer shows `timed out after 420s` or `cut as straggler` | Straggler: the rest of the pool finished long before it (often a degraded endpoint; check the gateway status page). Timeout: raise `reviewerTimeoutSec` or lower that reviewer's `@level` (higher levels didn't improve results in testing) |
 | `cannot read spec …` | `--spec` paths are relative to pi's cwd; the run refuses to continue without the spec rather than silently dropping it |
 | An issue shows `unanimous` instead of ✓/✗ | Every reviewer raised it, so nobody independent was left to verify it; the lead agent checks those itself |
 | `none of the configured reviewers resolved` | Confirm each spec is rule-typed in `~/.pi/agent/models.json` AND has its API key wired (`/login` or env var); the extension never adds models itself |

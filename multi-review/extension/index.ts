@@ -149,18 +149,22 @@ export function describeFlags(flags: ReviewFlags): string {
 }
 
 /**
- * Defaults track the models in ~/.pi/agent/models.json. Reviewers are
- * deliberately non-Anthropic: the main agent and judge are Claude, so the
- * pool adds independent model families. Specs that don't resolve are
- * skipped with a notice, never substituted.
+ * Defaults track the models in ~/.pi/agent/models.json, chosen by an
+ * internal benchmark (10 known bugs in a 3.3k-line file, 2 runs each, Opus
+ * grading; see README "Model choice"): Sonnet 5.5 had the best recall with
+ * zero dubious findings and was the fastest; gpt-6-sol adds the most valid
+ * extras per minute; gpt-6-luna is precise (zero dubious) and fast.
+ * Gemini 3.8 Flash was dropped: on this gateway it routinely ran past the
+ * straggler cutoff even at @medium, adding delay and no findings. Raising
+ * reasoning to max didn't improve any model, so levels stay moderate for
+ * responsiveness. Specs that don't resolve are skipped with a notice,
+ * never substituted.
  */
 const DEFAULTS: MultiReviewConfig = {
 	reviewers: [
-		"amd-gateway/gpt-6-astra@xhigh",
-		"amd-gateway/Grok-4.7@high",
-		"amd-gateway/DeepSeek-V4-Pro@high",
-		"amd-gateway/Kimi-K2.7-Code@high",
-		"amd-gateway/gemini-3.8-flash@high",
+		"amd-gateway-anthropic/Claude-Sonnet-5.5@high",
+		"amd-gateway/gpt-6-sol@xhigh",
+		"amd-gateway/gpt-6-luna@high",
 	],
 	judge: "amd-gateway-anthropic/Claude-Opus-5.5",
 	judgeThinking: "high",
@@ -169,12 +173,12 @@ const DEFAULTS: MultiReviewConfig = {
 	verify: false,
 	verifiersPerFinding: 2,
 	quickReviewers: [
-		"amd-gateway/Kimi-K2.7-Code@low",
-		"amd-gateway/DeepSeek-V4-Pro@low",
+		"amd-gateway/gpt-6-luna@low",
+		"amd-gateway-anthropic/Claude-Haiku-5.5",
 		"amd-gateway/gemini-3.8-flash@low",
 	],
 	reviewerTools: true,
-	reviewerTimeoutSec: 300,
+	reviewerTimeoutSec: 420,
 };
 
 function reviewerRunOptions(cfg: MultiReviewConfig): ReviewerRunOptions {
@@ -741,8 +745,15 @@ async function buildDefaultTarget(pi: ExtensionAPI, cwd: string): Promise<Review
 	const branch = await exec(pi, "git", ["rev-parse", "--abbrev-ref", "HEAD"], cwd, 5_000);
 	const upstream = await exec(pi, "git", ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd, 5_000);
 	const baseCandidates: string[] = [];
-	if (upstream.code === 0) baseCandidates.push(upstream.stdout.trim());
-	for (const candidate of ["main", "master", "develop", "origin/main", "origin/master"]) {
+	const defaultBranches = ["main", "master", "develop"];
+	const current = branch.stdout.trim();
+	const upstreamRef = upstream.code === 0 ? upstream.stdout.trim() : "";
+	// A feature branch tracking its own remote copy (origin/feature) is not a
+	// base: diffing against it hides everything already pushed. Only trust
+	// the upstream for default branches, where it means "not yet pushed".
+	const upstreamIsOwnCopy = upstreamRef.split("/").slice(1).join("/") === current && !defaultBranches.includes(current);
+	if (upstreamRef && !upstreamIsOwnCopy) baseCandidates.push(upstreamRef);
+	for (const candidate of [...defaultBranches, "origin/main", "origin/master"]) {
 		if (!baseCandidates.includes(candidate)) baseCandidates.push(candidate);
 	}
 
@@ -1242,6 +1253,69 @@ function buildReviewUserPrompt(target: ReviewTarget): string {
  * Some models — especially Fireworks-hosted ones — sometimes honor the
  * 'ONLY JSON' rule by wrapping in a ```json fence. This is tolerant of both.
  */
+/**
+ * JSON.parse, retrying once on a repaired copy. Review comments quote code,
+ * so models routinely emit raw backslashes (`\d`), raw newlines, and bare
+ * quotes (`uses "-q"`) inside JSON strings — one bad character shouldn't
+ * discard a reviewer's whole output.
+ */
+export function parseJsonLenient(text: string): unknown {
+	try {
+		return JSON.parse(text);
+	} catch (err) {
+		const repaired = repairJsonText(text);
+		if (repaired === text) throw err;
+		return JSON.parse(repaired);
+	}
+}
+
+/**
+ * String-aware repair scan. Inside strings: escape raw control characters,
+ * double backslashes that don't start a valid escape, and escape a quote
+ * unless the next non-space character could legally follow a string
+ * (`,` `}` `]` `:`), which marks it as the real closing quote.
+ */
+export function repairJsonText(text: string): string {
+	let out = "";
+	let inString = false;
+	for (let i = 0; i < text.length; i++) {
+		const ch = text[i];
+		if (!inString) {
+			if (ch === '"') inString = true;
+			out += ch;
+			continue;
+		}
+		if (ch === "\\") {
+			const next = text[i + 1] ?? "";
+			if (/["\\/bfnrt]/.test(next)) {
+				out += ch + next;
+				i++;
+			} else if (next === "u" && /^[0-9a-fA-F]{4}$/.test(text.slice(i + 2, i + 6))) {
+				out += text.slice(i, i + 6);
+				i += 5;
+			} else {
+				out += "\\\\";
+			}
+			continue;
+		}
+		if (ch === '"') {
+			const rest = text.slice(i + 1).match(/^\s*(.)/);
+			if (!rest || /[,}\]:]/.test(rest[1])) {
+				inString = false;
+				out += ch;
+			} else {
+				out += '\\"';
+			}
+			continue;
+		}
+		if (ch === "\n") out += "\\n";
+		else if (ch === "\r") out += "\\r";
+		else if (ch === "\t") out += "\\t";
+		else out += ch;
+	}
+	return out;
+}
+
 /** First non-empty string among `keys` (trimmed), or "". */
 function pickText(obj: Record<string, unknown>, keys: string[]): string {
 	for (const k of keys) {
@@ -1275,7 +1349,7 @@ export function parseReviewerJson(rawText: string): ReviewerFinding[] {
 	if (start === -1 || end === -1 || end <= start) {
 		throw new Error(`no JSON array in reply: ${JSON.stringify(text.slice(0, 120))}`);
 	}
-	let parsed = JSON.parse(inner.slice(start, end + 1));
+	let parsed = parseJsonLenient(inner.slice(start, end + 1)) as any;
 	// Tolerate {"findings": [...]} wrappers some models emit despite the schema.
 	if (!Array.isArray(parsed) && Array.isArray(parsed?.findings)) parsed = parsed.findings;
 	if (!Array.isArray(parsed)) throw new Error("reply JSON is not an array");
@@ -1311,6 +1385,10 @@ export function parseReviewerJson(rawText: string): ReviewerFinding[] {
 			file: filePath, line_start: lineStart, line_end: lineEnd, severity, category, title, comment,
 			match_text: `${title} ${core}`,
 		});
+	}
+	// Entries existed but none was usable: a protocol failure, not a clean review.
+	if (parsed.length > 0 && findings.length === 0) {
+		throw new Error(`${parsed.length} finding(s) in reply but none had a file: ${JSON.stringify(JSON.stringify(parsed[0]).slice(0, 120))}`);
 	}
 	return findings;
 }
@@ -1354,7 +1432,7 @@ async function callModel(
 	const reasoning = model.reasoning && opts.thinking !== "off" ? opts.thinking : undefined;
 	const maxTokens = Math.min(opts.maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS, model.maxTokens || DEFAULT_MAX_OUTPUT_TOKENS);
 	try {
-		const response = await ctx.modelRegistry
+		const response = await abortable(ctx.modelRegistry
 			.streamSimple(
 				model,
 				{ systemPrompt, messages: [{ role: "user", content: [{ type: "text", text: userPrompt }], timestamp: Date.now() }] },
@@ -1364,7 +1442,9 @@ async function callModel(
 					...(reasoning !== undefined ? { reasoning } : { temperature: opts.temperature }),
 				},
 			)
-			.result();
+			.result(), opts.signal, () => {
+				throw new Error(`aborted: ${String(opts.signal?.reason ?? "cancelled")}`);
+			});
 		const text = response.content
 			.filter((c) => c.type === "text")
 			.map((c) => (c as { type: "text"; text: string }).text)
@@ -1440,11 +1520,13 @@ async function runAgenticReviewer(
 	signal.addEventListener("abort", onAbort, { once: true });
 	try {
 		if (signal.aborted) throw new Error("aborted before start");
-		await session.prompt(userPrompt);
+		const aborted = new Error("aborted");
+		const prompt = (text: string) => abortable(session.prompt(text), signal, () => { throw aborted; });
+		await prompt(userPrompt);
 		// Agent turns sometimes end on a tool result or thinking with no final
 		// answer; one in-session nudge recovers it with the context intact.
 		if (!signal.aborted && !(session.getLastAssistantText() ?? "").includes("[")) {
-			await session.prompt("Your final message must be ONLY the JSON array described in the system prompt. Output it now.");
+			await prompt("Your final message must be ONLY the JSON array described in the system prompt. Output it now.");
 		}
 		const stats = session.getSessionStats();
 		const last = [...session.messages].reverse().find((m) => (m as { role?: string }).role === "assistant") as
@@ -1473,6 +1555,35 @@ async function runAgenticReviewer(
 		signal.removeEventListener("abort", onAbort);
 		session.dispose();
 	}
+}
+
+const JSON_REPAIR_PROMPT = `The text below should contain a JSON array of code-review findings but fails to parse. Output ONLY the corrected JSON array with the same findings and wording — escape quotes, backslashes, and newlines inside strings. Do not add, drop, or change findings.`;
+
+/**
+ * Settle with `onAbort()` as soon as `signal` fires, even if `promise` never
+ * does. Provider streams don't always honour abort (hung on-prem endpoints
+ * ran for 45+ minutes past their abort in testing), and a timeout that
+ * doesn't actually return is not a timeout.
+ */
+export function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined, onAbort: () => T): Promise<T> {
+	if (!signal) return promise;
+	return new Promise<T>((resolve, reject) => {
+		// onAbort may throw; route that into the promise, never into the event dispatcher.
+		const settle = () => {
+			try {
+				resolve(onAbort());
+			} catch (e) {
+				reject(e);
+			}
+		};
+		if (signal.aborted) return settle();
+		const listener = settle;
+		signal.addEventListener("abort", listener, { once: true });
+		promise.then(
+			(v) => { signal.removeEventListener("abort", listener); resolve(v); },
+			(e) => { signal.removeEventListener("abort", listener); reject(e); },
+		);
+	});
 }
 
 /** Caller's signal plus a per-reviewer deadline, so one hung model can't stall the run. */
@@ -1516,8 +1627,23 @@ async function runReviewer(
 		try {
 			findings = parse(call.text);
 		} catch (err) {
-			const truncated = call.stopReason === "length" ? " (output truncated at maxTokens)" : "";
-			errorMessage = `json-parse${truncated}: ${err instanceof Error ? err.message : String(err)}`;
+			const first = err instanceof Error ? err.message : String(err);
+			// Minutes of review shouldn't be lost to one malformed character the
+			// repair scan couldn't fix: ask the same model to re-emit valid JSON.
+			const fixed = call.text.includes("[") && !signal.aborted
+				? await callModel(ctx, model, JSON_REPAIR_PROMPT, `Parse error: ${first}\n\n${call.text}`, {
+					thinking: "low",
+					temperature: 0,
+					signal,
+				})
+				: undefined;
+			try {
+				if (!fixed || fixed.errorMessage) throw err;
+				findings = parse(fixed.text);
+			} catch {
+				const truncated = call.stopReason === "length" ? " (output truncated at maxTokens)" : "";
+				errorMessage = `json-parse${truncated}: ${first}`;
+			}
 		}
 	}
 	return {
@@ -1578,6 +1704,26 @@ async function runAllReviewers(
 	let done = 0;
 	const total = resolved.length;
 
+	// Straggler cutoff: once a quorum has answered, the rest get half as long
+	// again as the quorum took (min STRAGGLER_MIN_GRACE_MS). A degraded endpoint
+	// otherwise holds the whole review hostage until its full timeout.
+	const started = Date.now();
+	const quorum = stragglerQuorum(total);
+	const straggler = new AbortController();
+	const reviewerSignal = abortSignal ? AbortSignal.any([abortSignal, straggler.signal]) : straggler.signal;
+	let okCount = 0;
+	let stragglerTimer: ReturnType<typeof setTimeout> | undefined;
+	const noteFinished = (ok: boolean) => {
+		if (ok) okCount++;
+		if (stragglerTimer || okCount < quorum || done >= total) return;
+		const quorumMs = Date.now() - started;
+		const graceMs = Math.max(STRAGGLER_MIN_GRACE_MS, quorumMs * STRAGGLER_GRACE_FACTOR);
+		stragglerTimer = setTimeout(() => {
+			straggler.abort(`cut as straggler: ${quorum}/${total} reviewers finished in ${Math.round(quorumMs / 1000)}s, waited ${Math.round(graceMs / 1000)}s more`);
+		}, graceMs);
+		stragglerTimer.unref?.();
+	};
+
 	// Worker slot: pulls next reviewer, runs, stores result. We launch `cap`
 	// workers up front; each races to grab via the shared cursor.
 	const worker = async (): Promise<void> => {
@@ -1587,7 +1733,7 @@ async function runAllReviewers(
 			if (idx >= resolved.length) return;
 			const slot = resolved[idx];
 			try {
-				const partial = await runReviewer(slot.model, slot.rs, ctx, systemPrompt, userPrompt, temperature, abortSignal, runOpts);
+				const partial = await runReviewer(slot.model, slot.rs, ctx, systemPrompt, userPrompt, temperature, reviewerSignal, runOpts);
 				const full: ReviewerRunResult = {
 					formattedSpec: formatReviewerSpec(slot.rs),
 					spec: slot.rs.spec,
@@ -1597,6 +1743,7 @@ async function runAllReviewers(
 				};
 				results[idx] = full;
 				done++;
+				noteFinished(full.ok);
 				onProgress?.(done, total, full);
 			} catch (err) {
 				const full: ReviewerRunResult = {
@@ -1614,14 +1761,25 @@ async function runAllReviewers(
 				};
 				results[idx] = full;
 				done++;
+				noteFinished(false);
 				onProgress?.(done, total, full);
 			}
 		}
 	};
 
 	await Promise.all(Array.from({ length: cap }, () => worker()));
+	if (stragglerTimer) clearTimeout(stragglerTimer);
 	throwIfAborted(abortSignal);
 	return results;
+}
+
+const STRAGGLER_MIN_GRACE_MS = 45_000;
+const STRAGGLER_GRACE_FACTOR = 0.5;
+
+/** Successful answers needed before stragglers get a deadline; pools of ≤2 always wait for everyone. */
+export function stragglerQuorum(total: number): number {
+	if (total <= 2) return Number.POSITIVE_INFINITY;
+	return Math.max(2, Math.ceil((total * 2) / 3));
 }
 
 // ---------- dedupe & group ----------
@@ -1977,7 +2135,7 @@ function parseVerificationJson(rawText: string, expected: Set<string>): Map<stri
 	const start = rawText.indexOf("[");
 	const end = rawText.lastIndexOf("]");
 	if (start === -1 || end <= start) throw new Error(`no JSON array in verifier reply: ${JSON.stringify(rawText.slice(0, 120))}`);
-	const parsed = JSON.parse(rawText.slice(start, end + 1));
+	const parsed = parseJsonLenient(rawText.slice(start, end + 1));
 	if (!Array.isArray(parsed)) throw new Error("verifier reply is not an array");
 	for (const item of parsed) {
 		const rec = (item ?? {}) as Record<string, unknown>;
@@ -2321,10 +2479,13 @@ async function runJudge(
 		: "";
 	const userPrompt = `${groupsPayload}\n\n## Coverage notes\nReviewers that didn't return usable output: ${failedSpecs.length}${coverage}\n\nNow produce the markdown per the schema in the system prompt. Output ONLY markdown — no preamble, no "Here's the review:" opener.`;
 	const call = await callModel(ctx, judgeModel, JUDGE_SYSTEM_PROMPT, userPrompt, { thinking, temperature, signal: abortSignal });
+	// A judge cut off at maxTokens drops findings silently; fall back to the
+	// deterministic synthesis rather than publish a partial review.
+	const truncated = call.stopReason === "length";
 	return {
-		markdown: call.errorMessage ? "" : call.text,
+		markdown: call.errorMessage || truncated ? "" : call.text,
 		stopReason: call.stopReason,
-		errorMessage: call.errorMessage,
+		errorMessage: call.errorMessage ?? (truncated ? "judge output truncated at maxTokens" : undefined),
 		usage: call.usage,
 		durationMs: call.durationMs,
 	};
@@ -2967,6 +3128,9 @@ async function runReviewPipeline(
 	if (failure) return failure;
 
 	const groups = await groupFindings(ctx, cfg, runs, signal, progress);
+	// Grouping and judge calls turn an abort into an error + fallback; a
+	// cancelled run must stop here, not publish a fallback review.
+	throwIfAborted(signal);
 	if (flags.verify && groups.length > 0) {
 		const { failures } = await runVerification(ctx, cfg, rows, groups, userPrompt, runOpts, signal, progress);
 		for (const f of failures) target.warnings.push(`verifier failed (its findings stay unverified): ${f}`);
@@ -2981,6 +3145,7 @@ async function runReviewPipeline(
 	} else if (judge) {
 		progress.update({ phase: `${groups.length} groups · invoking judge ${shortSpec(cfg.judge)}`, done: undefined, total: undefined });
 		const jr = await runJudge(judge, groups, target, runs.filter((r) => !r.ok).map((r) => r.spec), ctx, signal, cfg.temperature, cfg.judgeThinking);
+		throwIfAborted(signal);
 		judgeLabel = cfg.judge;
 		judgeDurationMs = jr.durationMs;
 		judgeUsage = jr.usage;

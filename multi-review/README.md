@@ -66,9 +66,9 @@ its own option:
 
 | Option | What it does | When | Cost / time (5-reviewer pool) |
 |--------|-------------|------|------------------------------|
-| *(default)* | Full pool, reviewers with read-only tools → grouping → the main agent judges | Most reviews | ~1× · 1–3 min (Grok-4.7@high is the long pole) |
+| *(default)* | Sonnet 5.5 + gpt-6-sol + gpt-6-luna with read-only tools → grouping → the main agent judges | Most reviews | ~1× · ~2–3 min on a 700-line diff |
 | `--verify` | Adds a cross-check round: each issue goes to `verifiersPerFinding` (2) reviewers **who did not raise it**. With tools, they reply confirmed / refuted / uncertain plus code evidence | High-stakes changes; when false positives are expensive | ~1.5–2× |
-| `--quick` | `quickReviewers` pool (Kimi / DeepSeek / Gemini at `@low`), single completions, no tools | Small diffs, a cheap first look | ~0.2× · 20–40s |
+| `--quick` | `quickReviewers` pool (gpt-6-luna@low, Haiku 5.5, Gemini Flash@low), single completions, no tools | Small diffs, a cheap first look | ~0.2× · 10–50s |
 | `--direct` | No agent hand-off: the configured judge writes the synthesis (print/RPC modes always do this) | Scripting, or when you don't want the agent involved | +1 judge call |
 
 Options combine: `--quick --verify` is a fast pass that still cross-checks.
@@ -144,8 +144,12 @@ extglob — documented limitation.
    instead of guessing from hunks. Otherwise it's a single
    `ctx.modelRegistry.streamSimple()` call. Both paths use registry auth
    (literal keys and custom headers in `models.json`). Each reviewer gets
-   `reviewerTimeoutSec` (default 300). Abort is threaded from the tool's
-   signal. Fail-soft: one reviewer's failure doesn't stop the rest, but
+   `reviewerTimeoutSec` (default 420). **Straggler cutoff:** once a quorum
+   (⅔ of the pool, at least 2) has answered, the rest get half as long
+   again as the quorum took (min 45s), then are cut. A degraded endpoint
+   no longer holds the whole review hostage. Aborts are authoritative: a
+   call returns when its signal fires even if the provider stream hangs.
+   Abort is threaded from the tool's signal. Fail-soft: one reviewer's failure doesn't stop the rest, but
    failures (`stopReason` error/aborted/timeout, empty output at maxTokens,
    no JSON array) are reported as failures, never as "no findings". If
    every reviewer fails, the run reports errors instead of a review.
@@ -194,6 +198,51 @@ extglob — documented limitation.
    each finding confirmed / plausible / false positive. The output lands as
    a `multi-review` custom message.
 
+## Model choice
+
+The default pool comes from an internal benchmark, not vendor numbers. The
+target was this extension at `e64d3b4`, with **10 known bugs** (all fixed
+since) that are visible from the code alone. It is a 3.3k-line,
+whole-file review with read-only tools, 2 runs per config, and Opus 5.5
+grading findings against the answer key. Times are under 8-way gateway
+load, so they're inflated in absolute terms but comparable to each other.
+
+| Reviewer | Known bugs found | Valid extras | Dubious | Time | Notes |
+|---|---|---|---|---|---|
+| **Claude-Sonnet-5.5@high** | **8, 8** | 9, 7 | **0, 0** | **142s, 124s** | Best recall, cleanest, fastest |
+| **gpt-6-sol@xhigh** | 6, 8 | 13, 13 | 1, 1 | 177s, 168s | Most extras per minute |
+| Grok-4.7@xhigh | 7, 7 | 6, 6 | 1, 1 | 867s, 860s | Good but slow |
+| Grok-4.7@high | 6, 8 | 4, 4 | 2, 0 | 845s, 815s | |
+| gpt-6.1-sol@xhigh | 7 | 13 | 1 | 925s | |
+| gpt-6-astra@xhigh | 7, 6 | 20, 18 | 0, 1 | 470s, 483s | Most extras; slow |
+| gpt-6-astra@max | 6, parse-fail | 17 | 2 | 1065s, 720s | Max didn't help |
+| **gpt-6-luna@xhigh** | 6, 6 | 8, 9 | **0, 0** | 419s, 577s | Precise; fast at lower levels |
+| gemini-3.8-flash@high | 6, parse-fail | 2 | 0 | 248s, 402s | Later timed out at 420s; gateway lists it as Degraded |
+| DeepSeek-V4.1-Flash@max | 6 | 7 | 2 | 1208s | Slow |
+| Kimi-K2.7-Code@high | 4, parse-fail | 2 | 2 | 797s, 856s | |
+| Kimi-K2.7-Code@max | 4, parse-fail | 2 | 1 | 315s, 343s | |
+| DeepSeek-V4-Pro@high/max | 3–5 | 1–4 | 2–3 | ~800s | Max didn't help |
+| GLM-5.3-Flash@max, Qwen3.8-Flash-Next@xhigh | — | — | — | never returned (45+ min) | On-prem endpoints hung |
+
+Findings:
+- **Raising reasoning bought nothing.** astra, Kimi and DeepSeek at `max`
+  were no better than one level lower, only slower. Model choice matters
+  far more than level.
+- **Sonnet + gpt-6-sol cover every bug any model found** (the
+  maxTokens/reasoning bug went unfound by all). luna adds a third
+  independent voice for consensus and for the verifier pool.
+- **Parse failures were the biggest quality loss.** 4 of 25 runs lost all
+  output to malformed JSON (raw backslashes and quotes from quoted code).
+  This led to the string-aware JSON repair, plus a model re-emit fallback.
+
+On a realistic 700-line diff (commit `a88d67e` against its parent), the
+default pool finished in **138s**, with 7 of 12 issues confirmed by two
+or more reviewers.
+
+The judge and grouping model stay Opus 5.5 (your main model). Public
+code-review benchmarks (Qodo, Macroscope) point the same way: Claude
+models lead on recall, while gpt-6-astra leads on precision but is slow.
+
 ## Defaults file
 
 `$PI_CODING_AGENT_DIR/multi-review.json` (drop-in; missing file falls back to
@@ -202,11 +251,9 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
 ```json
 {
   "reviewers": [
-    "amd-gateway/gpt-6-astra@xhigh",
-    "amd-gateway/Grok-4.7@high",
-    "amd-gateway/DeepSeek-V4-Pro@high",
-    "amd-gateway/Kimi-K2.7-Code@high",
-    "amd-gateway/gemini-3.8-flash@high"
+    "amd-gateway-anthropic/Claude-Sonnet-5.5@high",
+    "amd-gateway/gpt-6-sol@xhigh",
+    "amd-gateway/gpt-6-luna@high"
   ],
   "judge": "amd-gateway-anthropic/Claude-Opus-5.5",
   "judgeThinking": "high",
@@ -215,12 +262,12 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
   "verify": false,
   "verifiersPerFinding": 2,
   "quickReviewers": [
-    "amd-gateway/Kimi-K2.7-Code@low",
-    "amd-gateway/DeepSeek-V4-Pro@low",
+    "amd-gateway/gpt-6-luna@low",
+    "amd-gateway-anthropic/Claude-Haiku-5.5",
     "amd-gateway/gemini-3.8-flash@low"
   ],
   "reviewerTools": true,
-  "reviewerTimeoutSec": 300,
+  "reviewerTimeoutSec": 420,
   "dedupeModel": "amd-gateway-anthropic/Claude-Opus-5.5@low"
 }
 ```
@@ -246,9 +293,9 @@ used elsewhere in this repo (`tdd-pipeline` uses it for `/build-models`).
 ```jsonc
 {
   "reviewers": [
-    "amd-gateway/gpt-6-astra@xhigh",    // deepest reasoning
+    "amd-gateway-anthropic/Claude-Sonnet-5.5@high",
     "amd-gateway/DeepSeek-V4-Pro@high", // DeepSeek has no medium; bare would clamp up
-    "amd-gateway/Kimi-K2.7-Code"        // bare → medium
+    "amd-gateway/gpt-6-luna"            // bare → medium
   ]
 }
 ```
