@@ -163,6 +163,13 @@ multi_review
   verify: true
 ```
 
+Triage a PR's existing review comments (CodeRabbit, collaborators) and
+review it fresh. Draft replies go to a local file; nothing is posted:
+```
+/multi-review #1234 --pr-comments
+/multi-review #1234 --pr-comments --nits --resolved
+```
+
 Fast first look:
 ```
 /multi-review --quick

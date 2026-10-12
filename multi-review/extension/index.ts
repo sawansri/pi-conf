@@ -560,6 +560,10 @@ export interface ReviewTarget {
 	warnings: string[];
 	/** Reviewer brief, usually drafted by the main agent. Empty for bare runs. */
 	brief?: ReviewBrief;
+	/** PR identity for PR targets (from `gh pr view`). */
+	pr?: { number: number; url: string; owner: string; repo: string; headSha: string };
+	/** Where reviewers' tools read files: the PR-head worktree when one was needed. */
+	reviewDir?: string;
 }
 
 /**
@@ -682,11 +686,15 @@ async function buildPrTarget(pi: ExtensionAPI, parsed: { number: number; raw: st
 	// Try `gh` first.
 	// No `-q`: a jq projection prints raw strings, which JSON.parse can't read.
 	const ghView = await exec(pi, "gh", ["pr", "view", String(parsed.number), "--json",
-		"title,body,baseRefName,headRefName,url"
+		"title,body,baseRefName,headRefName,url,headRefOid"
 	], cwd, 15_000);
 	if (ghView.code === 0 && ghView.stdout.trim()) {
 		try {
 			const view = JSON.parse(ghView.stdout);
+			const repoMatch = typeof view.url === "string" ? view.url.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/\d+/) : null;
+			if (repoMatch && view.headRefOid) {
+				target.pr = { number: parsed.number, url: view.url, owner: repoMatch[1], repo: repoMatch[2], headSha: view.headRefOid };
+			}
 			if (view.title) target.metaLines.push(`title: ${view.title}`);
 			if (view.url) target.metaLines.push(`url: ${view.url}`);
 			if (view.baseRefName && view.headRefName) target.metaLines.push(`base: ${view.baseRefName} ← head: ${view.headRefName}`);
@@ -730,6 +738,51 @@ async function buildPrTarget(pi: ExtensionAPI, parsed: { number: number; raw: st
 	target.metaLines.push(`(fallback: fetched origin/pull/${parsed.number}/head as ${refName}; diff ${base}...${refName})`);
 	target.files = summarizeDiff(diff.stdout).files;
 	return target;
+}
+
+/**
+ * Give reviewers the PR's actual code. The local checkout is reused when it
+ * IS the PR head (HEAD == headSha, no tracked modifications) — the usual
+ * case after pushing your own branch. Otherwise a detached worktree at the
+ * head commit is created (fetching pull/N/head if needed) and removed by
+ * `cleanup`. Never touches the user's checkout, branches, or stash. On any
+ * failure, falls back to cwd with a warning.
+ */
+export async function preparePrCheckout(
+	pi: ExtensionAPI,
+	cwd: string,
+	pr: NonNullable<ReviewTarget["pr"]>,
+): Promise<{ dir: string; note: string; warning?: string; cleanup: () => Promise<void> }> {
+	const noop = async () => {};
+	const top = await exec(pi, "git", ["rev-parse", "--show-toplevel"], cwd, 5_000);
+	if (top.code !== 0) return { dir: cwd, note: "", warning: "not a git checkout; reviewers read local files, the diff is authoritative", cleanup: noop };
+	const root = top.stdout.trim();
+	const head = await exec(pi, "git", ["rev-parse", "HEAD"], root, 5_000);
+	const dirty = await exec(pi, "git", ["status", "--porcelain", "--untracked-files=no"], root, 10_000);
+	if (head.stdout.trim() === pr.headSha && dirty.code === 0 && !dirty.stdout.trim()) {
+		return { dir: root, note: `reviewers read the local checkout (it is the PR head ${pr.headSha.slice(0, 7)})`, cleanup: noop };
+	}
+	const have = await exec(pi, "git", ["cat-file", "-e", `${pr.headSha}^{commit}`], root, 5_000);
+	if (have.code !== 0) {
+		const fetched = await exec(pi, "git", ["fetch", "--no-tags", `https://github.com/${pr.owner}/${pr.repo}.git`, `pull/${pr.number}/head`], root, 120_000);
+		if (fetched.code !== 0) {
+			return { dir: root, note: "", warning: `could not fetch PR head (${fetched.stderr.trim().slice(0, 120)}); reviewers read the local checkout, the diff is authoritative`, cleanup: noop };
+		}
+	}
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), `multi-review-pr${pr.number}-`));
+	const added = await exec(pi, "git", ["worktree", "add", "--detach", dir, pr.headSha], root, 60_000);
+	if (added.code !== 0) {
+		fs.rmSync(dir, { recursive: true, force: true });
+		return { dir: root, note: "", warning: `could not create PR worktree (${added.stderr.trim().slice(0, 120)}); reviewers read the local checkout`, cleanup: noop };
+	}
+	return {
+		dir,
+		note: `reviewers read a temporary worktree at PR head ${pr.headSha.slice(0, 7)} (your checkout differs)`,
+		cleanup: async () => {
+			await exec(pi, "git", ["worktree", "remove", "--force", dir], root, 30_000);
+			fs.rmSync(dir, { recursive: true, force: true });
+		},
+	};
 }
 
 /**
@@ -1517,11 +1570,12 @@ async function runAgenticReviewer(
 	systemPrompt: string,
 	userPrompt: string,
 	signal: AbortSignal,
+	cwd: string = ctx.cwd,
 ): Promise<ModelCallResult> {
 	const started = Date.now();
 	const settingsManager = SettingsManager.inMemory({});
 	const resourceLoader = new DefaultResourceLoader({
-		cwd: ctx.cwd,
+		cwd,
 		agentDir: getAgentDir(),
 		settingsManager,
 		noExtensions: true,
@@ -1533,13 +1587,13 @@ async function runAgenticReviewer(
 	});
 	await resourceLoader.reload();
 	const { session } = await createAgentSession({
-		cwd: ctx.cwd,
+		cwd,
 		model,
 		thinkingLevel: thinking,
 		tools: ["read", "grep", "find", "ls"],
 		resourceLoader,
 		settingsManager,
-		sessionManager: SessionManager.inMemory(ctx.cwd),
+		sessionManager: SessionManager.inMemory(cwd),
 	});
 	const onAbort = () => void session.abort();
 	signal.addEventListener("abort", onAbort, { once: true });
@@ -1621,6 +1675,8 @@ export interface ReviewerRunOptions {
 	/** Nested agent with read-only repo tools instead of a single completion. */
 	useTools: boolean;
 	timeoutMs: number;
+	/** Directory reviewers' tools see (a PR-head worktree for PR reviews); default ctx.cwd. */
+	cwd?: string;
 }
 
 async function runReviewer(
@@ -1636,7 +1692,7 @@ async function runReviewer(
 ): Promise<Omit<ReviewerRunResult, "formattedSpec" | "spec" | "thinking" | "clamped">> {
 	const signal = withTimeout(abortSignal, runOpts.timeoutMs);
 	const call = runOpts.useTools
-		? await runAgenticReviewer(ctx, model, reviewerSpec.thinking, systemPrompt + REVIEWER_TOOLS_ADDENDUM, userPrompt, signal)
+		? await runAgenticReviewer(ctx, model, reviewerSpec.thinking, systemPrompt + REVIEWER_TOOLS_ADDENDUM, userPrompt, signal, runOpts.cwd)
 		: await callModel(ctx, model, systemPrompt, userPrompt, {
 			thinking: reviewerSpec.thinking,
 			temperature,
@@ -1852,6 +1908,8 @@ export interface DedupeGroup {
 	verifiers?: number;
 	/** Finding keys (`run:finding`) that formed this group, when grouped by the model. */
 	keys?: FindingKey[];
+	/** Extra verifier context for claim pseudo-groups (origin, original diff hunk). */
+	context?: string;
 }
 
 /**
@@ -2007,7 +2065,7 @@ export function dedupeReviewerFindings(results: ReviewerRunResult[], clusters?: 
 		for (const cluster of clusters) {
 			let group: DedupeGroup | undefined;
 			for (const key of cluster) {
-				if (key.startsWith("S:")) continue;
+				if (!/^\d+:\d+$/.test(key)) continue;
 				const [ri, fi] = key.split(":").map(Number);
 				const r = results[ri];
 				const finding = r?.findings[fi];
@@ -2051,11 +2109,11 @@ const CLUSTER_SYSTEM_PROMPT = `You group code-review findings from several indep
 
 Two findings belong together only if they describe the SAME underlying defect (same root cause, same fix) — not merely the same file, nearby lines, or the same spec. Different requirements, different bugs on adjacent lines, and a bug vs. a missing test are separate issues.
 
-Ids starting with "S:" are NOT findings but the lead reviewer's hypotheses. Put a hypothesis in the cluster of the finding(s) describing the same defect, or leave it alone in its own cluster if no finding matches. Match on the defect, not the topic.
+Ids starting with "S:" or "P:" are NOT findings but claims from elsewhere (the lead reviewer's hypotheses, or existing PR review comments). Put each claim in the cluster of the finding(s) describing the same defect, or leave it alone in its own cluster if no finding matches. Match on the defect, not the topic. Never put two claims in one cluster.
 
 Output ONLY a JSON array of clusters; each cluster is an array of ids, e.g. [["0:1","2:0","S:0"],["1:3"],["S:1"]].
 - Every id appears in exactly one cluster.
-- Never put two findings from the same reviewer (same number before the colon) in one cluster.
+- Never put two findings from the same reviewer (same prefix before the colon) in one cluster.
 - Singletons are fine.`;
 
 /**
@@ -2073,14 +2131,14 @@ async function clusterFindingsWithModel(
 	results: ReviewerRunResult[],
 	signal: AbortSignal | undefined,
 	timeoutMs: number,
-	suspicions: string[] = [],
+	hidden: HiddenClaim[] = [],
 ): Promise<{ clusters: FindingKey[][] } | { error: string }> {
 	const items: string[] = [];
 	const known = new Set<FindingKey>();
-	suspicions.forEach((text, i) => {
-		known.add(`S:${i}`);
-		items.push(`- id S:${i} | lead hypothesis (not a finding) | ${text.replace(/\s+/g, " ").slice(0, 500)}`);
-	});
+	for (const h of hidden) {
+		known.add(h.key);
+		items.push(`- id ${h.key} | ${h.label} (not a finding) | ${h.text.replace(/\s+/g, " ").slice(0, 500)}`);
+	}
 	results.forEach((r, ri) => {
 		if (!r?.ok) return;
 		r.findings.forEach((f, fi) => {
@@ -2090,7 +2148,7 @@ async function clusterFindingsWithModel(
 			items.push(`- id ${key} | ${f.file}:${formatRange(f.line_start, f.line_end)} | ${f.category} | ${f.title} — ${core}`);
 		});
 	});
-	if (known.size - suspicions.length === 0 || known.size < 2) return { clusters: [...known].map((k) => [k]) };
+	if (known.size - hidden.length === 0 || known.size < 2) return { clusters: [...known].map((k) => [k]) };
 	const call = await callModel(ctx, model, CLUSTER_SYSTEM_PROMPT, `## Findings\n${items.join("\n")}`, {
 		thinking,
 		temperature: 0,
@@ -2132,9 +2190,18 @@ async function clusterFindingsWithModel(
 	return { clusters };
 }
 
+/** A claim checked against independent findings without being shown to reviewers. */
+export interface HiddenClaim {
+	/** "S:<i>" for lead suspicions, "P:<i>" for PR comment claims. */
+	key: string;
+	label: string;
+	text: string;
+}
+
 /**
  * Semantic grouping with lexical fallback; never fails the run. Also maps
- * each lead suspicion to the groups that independently describe it.
+ * each hidden claim (lead suspicion, PR comment) to the groups that
+ * independently describe it.
  */
 async function groupFindings(
 	ctx: ExtensionContext,
@@ -2142,18 +2209,18 @@ async function groupFindings(
 	results: ReviewerRunResult[],
 	signal: AbortSignal | undefined,
 	progress?: MultiReviewProgressReporter,
-	suspicions: string[] = [],
-): Promise<{ groups: DedupeGroup[]; suspicionMatches: string[][] }> {
+	hidden: HiddenClaim[] = [],
+): Promise<{ groups: DedupeGroup[]; matches: Map<string, string[]> }> {
 	const lexical = () => {
 		const groups = dedupeReviewerFindings(results);
-		return { groups, suspicionMatches: suspicions.map((t) => matchSuspicionLexically(t, groups)) };
+		return { groups, matches: new Map(hidden.map((h) => [h.key, matchSuspicionLexically(h.text, groups)])) };
 	};
 	if (cfg.dedupeModel === "lexical") return lexical();
 	const parsedSpec = parseReviewerSpec(cfg.dedupeModel ?? cfg.judge, "low");
 	const model = parsedSpec ? findModel(ctx, parsedSpec.spec) : null;
 	if (!parsedSpec || !model) return lexical();
 	progress?.update({ phase: `grouping findings (${shortSpec(parsedSpec.spec)})`, done: undefined, total: undefined });
-	const out = await clusterFindingsWithModel(ctx, model, parsedSpec.thinking, results, signal, 120_000, suspicions);
+	const out = await clusterFindingsWithModel(ctx, model, parsedSpec.thinking, results, signal, 120_000, hidden);
 	if ("error" in out) {
 		progress?.update({ phase: "grouping fell back to lexical", latest: `grouping model failed: ${out.error.slice(0, 120)}` });
 		return lexical();
@@ -2161,11 +2228,11 @@ async function groupFindings(
 	const groups = dedupeReviewerFindings(results, out.clusters);
 	const groupOfKey = new Map<FindingKey, string>();
 	for (const g of groups) for (const k of g.keys ?? []) groupOfKey.set(k, g.id);
-	const suspicionMatches = suspicions.map((_, i) => {
-		const cluster = out.clusters.find((c) => c.includes(`S:${i}`)) ?? [];
-		return [...new Set(cluster.map((k) => groupOfKey.get(k)).filter((id): id is string => Boolean(id)))];
-	});
-	return { groups, suspicionMatches };
+	const matches = new Map(hidden.map((h) => {
+		const cluster = out.clusters.find((c) => c.includes(h.key)) ?? [];
+		return [h.key, [...new Set(cluster.map((k) => groupOfKey.get(k)).filter((id): id is string => Boolean(id)))]];
+	}));
+	return { groups, matches };
 }
 
 /** Fallback suspicion matching: shared distinctive vocabulary with a group's text. */
@@ -2174,6 +2241,233 @@ function matchSuspicionLexically(text: string, groups: DedupeGroup[]): string[] 
 	return groups
 		.filter((g) => jaccard(words, keywords(`${g.titles.join(" ")} ${g.members.map((m) => m.comment).join(" ")}`)) >= 0.12)
 		.map((g) => g.id);
+}
+
+// ---------- PR review comments (CodeRabbit, collaborators) ----------
+
+/** One reviewable unit fetched from the PR: a review thread, a review body, or a conversation comment. */
+export interface PrCommentItem {
+	id: string;
+	kind: "thread" | "review" | "conversation";
+	author: string;
+	bot: boolean;
+	url: string;
+	path?: string;
+	line?: number | null;
+	outdated?: boolean;
+	resolved?: boolean;
+	hunk?: string;
+	text: string;
+	/** Later replies in the thread (author: text), e.g. "fixed in abc123". */
+	replies?: string[];
+	/** Resolved thread kept only so bots' summary bodies don't resurrect it as a new claim. */
+	contextOnly?: boolean;
+}
+
+/** A checkable claim extracted from a PR comment, verified like a suspicion. */
+export interface PrClaim {
+	id: string;
+	itemId: string;
+	author: string;
+	url: string;
+	path?: string;
+	line?: number | null;
+	outdated?: boolean;
+	hunk?: string;
+	claim: string;
+	nit: boolean;
+	raisedBy: string[];
+	verifications?: Verification[];
+	verificationNote?: string;
+}
+
+/** A PR comment that isn't a checkable defect claim: answered or noted by the lead, not verified. */
+export interface PrNonClaim {
+	itemId: string;
+	author: string;
+	url: string;
+	type: "question" | "preference";
+	summary: string;
+}
+
+export interface PrCommentsReport {
+	claims: PrClaim[];
+	others: PrNonClaim[];
+	stats: { threads: number; reviews: number; conversation: number; skippedResolved: number; skippedNits: number; noise: number };
+}
+
+/**
+ * Strip markup that carries no review content: HTML comments (bot state),
+ * images/badges, and CodeRabbit's "Prompt for AI Agents" blocks (a restated
+ * copy of the comment). Keeps details/summary text.
+ */
+export function cleanCommentBody(body: string): string {
+	return body
+		.replace(/<!--[\s\S]*?-->/g, "")
+		.replace(/<details>\s*<summary>[^<]*Prompt for AI Agents[^<]*<\/summary>[\s\S]*?<\/details>/gi, "")
+		.replace(/<(picture|source|img)[^>]*>(<\/picture>)?/gi, "")
+		// Known HTML tags only — a generic <…> strip would eat code like Cache<V>.
+		.replace(/<\/?(details|summary|blockquote|div|span|p|br|hr|sub|sup|b|i|em|strong|code|pre|kbd|a|dl|dt|dd|ul|ol|li|table|thead|tbody|tr|td|th|h[1-6])(\s[^>]*)?\/?>/gi, "")
+		.replace(/\n{3,}/g, "\n\n")
+		.trim();
+}
+
+const PR_THREADS_QUERY = `query($owner: String!, $name: String!, $n: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $n) {
+      reviewThreads(first: 100) {
+        pageInfo { hasNextPage }
+        nodes {
+          isResolved isOutdated path line originalLine
+          comments(first: 30) { nodes { author { login __typename } body url diffHunk } }
+        }
+      }
+    }
+  }
+}`;
+
+/**
+ * Fetch every review surface of a PR with gh (read-only). Resolved threads
+ * are skipped unless asked; outdated ones are kept (does it still apply?).
+ */
+export async function fetchPrComments(
+	pi: ExtensionAPI,
+	cwd: string,
+	pr: NonNullable<ReviewTarget["pr"]>,
+	includeResolved: boolean,
+	warnings: string[],
+): Promise<{ items: PrCommentItem[]; skippedResolved: number }> {
+	const items: PrCommentItem[] = [];
+	let skippedResolved = 0;
+	const gql = await exec(pi, "gh", ["api", "graphql", "-f", `query=${PR_THREADS_QUERY}`, "-F", `owner=${pr.owner}`, "-F", `name=${pr.repo}`, "-F", `n=${pr.number}`], cwd, 60_000);
+	if (gql.code !== 0) {
+		warnings.push(`could not fetch PR review threads: ${gql.stderr.trim().slice(0, 160)}`);
+	} else {
+		const threads = JSON.parse(gql.stdout)?.data?.repository?.pullRequest?.reviewThreads;
+		if (threads?.pageInfo?.hasNextPage) warnings.push("PR has more than 100 review threads; only the first 100 were checked");
+		for (const t of threads?.nodes ?? []) {
+			const comments = t.comments?.nodes ?? [];
+			if (comments.length === 0) continue;
+			const skip = Boolean(t.isResolved) && !includeResolved;
+			if (skip) skippedResolved++;
+			const [first, ...rest] = comments;
+			const text = cleanCommentBody(String(first.body ?? ""));
+			if (!text) continue;
+			items.push({
+				id: `c${items.length + 1}`,
+				kind: "thread",
+				author: first.author?.login ?? "ghost",
+				bot: first.author?.__typename === "Bot",
+				url: first.url,
+				path: t.path,
+				line: t.line ?? t.originalLine ?? null,
+				outdated: Boolean(t.isOutdated),
+				resolved: Boolean(t.isResolved),
+				hunk: typeof first.diffHunk === "string" ? first.diffHunk.split("\n").slice(-12).join("\n") : undefined,
+				text: text.slice(0, skip ? 1200 : 4000),
+				replies: rest.map((c: { author?: { login?: string }; body?: string }) => `${c.author?.login ?? "ghost"}: ${cleanCommentBody(String(c.body ?? "")).slice(0, 400)}`),
+				contextOnly: skip,
+			});
+		}
+	}
+	const rest = async (endpoint: string, kind: PrCommentItem["kind"]) => {
+		const res = await exec(pi, "gh", ["api", "--paginate", endpoint, "--jq", ".[] | {user: .user.login, type: .user.type, body, url: .html_url}"], cwd, 60_000);
+		if (res.code !== 0) {
+			warnings.push(`could not fetch ${endpoint}: ${res.stderr.trim().slice(0, 160)}`);
+			return;
+		}
+		for (const line of res.stdout.split("\n")) {
+			if (!line.trim()) continue;
+			const c = JSON.parse(line);
+			const text = cleanCommentBody(String(c.body ?? ""));
+			if (!text) continue;
+			items.push({ id: `c${items.length + 1}`, kind, author: c.user, bot: c.type === "Bot", url: c.url, text: text.slice(0, 12_000) });
+		}
+	};
+	await rest(`repos/${pr.owner}/${pr.repo}/pulls/${pr.number}/reviews`, "review");
+	await rest(`repos/${pr.owner}/${pr.repo}/issues/${pr.number}/comments`, "conversation");
+	return { items, skippedResolved };
+}
+
+const CLASSIFY_SYSTEM_PROMPT = `You triage review comments on a pull request (from bots like CodeRabbit and from human collaborators) for a verification pipeline.
+
+For each item, extract every distinct CHECKABLE defect claim it makes — something about the code that can be shown true or false by reading it ("X can be null at Y", "the test never runs in CI", "this leaks the key into the file"). One item may hold many claims (bot review bodies list several, including "outside diff range" and nitpick sections); one claim per entry.
+
+Classify what's left of each item:
+- "question": asks the author something ("why not use X?") — summarize it.
+- "preference": style/design taste without a checkable defect — summarize it.
+- "noise": approvals, praise, walkthroughs/summaries of the change, tool boilerplate, "fixed"/"done" replies.
+
+Items marked "RESOLVED — context only" are threads the PR participants already settled. Extract NO claims from them, and do not extract the same defect again from any other item (bots often repeat inline comments in their review summary bodies). Give them type "noise".
+
+Mark a claim "nit": true when it's cosmetic/minor (the bot calls it a nitpick, or it's naming/formatting/comment wording).
+
+Output ONLY a JSON array, one entry per item:
+[{"id": "c1", "claims": [{"claim": "<one self-contained sentence, include the identifier/file it's about>", "path": "<file or null>", "line": <int or null>, "nit": false}], "type": "claims"|"question"|"preference"|"noise", "summary": "<≤160 chars, for question/preference>"}]`;
+
+/** One model call turns raw PR comments into claims vs questions/preferences/noise. */
+export async function classifyPrComments(
+	ctx: ExtensionContext,
+	cfg: MultiReviewConfig,
+	items: PrCommentItem[],
+	includeNits: boolean,
+	signal: AbortSignal | undefined,
+): Promise<Omit<PrCommentsReport, "stats"> & { skippedNits: number; noise: number; error?: string }> {
+	const empty = { claims: [], others: [], skippedNits: 0, noise: 0 };
+	if (items.length === 0) return empty;
+	const parsedSpec = parseReviewerSpec(cfg.dedupeModel && cfg.dedupeModel !== "lexical" ? cfg.dedupeModel : cfg.judge, "low");
+	const model = parsedSpec ? findModel(ctx, parsedSpec.spec) : null;
+	if (!parsedSpec || !model) return { ...empty, error: "no model available to classify PR comments" };
+	const listing = items.map((it) => [
+		`### ${it.id} · ${it.kind} · @${it.author}${it.bot ? " (bot)" : ""}${it.path ? ` · ${it.path}:${it.line ?? "?"}` : ""}${it.outdated ? " · outdated" : ""}${it.contextOnly ? " · RESOLVED — context only" : ""}`,
+		it.text,
+		...(it.replies?.length ? ["Replies:", ...it.replies] : []),
+	].join("\n")).join("\n\n");
+	const call = await callModel(ctx, model, CLASSIFY_SYSTEM_PROMPT, listing, { thinking: parsedSpec.thinking, temperature: 0, signal: withTimeout(signal, 180_000) });
+	if (call.errorMessage) return { ...empty, error: call.errorMessage };
+	let parsed: unknown;
+	try {
+		parsed = parseJsonLenient(call.text.slice(call.text.indexOf("["), call.text.lastIndexOf("]") + 1));
+	} catch (err) {
+		return { ...empty, error: `classifier JSON: ${err instanceof Error ? err.message : String(err)}` };
+	}
+	const byId = new Map(items.map((it) => [it.id, it]));
+	const claims: PrClaim[] = [];
+	const others: PrNonClaim[] = [];
+	let skippedNits = 0;
+	let noise = 0;
+	for (const entry of Array.isArray(parsed) ? parsed : []) {
+		const it = byId.get(String(entry?.id ?? ""));
+		if (!it || it.contextOnly) continue;
+		const type = String(entry?.type ?? "");
+		for (const c of Array.isArray(entry?.claims) ? entry.claims : []) {
+			const text = typeof c?.claim === "string" ? c.claim.trim() : "";
+			if (!text) continue;
+			if (c?.nit === true && !includeNits) {
+				skippedNits++;
+				continue;
+			}
+			claims.push({
+				id: `p${claims.length + 1}`,
+				itemId: it.id,
+				author: it.author,
+				url: it.url,
+				path: typeof c?.path === "string" && c.path ? c.path : it.path,
+				line: typeof c?.line === "number" ? c.line : it.line,
+				outdated: it.outdated,
+				hunk: it.hunk,
+				claim: text.slice(0, 600),
+				nit: c?.nit === true,
+				raisedBy: [],
+			});
+		}
+		if (type === "question" || type === "preference") {
+			others.push({ itemId: it.id, author: it.author, url: it.url, type, summary: String(entry?.summary ?? "").slice(0, 200) });
+		} else if (type === "noise") {
+			noise++;
+		}
+	}
+	return { claims, others, skippedNits, noise };
 }
 
 // ---------- verification round ----------
@@ -2218,6 +2512,13 @@ function buildVerifyPrompt(basePrompt: string, groups: DedupeGroup[]): string {
 		if (g.category === "suspicion") {
 			lines.push(`### ${g.id} — unconfirmed hypothesis (no location given; find it yourself)`);
 			lines.push(`Claim: ${g.title}`);
+			lines.push("");
+			continue;
+		}
+		if (g.category === "pr-claim") {
+			lines.push(`### ${g.id} — claim from an existing PR review comment · ${g.file}${g.line_start !== null ? `:${g.line_start}` : ""} (line may have moved; verify against the current code)`);
+			lines.push(`Claim: ${g.title}`);
+			if (g.context) lines.push(g.context);
 			lines.push("");
 			continue;
 		}
@@ -2513,6 +2814,8 @@ export function synthesizeLeadView(
 			`${groups.filter((g) => g.consensus).length} raised independently by ≥2`,
 	);
 	lines.push(`Reviewers: ${runs.map((r) => `${shortSpec(r.formattedSpec)} ${r.ok ? `(${r.findings.length})` : `FAILED: ${r.errorMessage?.slice(0, 100) ?? "?"}`}`).join(" · ")}`);
+	// Scope notes (PR worktree, spec source) — they change how findings read.
+	for (const note of target.metaLines.filter((l) => l.startsWith("("))) lines.push(`Note: ${note.slice(1, -1)}`);
 	if (detailHint) lines.push(detailHint);
 	lines.push("");
 	if (groups.length > 0) lines.push("## Issues", "");
@@ -2550,6 +2853,56 @@ export function synthesizeLeadView(
 	if (groups.length === 0) lines.push(`No findings from ${ok.length} reviewer${ok.length === 1 ? "" : "s"}.`, "");
 	lines.push(...warningLines(target));
 	return lines.join("\n");
+}
+
+/** A PR comment claim as a pseudo-group for the verify round; every reviewer is eligible. */
+function prClaimAsGroup(c: PrClaim): DedupeGroup {
+	const origin = `Raised on the PR by @${c.author}${c.outdated ? " (thread is outdated: the code changed after the comment)" : ""}.`;
+	return {
+		id: c.id,
+		file: c.path ?? "(file not stated)",
+		line_start: c.line ?? null,
+		line_end: c.line ?? null,
+		severity: "info",
+		category: "pr-claim",
+		title: c.claim,
+		titles: [c.claim],
+		members: [],
+		reviewerSpecs: [],
+		consensus: false,
+		context: c.hunk ? `${origin}\nDiff context the comment was attached to:\n\`\`\`diff\n${c.hunk}\n\`\`\`` : origin,
+	};
+}
+
+/** PR comment triage for the lead: each claim's independent match and verification, then non-claims. */
+function prCommentsMarkdown(report: PrCommentsReport, groups: DedupeGroup[]): string[] {
+	const byId = new Map(groups.map((g) => [g.id, g]));
+	const st = report.stats;
+	const lines = [
+		"## Existing PR review comments (hidden from reviewers)",
+		`Fetched ${st.threads} review thread(s)${st.skippedResolved ? ` (${st.skippedResolved} resolved: context only, not re-checked)` : ""}, ${st.reviews} review bod(ies), ${st.conversation} conversation comment(s) → ${report.claims.length} checkable claim(s)` +
+			`${st.skippedNits ? ` · ${st.skippedNits} nit(s) skipped (--nits to include)` : ""}${st.noise ? ` · ${st.noise} non-review item(s) ignored` : ""}.`,
+		"",
+	];
+	const mark = { confirmed: "✓", refuted: "✗", uncertain: "?" } as const;
+	for (const c of report.claims) {
+		const raised = c.raisedBy.map((id) => byId.get(id)).filter((g): g is DedupeGroup => Boolean(g));
+		lines.push(`- **${c.id}** · @${c.author} · \`${c.path ?? "?"}${c.line ? `:${c.line}` : ""}\`${c.outdated ? " (outdated)" : ""}${c.nit ? " · nit" : ""} · [comment](${c.url})`);
+		lines.push(`    - Claim: ${c.claim}`);
+		lines.push(`    - Independent reviewers: ${raised.length ? `raised it — ${raised.map((g) => `${g.id} "${g.title}" (×${g.reviewerSpecs.length})`).join("; ")}` : "did not raise it"}`);
+		if (c.verifications?.length) {
+			lines.push(`    - Verification (${verificationTally({ verifications: c.verifications } as DedupeGroup)}): ${c.verifications.map((v) => `${mark[v.verdict]} ${shortSpec(v.spec)}: ${v.evidence.replace(/\s+/g, " ").slice(0, 240)}`).join(" · ")}`);
+		} else {
+			lines.push(`    - Verification: ${c.verificationNote ?? "no verdict returned"}`);
+		}
+	}
+	if (report.claims.length === 0) lines.push("_No checkable claims in the PR's review comments._");
+	if (report.others.length > 0) {
+		lines.push("", "### Questions and preferences (not verified — answer or note them)");
+		for (const o of report.others) lines.push(`- ${o.type} · @${o.author} · [comment](${o.url}): ${o.summary}`);
+	}
+	lines.push("");
+	return lines;
 }
 
 /** A suspicion dressed as a group so the verify round can check it like any claim. */
@@ -2730,6 +3083,7 @@ export interface MultiReviewDetails {
 	/** Review markdown, kept apart from tool-result text (which adds lead instructions). */
 	markdown?: string;
 	suspicions?: SuspicionResult[];
+	prComments?: PrCommentsReport;
 }
 
 const SEVERITY_COLOR: Record<ReviewerFinding["severity"], "error" | "warning" | "accent" | "muted" | "dim"> = {
@@ -2810,6 +3164,20 @@ function renderMultiReviewMessage(
 				const mark = v.verdict === "confirmed" ? "✓" : v.verdict === "refuted" ? "✗" : "?";
 				const color = v.verdict === "confirmed" ? "success" : v.verdict === "refuted" ? "warning" : "dim";
 				container.addChild(new Text(`    ${theme.fg(color, `${mark} ${specShort}:`)} ${v.evidence}`, 0, 0));
+			}
+		}
+	}
+
+	if (details.prComments) {
+		const pc = details.prComments;
+		const n = (v: Verification["verdict"]) => pc.claims.filter((c) => c.verifications?.some((x) => x.verdict === v)).length;
+		container.addChild(new Spacer(1));
+		container.addChild(new Text(theme.fg("muted",
+			`PR comments: ${pc.claims.length} claim(s) · ✓${n("confirmed")} ✗${n("refuted")} ?${n("uncertain")} · ${pc.claims.filter((c) => c.raisedBy.length).length} also found independently · ${pc.others.length} question/preference`), 0, 0));
+		if (options.expanded) {
+			for (const c of pc.claims) {
+				const tally = c.verifications?.length ? ` ${verificationTally({ verifications: c.verifications } as DedupeGroup)}` : "";
+				container.addChild(new Text(`  ${theme.fg("muted", `${c.id} @${c.author}:`)} ${c.claim}${theme.fg("dim", tally)}`, 0, 0));
 			}
 		}
 	}
@@ -3162,7 +3530,12 @@ let TRANSIENT_REVIEWERS: ModelSpec[] | null = null;
  * (intent, spec requirements, related files, focus) and calls multi_review,
  * then acts as lead reviewer on the results.
  */
-export function buildHandoffPrompt(rawArgs: string, flags: ReviewFlags, specPath: string | undefined): string {
+export function buildHandoffPrompt(
+	rawArgs: string,
+	flags: ReviewFlags,
+	specPath: string | undefined,
+	prComments?: { includeNits: boolean; includeResolved: boolean },
+): string {
 	const parsed = parseReviewArgs(rawArgs);
 	const focus = parsed.kind === "text" ? parsed.value : parsed.kind === "pr" ? parsed.raw : "";
 	const scope = parsed.kind === "pr"
@@ -3194,12 +3567,15 @@ export function buildHandoffPrompt(rawArgs: string, flags: ReviewFlags, specPath
 	if (parsed.kind === "text") lines.push(`   - \`scope\`: "area" (and put the area description in \`focus\`)`);
 	if (flags.verify) lines.push("   - `verify`: true (each finding is cross-checked by reviewers who didn't raise it)");
 	if (flags.quick) lines.push("   - `quick`: true (fast reviewer pool, no tools)");
+	if (prComments && parsed.kind === "pr") {
+		lines.push(`   - \`pr_comments\`: true${prComments.includeNits ? ", `include_nits`: true" : ""}${prComments.includeResolved ? ", `include_resolved`: true" : ""} — the PR's existing review comments (CodeRabbit, collaborators) are fetched and verified separately. Do NOT copy them into the brief (not focus, not suspicions): reviewers must find issues independently so agreement with a comment means something. Your own suspicions are still fine.`);
+	}
 	lines.push("4. **Verdict.** When results return, follow the lead-judgment instructions in the tool result.");
 	return lines.join("\n");
 }
 
 /** Appended to the tool result: the main agent is the final judge (pstack-style buckets). */
-function leadJudgmentInstructions(hasSpec: boolean): string {
+function leadJudgmentInstructions(hasSpec: boolean, prNumber?: number): string {
 	const lines = [
 		"---",
 		"## Lead judgment (you)",
@@ -3217,6 +3593,15 @@ function leadJudgmentInstructions(hasSpec: boolean): string {
 	if (hasSpec) {
 		lines.push("### Spec conformance", "| Requirement | Status (met / partial / missing / contradicted) | Evidence (file:line) |");
 	}
+	if (prNumber !== undefined) {
+		lines.push(
+			"### Existing PR comments",
+			"One row per claim (and per question/preference): | id | author | where | verdict (valid / invalid / unclear / not a defect) | evidence | action (fix → Act On / reply with explanation / answer / resolve) |.",
+			"Weigh verification evidence and whether independent reviewers reached the same defect; a human reviewer's claim that verifiers refute is presented with the code evidence, not overruled silently. Valid claims go into Act On (note the comment id).",
+			"### New issues not mentioned on the PR",
+			"What the independent reviewers found that no PR comment covers (these are the extra value of this review).",
+		);
+	}
 	lines.push(
 		"### Act On",
 		"Real issues that would block a PR, numbered. Each: what, where (file:line), which models raised it, why it matters, **Repro** (the concrete trigger → observed vs expected; take the reviewer's and correct it if needed), **Test** (the failing test that will prove the fix), and the fix. Aim for ≤5; more means you aren't filtering hard enough.",
@@ -3229,6 +3614,12 @@ function leadJudgmentInstructions(hasSpec: boolean): string {
 		"### Agreement Map",
 		"Where models agreed or diverged, and what that pattern suggests.",
 		"",
+		...(prNumber !== undefined
+			? [
+				`Draft replies: after the verdict, write a reply for each triaged PR comment (valid → what will be fixed and how; invalid → the code evidence; question → the answer) into a local markdown file such as /tmp/multi-review/pr-${prNumber}-replies.md — one section per comment with its link. NEVER post to GitHub or resolve threads (not via gh, not via the API): the user posts replies themselves. Tell the user where the file is.`,
+				"",
+			]
+			: []),
 		"Do not apply fixes unless the user asks. If they do, work from your verdict, not this raw review:",
 		"1. For each Act On item: write its test from the repro, run it and see it FAIL, fix, see it PASS. A test that passes before the fix doesn't prove anything; rewrite it.",
 		"2. Run the project's full test suite.",
@@ -3252,6 +3643,8 @@ async function runMultiReviewFromArgs(
 		deadlineMs?: number;
 		/** Where the lead can find verbatim per-reviewer text (headless: result.json). */
 		detailHint?: string;
+		/** Triage the PR's existing review comments (CodeRabbit, collaborators). */
+		prComments?: { includeNits: boolean; includeResolved: boolean };
 	} = {},
 ): Promise<MultiReviewRunResult> {
 	const cfg = loadConfig();
@@ -3260,11 +3653,20 @@ async function runMultiReviewFromArgs(
 	const flags: ReviewFlags = { ...parsedFlags.flags, ...stripUndefined(runOptions.flags ?? {}) };
 	const specFlag = parseValueFlag(parsedFlags.rest, "spec");
 	rawArgs = specFlag.rest;
+	const prCommentsFlag = parseBoolFlag(rawArgs, "pr-comments");
+	const nitsFlag = parseBoolFlag(prCommentsFlag.rest, "nits");
+	const resolvedFlag = parseBoolFlag(nitsFlag.rest, "resolved");
+	rawArgs = resolvedFlag.rest;
+	const prCommentOpts = runOptions.prComments ?? (prCommentsFlag.present ? { includeNits: nitsFlag.present, includeResolved: resolvedFlag.present } : undefined);
+	if (prCommentOpts && parseReviewArgs(rawArgs).kind !== "pr") {
+		return { kind: "notify", notifyMessage: "multi-review: --pr-comments needs a PR (e.g. #1234 or a PR URL)", notifyLevel: "error" };
+	}
 	const briefInput: BriefInput = { ...runOptions.brief };
 	if (specFlag.value && !briefInput.specPath) briefInput.specPath = specFlag.value;
-	if (briefInput.specPath) {
-		// An explicitly requested spec that can't be read must not silently
-		// degrade into a spec-less review.
+	// An explicitly requested spec that can't be read must not silently
+	// degrade into a spec-less review. PR reviews check it against the PR's
+	// code after checkout instead (the PR may add the spec).
+	if (briefInput.specPath && parseReviewArgs(rawArgs).kind !== "pr") {
 		const spec = readSpecFile(ctx.cwd, briefInput.specPath);
 		if ("error" in spec) return { kind: "notify", notifyMessage: `multi-review: ${spec.error}`, notifyLevel: "error" };
 	}
@@ -3302,6 +3704,7 @@ async function runMultiReviewFromArgs(
 
 	const label = describeFlags(flags);
 	const progress = createProgressReporter(ctx, label, onUpdate);
+	let cleanupCheckout: (() => Promise<void>) | undefined;
 	try {
 		const parsed = parseReviewArgs(rawArgs);
 		progress.update({ phase: "resolving scope" });
@@ -3310,12 +3713,71 @@ async function runMultiReviewFromArgs(
 		if (runOptions.focus?.trim()) {
 			target.focusHint = target.focusHint ? `${target.focusHint}\n\n${runOptions.focus.trim()}` : runOptions.focus.trim();
 		}
-		if (hasBriefInput(briefInput)) target.brief = buildBrief(ctx.cwd, briefInput, target.warnings);
 		const runOpts: ReviewerRunOptions = flags.quick
 			? { useTools: false, timeoutMs: cfg.reviewerTimeoutSec * 1000 }
 			: reviewerRunOptions(cfg);
-		if (target.kind === "pr" && runOpts.useTools) {
-			target.metaLines.push("(files on disk are the local checkout, not necessarily the PR head — the diff is authoritative)");
+		// PR reviews read the PR's actual code; brief files (spec, context) too,
+		// since the PR may add or change them.
+		if (target.kind === "pr" && target.pr) {
+			progress.update({ phase: "preparing PR checkout" });
+			const checkout = await preparePrCheckout(pi, ctx.cwd, target.pr);
+			cleanupCheckout = checkout.cleanup;
+			target.reviewDir = checkout.dir;
+			runOpts.cwd = checkout.dir;
+			if (checkout.note) target.metaLines.push(`(${checkout.note})`);
+			if (checkout.warning) target.warnings.push(checkout.warning);
+		}
+		const briefDir = target.reviewDir ?? ctx.cwd;
+		let specDir = briefDir;
+		if (briefInput.specPath) {
+			// A spec is a document about the change, not code under review: when
+			// the PR checkout lacks it (e.g. an untracked local doc), use the
+			// local copy rather than refusing the review.
+			let spec = readSpecFile(briefDir, briefInput.specPath);
+			if ("error" in spec && briefDir !== ctx.cwd) {
+				const local = readSpecFile(ctx.cwd, briefInput.specPath);
+				if (!("error" in local)) {
+					spec = local;
+					specDir = ctx.cwd;
+					target.metaLines.push(`(spec ${briefInput.specPath} read from your local checkout; it isn't in the PR)`);
+				}
+			}
+			if ("error" in spec) {
+				progress.finish("failed");
+				return { kind: "notify", notifyMessage: `multi-review: ${spec.error}`, notifyLevel: "error" };
+			}
+		}
+		if (hasBriefInput(briefInput)) {
+			target.brief = buildBrief(briefDir, { ...briefInput, specPath: undefined }, target.warnings);
+			if (briefInput.specPath) {
+				const spec = readSpecFile(specDir, briefInput.specPath);
+				if (!("error" in spec)) target.brief.spec = spec;
+			}
+		}
+		let prReport: PrCommentsReport | undefined;
+		if (prCommentOpts) {
+			if (!target.pr) {
+				target.warnings.push("could not resolve the PR via gh, so its review comments were not checked");
+			} else {
+				progress.update({ phase: "fetching PR review comments" });
+				const fetched = await fetchPrComments(pi, ctx.cwd, target.pr, prCommentOpts.includeResolved, target.warnings);
+				progress.update({ phase: `classifying ${fetched.items.length} PR comment item(s)` });
+				const cls = await classifyPrComments(ctx, cfg, fetched.items, prCommentOpts.includeNits, signal);
+				if (cls.error) target.warnings.push(`PR comment classification failed (${cls.error}); comments were not checked`);
+				prReport = {
+					claims: cls.claims,
+					others: cls.others,
+					stats: {
+						threads: fetched.items.filter((i) => i.kind === "thread").length,
+						// (includes resolved threads, which are context only)
+						reviews: fetched.items.filter((i) => i.kind === "review").length,
+						conversation: fetched.items.filter((i) => i.kind === "conversation").length,
+						skippedResolved: fetched.skippedResolved,
+						skippedNits: cls.skippedNits,
+						noise: cls.noise,
+					},
+				};
+			}
 		}
 		if (target.diffText.length > DIFF_BUDGET_CHARS) {
 			target.warnings.push(`diff is ${target.diffText.length} chars; reviewers saw the first ${DIFF_BUDGET_CHARS}. Narrow the scope or use focus.`);
@@ -3325,12 +3787,14 @@ async function runMultiReviewFromArgs(
 		const judge = agentLead ? null : resolveJudge(ctx, cfg);
 		if (!agentLead && !judge) target.warnings.push(`judge ${cfg.judge} not in registry; showing deterministic synthesis`);
 		const resolvedRows = resolved.map((r) => ({ rs: r.rs, model: r.model, clamped: r.clamped }));
-		const result = await runReviewPipeline(ctx, cfg, flags, target, resolvedRows, runOpts, judge, agentLead, signal, progress, runOptions.deadlineMs, runOptions.detailHint);
+		const result = await runReviewPipeline(ctx, cfg, flags, target, resolvedRows, runOpts, judge, agentLead, signal, progress, runOptions.deadlineMs, runOptions.detailHint, prReport);
 		progress.finish("done");
 		return result;
 	} catch (err) {
 		progress.finish("failed");
 		throw err;
+	} finally {
+		await cleanupCheckout?.();
 	}
 }
 
@@ -3356,6 +3820,7 @@ async function runReviewPipeline(
 	progress: MultiReviewProgressReporter,
 	deadlineMs?: number,
 	detailHint?: string,
+	prReport?: PrCommentsReport,
 ): Promise<MultiReviewRunResult> {
 	const label = describeFlags(flags);
 	const userPrompt = buildReviewUserPrompt(target);
@@ -3381,23 +3846,36 @@ async function runReviewPipeline(
 	if (failure) return failure;
 
 	const suspicionTexts = target.brief?.suspicions ?? [];
-	const { groups, suspicionMatches } = await groupFindings(ctx, cfg, runs, signal, progress, suspicionTexts);
+	const prClaims = prReport?.claims ?? [];
+	const hidden: HiddenClaim[] = [
+		...suspicionTexts.map((text, i) => ({ key: `S:${i}`, label: "lead hypothesis", text })),
+		...prClaims.map((c, i) => ({ key: `P:${i}`, label: `PR comment by @${c.author}`, text: `${c.path ? `${c.path}: ` : ""}${c.claim}` })),
+	];
+	const { groups, matches } = await groupFindings(ctx, cfg, runs, signal, progress, hidden);
 	// Grouping and judge calls turn an abort into an error + fallback; a
 	// cancelled run must stop here, not publish a fallback review.
 	throwIfAborted(signal);
-	const suspicions: SuspicionResult[] = suspicionTexts.map((text, i) => ({ id: `s${i + 1}`, text, raisedBy: suspicionMatches[i] ?? [] }));
-	// Suspicions ride the verify round as claims of their own: every reviewer
-	// is eligible (none raised them), and they never touched discovery.
-	const suspicionGroups = suspicions.map(suspicionAsGroup);
+	const suspicions: SuspicionResult[] = suspicionTexts.map((text, i) => ({ id: `s${i + 1}`, text, raisedBy: matches.get(`S:${i}`) ?? [] }));
+	prClaims.forEach((c, i) => { c.raisedBy = matches.get(`P:${i}`) ?? []; });
+	// Suspicions and PR claims ride the verify round as claims of their own:
+	// every reviewer is eligible (none raised them; none saw them). PR
+	// claims are always verified — checking them is the point of fetching.
+	const suspicionGroups = flags.verify ? suspicions.map(suspicionAsGroup) : [];
+	const prClaimGroups = prClaims.map(prClaimAsGroup);
 	const verifyTimeLeft = deadlineMs === undefined ? Number.POSITIVE_INFINITY : deadlineMs - Date.now() - FINAL_RESERVE_MS;
-	if (flags.verify && verifyTimeLeft < MIN_PHASE_MS) {
+	const toVerify = [...(flags.verify ? groups : []), ...suspicionGroups, ...prClaimGroups];
+	if (toVerify.length > 0 && verifyTimeLeft < MIN_PHASE_MS) {
 		target.warnings.push(`verification skipped: only ${Math.max(0, Math.round(verifyTimeLeft / 1000))}s left of the run's time budget`);
-	} else if (flags.verify && groups.length + suspicionGroups.length > 0) {
-		const { failures } = await runVerification(ctx, cfg, rows, [...groups, ...suspicionGroups], userPrompt, fit(runOpts, FINAL_RESERVE_MS), signal, progress);
-		for (const f of failures) target.warnings.push(`verifier failed (its findings stay unverified): ${f}`);
+	} else if (toVerify.length > 0) {
+		const { failures } = await runVerification(ctx, cfg, rows, toVerify, userPrompt, fit(runOpts, FINAL_RESERVE_MS), signal, progress);
+		for (const f of failures) target.warnings.push(`verifier failed (its claims stay unverified): ${f}`);
 		suspicionGroups.forEach((g, i) => {
 			suspicions[i].verifications = g.verifications;
 			suspicions[i].verificationNote = g.verificationNote;
+		});
+		prClaimGroups.forEach((g, i) => {
+			prClaims[i].verifications = g.verifications;
+			prClaims[i].verificationNote = g.verificationNote;
 		});
 	}
 
@@ -3424,6 +3902,7 @@ async function runReviewPipeline(
 		markdown = synthesizeMarkdownFromGroups(target, groups, runs, label);
 	}
 	if (suspicions.length > 0) markdown += `\n\n${suspicionMarkdown(suspicions, groups, flags.verify).join("\n")}`;
+	if (prReport) markdown += `\n\n${prCommentsMarkdown(prReport, groups).join("\n")}`;
 
 	const details: MultiReviewDetails = {
 		target,
@@ -3436,6 +3915,7 @@ async function runReviewPipeline(
 		consensusCount: groups.filter((g) => g.consensus).length,
 		totalFindings: groups.reduce((s, g) => s + g.members.length, 0),
 		suspicions: suspicions.length > 0 ? suspicions : undefined,
+		prComments: prReport,
 	};
 	const verified = groups.filter((g) => g.verifications?.length).length;
 	return {
@@ -3446,6 +3926,7 @@ async function runReviewPipeline(
 			`reviewers: ${runs.length}   issues: ${groups.length}   consensus: ${details.consensusCount}` +
 			(flags.verify ? `   verified: ${verified}/${groups.length}` : "") +
 			(suspicions.length ? `   suspicions raised independently: ${suspicions.filter((x) => x.raisedBy.length).length}/${suspicions.length}` : "") +
+			(prReport ? `   PR claims: ${prClaims.length} (${prClaims.filter((c) => c.verifications?.some((v) => v.verdict === "confirmed")).length} confirmed)` : "") +
 			(target.warnings.length ? `\nwarnings: ${target.warnings.length} (see review)` : ""),
 		notifyLevel: "info",
 		injectMessage: { customType: "multi-review", content: markdown, details },
@@ -3467,6 +3948,10 @@ export interface ReviewRequest {
 	pr_number?: number;
 	verify?: boolean;
 	quick?: boolean;
+	/** Triage the PR's existing review comments (needs pr_number). */
+	pr_comments?: boolean;
+	include_nits?: boolean;
+	include_resolved?: boolean;
 }
 
 /**
@@ -3486,6 +3971,7 @@ async function runAgentLedReview(
 ): Promise<{ text: string; markdown: string; details: MultiReviewDetails } | { error: string }> {
 	const parts: string[] = [];
 	const focus = typeof params.focus === "string" ? params.focus.trim() : "";
+	if (params.pr_comments && typeof params.pr_number !== "number") return { error: "multi_review: pr_comments needs pr_number" };
 	if (typeof params.pr_number === "number") parts.push(String(params.pr_number));
 	else if (params.scope === "area") {
 		if (!focus) return { error: "multi_review: scope='area' needs `focus` describing the area to review." };
@@ -3504,17 +3990,19 @@ async function runAgentLedReview(
 		flags: { verify: params.verify, quick: params.quick },
 		deadlineMs,
 		detailHint,
+		prComments: params.pr_comments ? { includeNits: Boolean(params.include_nits), includeResolved: Boolean(params.include_resolved) } : undefined,
 	});
 	if (!result.injectMessage) return { error: result.notifyMessage };
 	const { content: markdown, details } = result.injectMessage;
 	const hasSpec = Boolean(params.spec_path || params.requirements?.length);
-	return { text: `${markdown}\n\n${leadJudgmentInstructions(hasSpec)}`, markdown, details };
+	return { text: `${markdown}\n\n${leadJudgmentInstructions(hasSpec, details.prComments ? params.pr_number : undefined)}`, markdown, details };
 }
 
 /** Validate a brief file's JSON into a ReviewRequest; wrong-typed fields are errors, unknown keys ignored. */
 export function parseReviewRequest(raw: unknown): ReviewRequest | { error: string } {
 	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { error: "brief must be a JSON object" };
-	const o = raw as Record<string, unknown>;
+	// Explicit nulls (common in model-written JSON) mean "not set".
+	const o = Object.fromEntries(Object.entries(raw as Record<string, unknown>).filter(([, v]) => v !== null));
 	const req: ReviewRequest = {};
 	const str = (k: keyof ReviewRequest) => {
 		if (o[k] === undefined) return;
@@ -3536,7 +4024,7 @@ export function parseReviewRequest(raw: unknown): ReviewRequest | { error: strin
 		if (Array.isArray(o.focus) && o.focus.every((x) => typeof x === "string")) o.focus = (o.focus as string[]).join("; ");
 		str("intent"); str("spec_path"); str("focus");
 		strs("requirements"); strs("suspicions"); strs("context_files");
-		bool("verify"); bool("quick");
+		bool("verify"); bool("quick"); bool("pr_comments"); bool("include_nits"); bool("include_resolved");
 		if (o.scope !== undefined) {
 			if (o.scope !== "diff" && o.scope !== "area") throw new Error(`"scope" must be "diff" or "area"`);
 			req.scope = o.scope;
@@ -3614,6 +4102,9 @@ const ARG_COMPLETIONS: Array<{ token: string; label: string; description: string
 	{ token: "--verify", label: "--verify", description: "cross-check each finding with reviewers who didn't raise it" },
 	{ token: "--quick", label: "--quick", description: "fast reviewer pool, no tools" },
 	{ token: "--direct", label: "--direct", description: "skip the main agent; external judge synthesizes" },
+	{ token: "--pr-comments", label: "--pr-comments", description: "with a PR: verify its existing review comments (CodeRabbit, collaborators)" },
+	{ token: "--nits", label: "--nits", description: "with --pr-comments: include nitpicks" },
+	{ token: "--resolved", label: "--resolved", description: "with --pr-comments: include resolved threads" },
 	{ token: "#", label: "#<pr>", description: "review a PR by number" },
 ];
 
@@ -3690,7 +4181,16 @@ export default function (pi: ExtensionAPI) {
 		args = direct.rest;
 		if (!direct.present && ctx.hasUI && ctx.model) {
 			const { flags, rest: afterFlags } = parseReviewFlags(args, { verify: cfg.verify, quick: false });
-			const { value: specPath, rest } = parseValueFlag(afterFlags, "spec");
+			const { value: specPath, rest: afterSpec } = parseValueFlag(afterFlags, "spec");
+			const prC = parseBoolFlag(afterSpec, "pr-comments");
+			const nits = parseBoolFlag(prC.rest, "nits");
+			const resolvedThreads = parseBoolFlag(nits.rest, "resolved");
+			const rest = resolvedThreads.rest;
+			const prComments = prC.present ? { includeNits: nits.present, includeResolved: resolvedThreads.present } : undefined;
+			if (prComments && parseReviewArgs(rest).kind !== "pr") {
+				ctx.ui.notify("multi-review: --pr-comments needs a PR (e.g. #1234 or a PR URL)", "error");
+				return;
+			}
 			if (specPath) {
 				const spec = readSpecFile(ctx.cwd, specPath);
 				if ("error" in spec) {
@@ -3698,7 +4198,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 			}
-			const prompt = buildHandoffPrompt(rest, flags, specPath);
+			const prompt = buildHandoffPrompt(rest, flags, specPath, prComments);
 			if (ctx.isIdle()) pi.sendUserMessage(prompt);
 			else pi.sendUserMessage(prompt, { deliverAs: "followUp" });
 			return;
@@ -3714,7 +4214,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("multi-review", {
 		description:
 			"Fan-out code review across configured models. Usage: " +
-			"/multi-review [--spec=path] [--verify] [--quick] [--direct] [PR-number | free-text focus]. " +
+			"/multi-review [--spec=path] [--verify] [--quick] [--direct] [PR-number [--pr-comments [--nits] [--resolved]] | free-text focus]. " +
 			"The main agent drafts the reviewer brief from your args (and spec), then judges the results. " +
 			"--direct skips the agent and uses the configured judge.",
 		// Argument autocomplete hints the call shape so users don't have to
@@ -3801,6 +4301,7 @@ export default function (pi: ExtensionAPI) {
 			"`focus`: risk areas only, never hypotheses. Put your specific bug hypotheses in `suspicions`; they are hidden from reviewers and checked against what they find on their own.",
 			"`context_files` are repo paths reviewers should read in full (callers, types, tests) — not files already whole in the diff.",
 			"Set verify=true for high-stakes changes (independent cross-check of every finding); quick=true for small diffs or a cheap first look.",
+			"For a PR that already has review comments (CodeRabbit, collaborators), set pr_comments=true to triage them: each is verified and you report valid/invalid per comment plus new issues, and draft replies to a local file. Never post to GitHub.",
 			"After results return, follow the lead-judgment instructions in the result. Do not apply fixes unless asked.",
 		],
 		parameters: Type.Object({
@@ -3845,6 +4346,13 @@ export default function (pi: ExtensionAPI) {
 					"Cross-check round: each finding goes to reviewers who did NOT raise it, who confirm or refute it with " +
 					"evidence. Roughly doubles cost; use for high-stakes changes or when false positives are expensive.",
 			})),
+			pr_comments: Type.Optional(Type.Boolean({
+				description:
+					"With pr_number: fetch the PR's existing review comments (CodeRabbit, collaborators), extract checkable claims, " +
+					"and verify each (hidden from reviewers, matched against their independent findings). Do not copy those comments into the brief.",
+			})),
+			include_nits: Type.Optional(Type.Boolean({ description: "With pr_comments: also verify nitpick-level claims." })),
+			include_resolved: Type.Optional(Type.Boolean({ description: "With pr_comments: also check resolved review threads." })),
 			quick: Type.Optional(Type.Boolean({
 				description: "Fast reviewer pool, single completions without tools. For small diffs or a cheap first look.",
 			})),

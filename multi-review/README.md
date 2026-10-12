@@ -33,9 +33,9 @@ judge model writes the synthesis.
 
 | Surface | How |
 |---------|-----|
-| Slash command | `/multi-review [--spec=path] [--verify] [--quick] [--direct] [PR-number \| free-text focus]` |
+| Slash command | `/multi-review [--spec=path] [--verify] [--quick] [--direct] [PR-number [--pr-comments [--nits] [--resolved]] \| free-text focus]` |
 | Slash command | `/multi-review-pick`: open the multi-select TUI picker to choose reviewer models from your registry (optionally saved to `multi-review.json`) |
-| LLM-callable tool | `multi_review({intent?, spec_path?, requirements?, suspicions?, context_files?, focus?, scope?, pr_number?, verify?, quick?})`. The agent can call it on its own too |
+| LLM-callable tool | `multi_review({intent?, spec_path?, requirements?, suspicions?, context_files?, focus?, scope?, pr_number?, verify?, quick?, pr_comments?, include_nits?, include_resolved?})`. The agent can call it on its own too |
 
 Tool parameters:
 
@@ -50,6 +50,7 @@ Tool parameters:
 | `scope` | `diff` (default: working tree vs default branch, or the PR) or `area` (no diff; review what `focus` describes). |
 | `pr_number` | As for the slash command. |
 | `verify`, `quick` | Same as `--verify` / `--quick`. |
+| `pr_comments`, `include_nits`, `include_resolved` | With `pr_number`: triage the PR's existing review comments (see below). |
 
 Argument autocompletion completes only the token you're typing (`--spec=`,
 `--verify`, `--quick`, `--direct`, `#`) and keeps what's already typed.
@@ -58,6 +59,61 @@ If the configured reviewer pool is empty AND the agent has UI access,
 `/multi-review` opens the picker as a fallback. You can save the choice to
 `multi-review.json` or use it for the current run only (transient
 override, never touches the file).
+
+## Existing PR comments (CodeRabbit, collaborators)
+
+`--pr-comments` (with a PR) also triages the review comments already on
+the PR. It answers both questions in one run: which existing comments are
+right, and what did everyone miss.
+
+1. **Fetch** (read-only `gh`):
+   - review threads via GraphQL, with path, line, diff hunk, and resolved
+     and outdated flags;
+   - review bodies (bots put "outside diff range" and nitpick findings
+     there);
+   - conversation comments.
+
+   Bodies are cleaned: HTML comments, badges, and CodeRabbit's "Prompt
+   for AI Agents" copies are dropped.
+2. **Classify** (one fast call). Each item is split into checkable
+   **claims**, or classed as **question**, **preference** or **noise**
+   (walkthroughs, approvals, "done" replies).
+   - **Nitpick claims** are dropped unless `--nits`.
+   - **Resolved threads** are not re-checked unless `--resolved`. They're
+     given to the classifier as *context only*, so a bot's summary that
+     repeats a settled inline comment doesn't bring it back.
+   - **Outdated threads** are kept: whether they still apply is the
+     useful question.
+3. **Fresh review, blind.** Reviewers never see the comments. The comments
+   aren't in the brief, the same anchoring argument as for suspicions.
+4. **Match and verify.** Each claim is matched against the independent
+   findings by the grouping call, and is **always** cross-checked by
+   verifiers at the PR's latest commit. Verifiers get the comment's
+   original diff hunk to find the spot again.
+5. **Output.** An *Existing PR review comments* section shows, per claim,
+   its author and link, whether independent reviewers reached it, and the
+   verdicts with evidence. Questions and preferences come next. Then the
+   lead gives a per-comment verdict and action, a list of **new issues not
+   on the PR**, and **draft replies in a local file**. Nothing is ever
+   posted to GitHub.
+
+**PR checkout.** A PR review reads the PR's actual code. If your checkout
+is already the PR's latest commit with no edits to tracked files, it's
+used as is. Otherwise a temporary detached worktree is created at that
+commit (fetching `pull/N/head` if needed) and removed afterwards. Your
+checkout, branches and stash are never touched. A spec that isn't in the
+PR (e.g. an untracked local doc) is read from your local checkout.
+
+Example, on lemonade #3765 (a shared-HF-cache model-deletion fix):
+- **Comments in:** 15 items → 10 claims, 5 questions/preferences, and 1
+  resolved thread kept as context.
+- **Refuted, with current-code evidence:** 5 claims that later commits
+  had already addressed.
+- **Confirmed:** 5 claims, 3 of them also found independently by the
+  fresh reviewers.
+- **Human comments** (the shared-cache ownership debate, the UI warning
+  question) came through as questions and preferences for the lead to
+  answer.
 
 ## Brief discipline: what reviewers are told
 
@@ -148,7 +204,9 @@ The flow:
 
 Claude Code becomes the lead with the implementation context, just as
 pi's main agent is inside pi. The skill pre-approves only `pi -p`,
-`mkdir`, `git`, `gh pr`, Read and Write.
+`mkdir`, `git`, `gh pr view`/`gh pr diff`, Read and Write. It deliberately
+leaves out `gh pr comment`/`review`, so posting to GitHub always needs your
+approval, and the skill never asks to.
 
 ## Review options
 

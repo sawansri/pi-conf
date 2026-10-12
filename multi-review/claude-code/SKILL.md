@@ -1,8 +1,8 @@
 ---
 name: multi-review
 description: Multi-model code review through pi's multi-review extension. Reviewers from other model families (Sonnet 5.5, gpt-6-sol, gpt-6-luna), each with read-only repo access, review the current change, a PR, or a spec implementation in parallel. You write the brief, act as lead reviewer on their findings, and, if asked, fix the issues test-first and confirm the fixes with a re-review. Use when the user asks for a multi-model review, a second opinion from other models, a check of an implementation against a spec, or to fix and confirm review findings.
-argument-hint: "[--spec=path] [--verify] [--quick] [#PR | area to review]"
-allowed-tools: Bash(pi -p *) Bash(mkdir *) Bash(git *) Bash(gh pr *) Read Write
+argument-hint: "[--spec=path] [--verify] [--quick] [#PR [--pr-comments [--nits] [--resolved]] | area to review]"
+allowed-tools: Bash(pi -p *) Bash(mkdir *) Bash(git diff *) Bash(git log *) Bash(git show *) Bash(git status *) Bash(git merge-base *) Bash(git rev-parse *) Bash(gh pr view *) Bash(gh pr diff *) Read Write
 ---
 
 # Multi-model review (lead: you)
@@ -14,10 +14,15 @@ Arguments: `$ARGUMENTS`
 - `--verify`: each finding (and each of your suspicions) is cross-checked by reviewers who didn't raise it. Costs ~1.5–2×. Use it for high-stakes changes.
 - `--quick`: a fast pool without repo tools (10–50s). Good for small diffs or a first look.
 - `#123` or a PR URL: review that PR. Any other text is either a focus for the diff review or, if there is no change to review, the area to review.
+- `--pr-comments` (with a PR): also triage the PR's existing review comments (CodeRabbit, other bots, collaborators). `--nits` includes nitpicks, and `--resolved` re-checks resolved threads.
+
+**Never post to GitHub.** Don't comment, review, reply, or resolve threads, whether with `gh` or the API. Replies are drafted into a local file for the user to post.
 
 ## 1. Understand the change
 
-Run all commands from the repository root; pi derives the scope from the working directory.
+Run all commands from the repository root, where you already are; pi derives the scope from the working directory.
+
+**Don't check out the PR, switch branches, or create worktrees or copies.** For PR reviews the extension reads the PR's actual code itself. It reuses your checkout if it's already the PR head; otherwise it creates and removes a temporary worktree. A spec that isn't in the PR (an untracked local doc) is read from the local checkout. To look at PR code yourself, use `gh pr diff <n>` and `git show <sha>:<path>`.
 - Default scope: everything since the branch left the default branch, committed and uncommitted: `git diff $(git merge-base origin/HEAD HEAD)`. Fall back to `main`/`master` if `origin/HEAD` doesn't exist.
 - PR: `gh pr view <n>` and `gh pr diff <n>`.
 - With `--spec`, read the spec in full.
@@ -45,7 +50,7 @@ Write a JSON file (e.g. `/tmp/multi-review/<timestamp>/brief.json`; create the d
 | Field | Content |
 |---|---|
 | `intent` | What the change must accomplish, plus facts reviewers can't find in the repo: external tool/API behaviour, deployment constraints, what's deliberately out of scope. State goals; don't narrate the implementation, which reviewers verify for themselves. |
-| `spec_path` | Repo-relative spec path (passed to reviewers verbatim). |
+| `spec_path` | The spec path exactly as the user gave it: repo-relative or absolute (don't rewrite an absolute path; the spec may live outside the repo). Its text goes to reviewers verbatim. |
 | `requirements` | With a spec: every concrete, checkable requirement, one per item, including the edge cases and error behaviour it pins down. Without one: only explicit acceptance criteria. |
 | `context_files` | Up to 8 repo paths reviewers should read in full beyond the diff: callers, types/interfaces, tests that pin the behaviour. |
 | `focus` | Risk AREAS only ("API-key handling across agents", "config-file merge lifecycle"), never hypotheses ("does X compile?"). |
@@ -53,6 +58,7 @@ Write a JSON file (e.g. `/tmp/multi-review/<timestamp>/brief.json`; create the d
 | `scope` | `"area"` only when there is no change to review and `focus` describes the area; otherwise omit it. |
 | `pr_number` | For PR reviews. |
 | `verify`, `quick` | From the arguments. |
+| `pr_comments`, `include_nits`, `include_resolved` | For `--pr-comments`, `--nits` and `--resolved`. The comments are fetched and checked by the extension. **Do not copy them into the brief** (not `focus`, not `suspicions`): reviewers must find issues independently, so agreement with a comment means something. Your own suspicions are still fine. |
 
 ## 3. Run the review
 
@@ -91,6 +97,16 @@ Review: <dir>/result.md
 ## Consider / Noted / Dismissed
 <one line each>
 ```
+
+### With `--pr-comments`: triage and draft replies
+
+The result has an **Existing PR review comments** section. Each checkable claim extracted from the comments shows whether the independent reviewers found the same defect, plus verifier verdicts with evidence. Questions and preferences come after the claims. Resolved threads are used only as context; they're not re-checked.
+
+Your reply adds, as the Lead judgment section asks:
+- **Existing PR comments:** one row per claim, question and preference. Give the verdict (valid / invalid / unclear / not a defect), the evidence, and the action (fix → Act On / reply with explanation / answer / resolve). A human reviewer's claim that verifiers refute is presented with the code evidence, not overruled silently.
+- **New issues not mentioned on the PR:** what this review found beyond the existing comments.
+
+Then write `<dir>/pr-replies.md`: one section per comment with its link, the verdict, and a ready-to-paste reply. Valid → what will be fixed and how. Invalid → the code evidence. Question → the answer. Tell the user the path. **Do not post anything.**
 
 ## 5. If the user asks you to fix
 
