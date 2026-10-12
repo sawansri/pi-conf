@@ -2,7 +2,7 @@
 
 ## Prereqs
 
-- pi (the extension uses `completeSimple` from `@mariozechner/pi-ai` and
+- pi (the extension uses `ctx.modelRegistry.streamSimple` and
   `pi.appendEntry` / `pi.sendMessage` / `pi.registerMessageRenderer`
   / `pi.registerTool` / `pi.registerCommand` from
   `@mariozechner/pi-coding-agent`).
@@ -39,13 +39,15 @@ Reload inside pi with `/reload`, or restart.
 cat > ~/.pi/agent/multi-review.json << 'EOF'
 {
   "reviewers": [
-    "fireworks/accounts/fireworks/models/minimax-m3",
-    "fireworks/accounts/fireworks/models/glm-5p2",
-    "fireworks/accounts/fireworks/models/kimi-k2p7"
+    "amd-gateway/gpt-6-astra@xhigh",
+    "amd-gateway/Grok-4.7@high",
+    "amd-gateway/DeepSeek-V4-Pro@high",
+    "amd-gateway/Kimi-K2.7-Code@high",
+    "amd-gateway/gemini-3.8-flash@high"
   ],
-  "judge": "fireworks/accounts/fireworks/models/glm-5p2",
+  "judge": "amd-gateway-anthropic/Claude-Opus-5.5",
   "judgeThinking": "high",
-  "concurrency": 4,
+  "concurrency": 5,
   "temperature": 0.2,
   "mode": "balanced",
   "triageEscalationThreshold": 1
@@ -65,17 +67,17 @@ suffix on each reviewer entry; bare entries use the model default:
 cat > ~/.pi/agent/multi-review.json << 'EOF'
 {
   "reviewers": [
-    "fireworks/accounts/fireworks/models/minimax-m3@xhigh",
-    "fireworks/accounts/fireworks/models/glm-5p2@high",
-    "fireworks/accounts/fireworks/models/kimi-k2p7"
+    "amd-gateway/gpt-6-astra@xhigh",
+    "amd-gateway/Grok-4.7@max",
+    "amd-gateway/Kimi-K2.7-Code"
   ],
   "mode": "balanced"
 }
 EOF
 ```
 
-Allowed levels: `off | minimal | low | medium | high | xhigh`. If a model
-clams a level (e.g. `xhigh`→`high` on Fireworks), the notify surfaces it
+Allowed levels: `off | minimal | low | medium | high | xhigh | max`. If a model
+clamps a level (e.g. `xhigh` on gemini-3.8-flash), the notify surfaces it
 under "clamped" so you can spot it without guessing.
 
 ### Picking a mode
@@ -146,7 +148,7 @@ The result lands as a chat entry — `Ctrl+O` to expand.
 
 The status footer shows the loaded pool on session start:
 ```
-multi-review · pool: 3 (fireworks/.../minimax-m3, fireworks/.../glm-5p2, +1 more)
+multi-review · pool: 5 (amd-gateway/gpt-6-astra@xhigh, amd-gateway/Grok-4.7@high, amd-gateway/DeepSeek-V4-Pro@high, +2 more)
 ```
 
 Per-run status updates flow through the same status key and a temporary
@@ -154,8 +156,8 @@ progress widget below the editor:
 ```
 multi-review · mode=balanced · resolving scope
 multi-review · mode=balanced · reviewers running (2/3)
-latest: ✓ glm-5p2 (2/3) — 1 finding, 18.4s, $0.0021
-multi-review · 7 groups · invoking judge glm-5p2
+latest: ✓ Grok-4.7@high (3/5) — 2 findings, 11.6s
+multi-review · 2 groups · invoking judge Claude-Opus-5.5
 multi-review · done
 ```
 When called through the `multi_review` tool, the same progress is also sent
@@ -170,7 +172,8 @@ via tool updates so the pending tool row changes as reviewers complete.
 | `judge model missing` | Same as above for `multi-review.json` → `judge` |
 | `git fetch origin pull/N/head failed` | Network or auth problem in the git remote; try running fetch by hand |
 | `gh pr view failed` | Either missing `gh`, unauthed, or repo isn't GitHub'd; we silently fall back to `git fetch`+`git diff` |
-| Judge output truncated | Most judges cap at 4-8k output tokens; trim your reviewer pool or lower judge maxTokens ask |
+| Judge output truncated | Calls request up to 32k output tokens (capped at the model's maxTokens); trim the reviewer pool if a judge still truncates |
+| Watching a run in print/RPC mode | Set `MULTI_REVIEW_DEBUG=1`; progress lines go to stderr. When scripting `pi -p`, close stdin (`< /dev/null`) or pi waits for it |
 | Directory listing empty in free-text mode | Either nothing tracked + nothing non-ignored-added by git, or all paths matched gitignore. Run `git ls-files --others --exclude-standard` in the project to see what we'd find. |
 | `.gitignore` patterns not honored | We support `*`/`?`/`[…]`/`**`/leading-`/`/trailing-`/`/`!` negation. No `{a,b}` alternation or extglob. Files that need deeper .gitignore features should be reviewed with `git` directly. |
 

@@ -107,19 +107,26 @@ anchoring, trailing-`/` directory-only, and `!` negation. No alternation or
 extglob — documented limitation.
 
 3. **Parallel fan-out** — `Promise.all` (capped by `multi-review.concurrency`,
-   max 16) of `completeSimple()` per reviewer in a single shared in-process
-   call. Abort signal threaded from the tool's `ctx.signal` so `Ctrl+C`
-   during an agent turn cancels every in-flight call. Fail-soft: a single
-   reviewer's parse/protocol crash doesn't abort the rest.
+   max 16) of `ctx.modelRegistry.streamSimple()` per reviewer, so request-time
+   auth from `models.json` (literal keys, custom headers) applies. Abort signal
+   threaded from the tool's `ctx.signal` so `Ctrl+C` during an agent turn
+   cancels every in-flight call. Fail-soft: a single reviewer's failure
+   doesn't abort the rest, but failures (`stopReason` error/aborted, empty
+   output at maxTokens, no JSON array) are reported as failures — never as
+   "no findings". If every reviewer fails, the run reports the errors instead
+   of injecting a review. Temperature is omitted when reasoning is on.
 
 4. **Structured prompt** — each reviewer is told to output ONLY a JSON
    array `[{file, line_start, line_end, severity, category, title, comment}]`
    with `severity ∈ {critical|high|medium|low|info|none}` and a free-form
-   short `category` label. Parser is tolerant of markdown fences and prose
-   wrap; finds the first `[` and last `]` before parsing.
+   short `category` label. Parser is tolerant of markdown fences, prose
+   wrap, and `{"findings": [...]}` wrappers; a reply with no array is a
+   failure (only an explicit `[]` means clean).
 
-5. **Dedupe + group** — greedy O(N²) overlap matcher (same file + touching
-   lines OR either side file-level). Per-group carries the full per-model
+5. **Dedupe + group** — greedy O(N²) matcher: same file AND line ranges
+   within 3 lines of each other (file-level findings only match other
+   file-level findings). Each reviewer contributes at most one finding per
+   group, and group ranges widen to the union. Per-group carries the full per-model
    attribution: `members[]` keep every spec's original comment, `titles[]`
    collect distinct titles, `reviewerSpecs[]` feeds the consensus badge
    (≥ 2 reviewers ⇒ CONSENSUS). Group severity escalates to the max of
@@ -129,11 +136,11 @@ extglob — documented limitation.
    (`provider/id@level`, see Defaults). Bare specs fall back to model
    defaults; the SDK clamps per model.
 
-6. **Judge pass** — single `completeSimple()` on the configured judge model
-   with maxTokens 8192 and temperature inherited from defaults. Output is
-   structured markdown: severity + title + file:line + category + per-reviewer
-   comment list + one-sentence "Judge's take". Reviews never merged silently:
-   when reviewers disagree, both comments appear.
+6. **Judge pass** — single call on the configured judge model at
+   `judgeThinking`. The judge sees the deduped findings AND the diff, and
+   marks each finding confirmed / plausible / false positive with the diff
+   lines that support it, plus a "Judge's take". Findings are never deleted;
+   framing disagreements are called out.
 
 7. **Render + inject** — judges' markdown lands as a custom-typed session
    entry (`pi.sendMessage({ customType: "multi-review", ... })`) so it lives
@@ -150,13 +157,15 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
 ```json
 {
   "reviewers": [
-    "fireworks/accounts/fireworks/models/minimax-m3",
-    "fireworks/accounts/fireworks/models/glm-5p2",
-    "fireworks/accounts/fireworks/models/kimi-k2p7"
+    "amd-gateway/gpt-6-astra@xhigh",
+    "amd-gateway/Grok-4.7@high",
+    "amd-gateway/DeepSeek-V4-Pro@high",
+    "amd-gateway/Kimi-K2.7-Code@high",
+    "amd-gateway/gemini-3.8-flash@high"
   ],
-  "judge": "fireworks/accounts/fireworks/models/glm-5p2",
+  "judge": "amd-gateway-anthropic/Claude-Opus-5.5",
   "judgeThinking": "high",
-  "concurrency": 4,
+  "concurrency": 5,
   "temperature": 0.2,
   "mode": "balanced",
   "triageEscalationThreshold": 1
@@ -181,19 +190,19 @@ used elsewhere in this repo (`tdd-pipeline` uses it for `/build-models`).
 ```jsonc
 {
   "reviewers": [
-    "fireworks/.../minimax-m3@xhigh",   // force xhigh on the slow model
-    "fireworks/.../glm-5p2@high",       // moderate reasoning
-    "fireworks/.../kimi-k2p7"           // bare → model default (medium)
+    "amd-gateway/gpt-6-astra@xhigh",    // deepest reasoning
+    "amd-gateway/DeepSeek-V4-Pro@high", // DeepSeek has no medium; bare would clamp up
+    "amd-gateway/Kimi-K2.7-Code"        // bare → medium
   ]
 }
 ```
 
 Rules:
-- Allowed levels: `off | minimal | low | medium | high | xhigh`.
+- Allowed levels: `off | minimal | low | medium | high | xhigh | max`.
 - Bare spec → model default (`medium` for reasoning-capable models, no
   reasoning field emitted otherwise).
 - A level that the model's `thinkingLevelMap` clamps to a softer value
-  (e.g. `xhigh` → `high` on some Fireworks-hosted models) is surfaced in
+  (e.g. `xhigh` on gemini-3.8-flash, or `medium` on DeepSeek-V4-Pro) is surfaced in
   the notify under "clamped" so you don't have to guess why reasoning
   looks lighter than expected.
 
@@ -211,7 +220,7 @@ expose per-row level controls is tracked as future polish.
   `multi-review.json`; pickers can include any provider that the
   registry has API keys for (Fireworks, Kimi, MiniMax, Z.AI, Anthropic,
   OpenAI, etc.).
-- **Sub-process sharding.** Following the `completeSimple()` in-process
+- **Sub-process sharding.** Following the `modelRegistry.streamSimple()` in-process
   pattern, not the `subagent`-style subprocess spawn. Single fire-time,
   no per-reviewer tool sandbox.
 - **Full model configuration UI.** The picker selects reviewer models only.

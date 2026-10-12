@@ -9,9 +9,9 @@
  *   parseReviewArgs → resolve pool + judge
  *                     → buildReviewTarget (PR via gh, fallback to git fetch;
  *                                          default-branch diff; or directory listing)
- *                     → runAllReviewers (parallel completeSimple, capped at concurrency)
+ *                     → runAllReviewers (parallel modelRegistry.streamSimple, capped at concurrency)
  *                     → dedupeReviewerFindings (greedy overlap, consensus badge)
- *                     → runJudge (single completeSimple on configured judge)
+ *                     → runJudge (single call on configured judge)
  *                     → pi.sendMessage({ customType: "multi-review", … })
  *                     → pi.registerMessageRenderer collapses/expands it in TUI
  *
@@ -25,11 +25,13 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolUpdateCallback, ExtensionAPI, ExtensionContext, ExecResult } from "@mariozechner/pi-coding-agent";
-import type { Model } from "@mariozechner/pi-ai";
+import type { Api, Model as PiModel } from "@mariozechner/pi-ai";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { getAgentDir, getMarkdownTheme } from "@mariozechner/pi-coding-agent";
 import { Box, Container, Key, Markdown, matchesKey, Spacer, Text, truncateToWidth } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
+
+type Model = PiModel<Api>;
 
 /** Provider/model-id pair as written in the defaults file and the picker. */
 export type ModelSpec = `${string}/${string}`;
@@ -37,8 +39,8 @@ export type ModelSpec = `${string}/${string}`;
 /**
  * Per-reviewer entry parsed out of the raw `provider/id[@level]` form.
  * Storage form in MultiReviewConfig.reviewers stays stringly-typed so JSON
- * keeps bare (`fireworks/.../minimax-m3`) and suffixed
- * (`fireworks/.../minimax-m3@xhigh`) forms in the same field. Parsing
+ * keeps bare (`amd-gateway/Grok-4.7`) and suffixed
+ * (`amd-gateway/Grok-4.7@xhigh`) forms in the same field. Parsing
  * happens at load + at request time; clamping happens per-model.
  */
 export interface ReviewerSpec {
@@ -46,7 +48,7 @@ export interface ReviewerSpec {
 	thinking: ThinkingLevelAlias;
 }
 
-export const THINKING_LEVEL_ALIASES = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+export const THINKING_LEVEL_ALIASES = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevelAlias = (typeof THINKING_LEVEL_ALIASES)[number];
 
 /**
@@ -54,7 +56,7 @@ export type ThinkingLevelAlias = (typeof THINKING_LEVEL_ALIASES)[number];
  * null for malformed entries (no '/' separator). The level suffix is
  * accepted ONLY when it matches a known alias — anything not in the
  * allowlist is treated as part of the spec, so a typo like
- * `fireworks/.../m@HIGH` falls back gracefully instead of crashing.
+ * `amd-gateway/Grok-4.7@HIGH` falls back gracefully instead of crashing.
  */
 export function parseReviewerSpec(raw: string, fallbackThinking: ThinkingLevelAlias = "medium"): ReviewerSpec | null {
 	const trimmed = raw.trim();
@@ -86,20 +88,6 @@ export function formatReviewerSpec(rs: ReviewerSpec): string {
 }
 
 /**
- * Decide the `reasoning` field on a completeSimple call for one reviewer.
- *  - non-reasoning-capable model → no field (SDK ignores anyway but
- *    keeps the wire payload clean);
- *  - "off" intent → no field (run fast, no reasoning text);
- *  - otherwise → pass the requested level. The SDK clamps per model's
- *    thinkingLevelMap so per-provider quirks are honored.
- */
-export function reasoningForRequest(rs: ReviewerSpec, model: Model): ThinkingLevelAlias | undefined {
-	if (!model.reasoning) return undefined;
-	if (rs.thinking === "off") return undefined;
-	return rs.thinking;
-}
-
-/**
  * Output of runMultiReviewFromArgs. Tool surface returns it; slash command
  * uses notify unless explicitly told to stay silent (we don't, today).
  */
@@ -118,7 +106,7 @@ export interface MultiReviewRunResult {
 export interface MultiReviewConfig {
 	/**
 	 * Reviewer specs as the user wrote them. Each entry is `provider/id` or
-	 * `provider/id@level` (e.g. `fireworks/.../minimax-m3@xhigh`). Parsing
+	 * `provider/id@level` (e.g. `amd-gateway/gpt-6-astra@xhigh`). Parsing
 	 * happens lazily via parseReviewerSpec.
 	 */
 	reviewers: string[];
@@ -135,11 +123,23 @@ export interface MultiReviewConfig {
 export const REVIEW_MODES = ["balanced", "light", "triage", "council"] as const;
 export type ReviewMode = (typeof REVIEW_MODES)[number];
 
+/**
+ * Defaults track the models in ~/.pi/agent/models.json. Reviewers are
+ * deliberately non-Anthropic: the main agent and judge are Claude, so the
+ * pool adds independent model families. Specs that don't resolve are
+ * skipped with a notice, never substituted.
+ */
 const DEFAULTS: MultiReviewConfig = {
-	reviewers: [],
-	judge: "fireworks/accounts/fireworks/models/glm-5p2",
+	reviewers: [
+		"amd-gateway/gpt-6-astra@xhigh",
+		"amd-gateway/Grok-4.7@high",
+		"amd-gateway/DeepSeek-V4-Pro@high",
+		"amd-gateway/Kimi-K2.7-Code@high",
+		"amd-gateway/gemini-3.8-flash@high",
+	],
+	judge: "amd-gateway-anthropic/Claude-Opus-5.5",
 	judgeThinking: "high",
-	concurrency: 4,
+	concurrency: 5,
 	temperature: 0.2,
 	mode: "balanced",
 	triageEscalationThreshold: 1,
@@ -191,7 +191,7 @@ function loadConfig(): MultiReviewConfig {
 			cachedConfig.judge = parsed.judge as ModelSpec;
 		}
 		const tk: MultiReviewConfig["judgeThinking"] = parsed.judgeThinking;
-		if (typeof tk === "string" && ["off", "minimal", "low", "medium", "high", "xhigh"].includes(tk)) {
+		if (typeof tk === "string" && (THINKING_LEVEL_ALIASES as readonly string[]).includes(tk)) {
 			cachedConfig.judgeThinking = tk;
 		}
 		if (typeof parsed.concurrency === "number" && parsed.concurrency > 0 && parsed.concurrency <= 16) {
@@ -228,7 +228,20 @@ export function findModel(ctx: ExtensionContext, spec: ModelSpec): Model | null 
 	if (slash <= 0) return null;
 	const provider = spec.slice(0, slash);
 	const id = spec.slice(slash + 1);
-	return ctx.modelRegistry.find(provider, id);
+	return ctx.modelRegistry.find(provider, id) ?? null;
+}
+
+/**
+ * True when the provider won't run `level` as requested. Mirrors pi-ai's
+ * getSupportedThinkingLevels: a `null` map entry marks a level unsupported,
+ * and xhigh/max are only supported when the map defines them explicitly.
+ */
+export function isThinkingLevelClamped(model: Model, level: ThinkingLevelAlias): boolean {
+	if (!model.reasoning || level === "off") return false;
+	const map = (model.thinkingLevelMap ?? {}) as Record<string, string | null | undefined>;
+	if (map[level] === null) return true;
+	if ((level === "xhigh" || level === "max") && map[level] === undefined) return true;
+	return false;
 }
 
 /**
@@ -258,43 +271,9 @@ export async function resolveReviewerPoolStructured(
 			missing.push(raw);
 			continue;
 		}
-		let clamped = false;
-		if (model.reasoning && parsed.thinking !== "off") {
-			const mapped = model.thinkingLevelMap?.[parsed.thinking as keyof typeof model.thinkingLevelMap];
-			clamped = mapped !== undefined && mapped !== parsed.thinking && mapped !== null;
-		}
-		entries.push({ raw, rs: parsed, model, clamped });
+		entries.push({ raw, rs: parsed, model, clamped: isThinkingLevelClamped(model, parsed.thinking) });
 	}
 	return { entries, missing };
-}
-
-/**
- * Resolve the configured reviewer pool against the live ModelRegistry.
- * Returns the resolved Models plus any spec strings that failed to resolve
- * (so the caller can surface them to the user). Returns null when the
- * resolved pool is empty — never invent reviewers, never fall back to a
- * "default" model, because doing so silently changes the user's intent.
- */
-export async function resolveReviewerPool(
-	ctx: ExtensionContext,
-	cfg: MultiReviewConfig,
-): Promise<{ resolved: { spec: ModelSpec; model: Model }[]; missing: ModelSpec[] } | null> {
-	const available: Model[] = await ctx.modelRegistry.getAvailable();
-	const availableKeys = new Set(available.map((m) => `${m.provider}/${m.id}`));
-
-	const resolved: { spec: ModelSpec; model: Model }[] = [];
-	const missing: ModelSpec[] = [];
-	for (const spec of cfg.reviewers) {
-		if (!availableKeys.has(spec)) {
-			missing.push(spec);
-			continue;
-		}
-		const model = findModel(ctx, spec)!;
-		resolved.push({ spec, model });
-	}
-
-	if (resolved.length === 0) return null;
-	return { resolved, missing };
 }
 
 /**
@@ -362,7 +341,8 @@ function formatReviewerProgressLine(done: number, total: number, latest: Reviewe
 	const verdict = latest.ok ? "✓" : "✗";
 	const findings = latest.ok ? `${latest.findings.length} finding${latest.findings.length === 1 ? "" : "s"}` : (latest.errorMessage ?? "error");
 	const cost = latest.usage?.cost ? `, $${latest.usage.cost.toFixed(4)}` : "";
-	return `${verdict} ${shortSpec(latest.formattedSpec)} (${done}/${total}) — ${findings}, ${(latest.durationMs / 1000).toFixed(1)}s${cost}`;
+	const clamped = latest.clamped ? " [thinking clamped]" : "";
+	return `${verdict} ${shortSpec(latest.formattedSpec)}${clamped} (${done}/${total}) — ${findings}, ${(latest.durationMs / 1000).toFixed(1)}s${cost}`;
 }
 
 function createProgressReporter(ctx: ExtensionContext, mode: ReviewMode, onUpdate?: ToolUpdateFn): MultiReviewProgressReporter {
@@ -399,7 +379,10 @@ function createProgressReporter(ctx: ExtensionContext, mode: ReviewMode, onUpdat
 			clearTimeout(clearTimer);
 			clearTimer = undefined;
 		}
-		setStatus(`multi-review · mode=${mode} · ${state.phase}${state.done !== undefined && state.total !== undefined ? ` (${state.done}/${state.total})` : ""}`, ctx);
+		const statusLine = `multi-review · mode=${mode} · ${state.phase}${state.done !== undefined && state.total !== undefined ? ` (${state.done}/${state.total})` : ""}`;
+		// Print/RPC modes have no widget; this is the only way to watch a run there.
+		if (process.env.MULTI_REVIEW_DEBUG) console.error(`[${((Date.now() - startedAt) / 1000).toFixed(1)}s] ${statusLine}${state.latest ? ` · ${state.latest}` : ""}`);
+		setStatus(statusLine, ctx);
 		if (ctx.hasUI) {
 			ctx.ui.setWidget(PROGRESS_WIDGET_KEY, (_tui, theme) => ({
 				render: (width: number) => renderLines(theme, width),
@@ -422,11 +405,18 @@ function createProgressReporter(ctx: ExtensionContext, mode: ReviewMode, onUpdat
 			state = { ...state, phase: summary, latest: undefined };
 			publish();
 			clearTimer = setTimeout(() => this.clear(), 4000);
+			clearTimer.unref?.();
 		},
 		clear(): void {
 			if (clearTimer) clearTimeout(clearTimer);
 			clearTimer = undefined;
-			ctx.ui.setWidget(PROGRESS_WIDGET_KEY, undefined);
+			// Runs from a timer: the session may have been replaced/reloaded or
+			// pi may be exiting, and a stale-ctx throw here is uncaught (kills pi).
+			try {
+				ctx.ui.setWidget(PROGRESS_WIDGET_KEY, undefined);
+			} catch {
+				/* stale ctx — nothing left to clear */
+			}
 		},
 	};
 }
@@ -521,7 +511,7 @@ function summarizeDiff(diff: string): { files: { path: string; lines: number }[]
  *   2. `git fetch origin pull/<n>/head:pr-<n>` + `git diff` (works without gh)
  *   3. Refuse politely if both fail.
  */
-async function buildPrTarget(pi: ExtensionAPI, parsed: { number: number }, cwd: string): Promise<ReviewTarget> {
+async function buildPrTarget(pi: ExtensionAPI, parsed: { number: number; raw: string }, cwd: string): Promise<ReviewTarget> {
 	const target: ReviewTarget = {
 		kind: "pr",
 		label: `PR #${parsed.number}`,
@@ -533,9 +523,9 @@ async function buildPrTarget(pi: ExtensionAPI, parsed: { number: number }, cwd: 
 	};
 
 	// Try `gh` first.
+	// No `-q`: a jq projection prints raw strings, which JSON.parse can't read.
 	const ghView = await exec(pi, "gh", ["pr", "view", String(parsed.number), "--json",
-		"title,body,baseRefName,headRefName,url,files", "-q",
-		".title, .body, .baseRefName, .headRefName, .url, (.files | map(.path) | join(\",\"))"
+		"title,body,baseRefName,headRefName,url"
 	], cwd, 15_000);
 	if (ghView.code === 0 && ghView.stdout.trim()) {
 		try {
@@ -569,13 +559,18 @@ async function buildPrTarget(pi: ExtensionAPI, parsed: { number: number }, cwd: 
 		target.warnings.push(`git fetch origin pull/${parsed.number}/head failed (exit ${fetch.code}, stderr: ${fetch.stderr.slice(0, 200)})`);
 		return target;
 	}
-	const diff = await exec(pi, "git", ["diff", `${refName}...HEAD`], cwd, 30_000);
+	// The PR's changes are base...head. Prefer the remote default branch as the
+	// base; HEAD is only a last resort (it's whatever the user has checked out).
+	let base = "HEAD";
+	const originHead = await exec(pi, "git", ["rev-parse", "--abbrev-ref", "origin/HEAD"], cwd, 5_000);
+	if (originHead.code === 0 && originHead.stdout.trim()) base = originHead.stdout.trim();
+	const diff = await exec(pi, "git", ["diff", `${base}...${refName}`], cwd, 30_000);
 	if (diff.code !== 0) {
-		target.warnings.push(`git diff ${refName}...HEAD failed (exit ${diff.code}, stderr: ${diff.stderr.slice(0, 200)})`);
+		target.warnings.push(`git diff ${base}...${refName} failed (exit ${diff.code}, stderr: ${diff.stderr.slice(0, 200)})`);
 		return target;
 	}
 	target.diffText = diff.stdout;
-	target.metaLines.push(`(fallback: fetched origin/pull/${parsed.number}/head as ${refName})`);
+	target.metaLines.push(`(fallback: fetched origin/pull/${parsed.number}/head as ${refName}; diff ${base}...${refName})`);
 	target.files = summarizeDiff(diff.stdout).files;
 	return target;
 }
@@ -605,11 +600,13 @@ async function buildDefaultTarget(pi: ExtensionAPI, cwd: string): Promise<Review
 	}
 
 	for (const base of baseCandidates) {
-		const refExists = await exec(pi, "git", ["rev-parse", "--verify", base], cwd, 5_000);
-		if (refExists.code !== 0) continue;
-		const diff = await exec(pi, "git", ["diff", `${base}...HEAD`], cwd, 30_000);
+		const mergeBase = await exec(pi, "git", ["merge-base", base, "HEAD"], cwd, 5_000);
+		if (mergeBase.code !== 0 || !mergeBase.stdout.trim()) continue;
+		// Diff the working tree (not HEAD) against the merge-base so committed,
+		// staged, and unstaged changes are all in scope.
+		const diff = await exec(pi, "git", ["diff", mergeBase.stdout.trim()], cwd, 30_000);
 		if (diff.code === 0 && diff.stdout.trim()) {
-			target.label = `cwd diff vs ${base}`;
+			target.label = `cwd diff vs ${base} (incl. uncommitted)`;
 			target.metaLines.push(`branch: ${branch.stdout.trim() || "(unknown)"}`);
 			target.metaLines.push(`base: ${base}`);
 			target.diffText = diff.stdout;
@@ -619,7 +616,8 @@ async function buildDefaultTarget(pi: ExtensionAPI, cwd: string): Promise<Review
 	}
 
 	// Step 2: last commit's diff (works in shallow/no-upstream setups).
-	const last = await exec(pi, "git", ["show", "--unified=3", "HEAD", "--stat"], cwd, 15_000);
+	// `--stat` alone would replace the patch with a summary; `--patch` keeps both.
+	const last = await exec(pi, "git", ["show", "--unified=3", "--stat", "--patch", "HEAD"], cwd, 15_000);
 	if (last.code === 0 && last.stdout.trim()) {
 		target.label = "last commit (HEAD)";
 		target.metaLines.push(`branch: ${branch.stdout.trim() || "(unknown)"}`);
@@ -1017,6 +1015,12 @@ Rules:
  * full diff.
  */
 const DIFF_BUDGET_CHARS = 200_000; // ~50k tokens worst case
+function budgetDiff(diffText: string): string {
+	if (diffText.length <= DIFF_BUDGET_CHARS) return diffText;
+	return diffText.slice(0, DIFF_BUDGET_CHARS) +
+		`\n…(diff truncated to ${DIFF_BUDGET_CHARS} chars; ${diffText.length} total)\n`;
+}
+
 function buildReviewUserPrompt(target: ReviewTarget): string {
 	const chunks: string[] = [];
 	if (target.metaLines.length > 0) {
@@ -1025,12 +1029,8 @@ function buildReviewUserPrompt(target: ReviewTarget): string {
 		chunks.push("");
 	}
 	if (target.diffText) {
-		const diff = target.diffText.length > DIFF_BUDGET_CHARS
-			? target.diffText.slice(0, DIFF_BUDGET_CHARS) +
-				`\n…(diff truncated to ${DIFF_BUDGET_CHARS} chars; ${target.diffText.length} total)\n`
-			: target.diffText;
 		chunks.push("## Diff");
-		chunks.push(diff);
+		chunks.push(budgetDiff(target.diffText));
 		chunks.push("");
 	} else if (target.files.length > 0) {
 		chunks.push("## Files in scope (no diff; review at the file level)");
@@ -1056,13 +1056,18 @@ function parseReviewerJson(rawText: string): ReviewerFinding[] {
 	// Strip leading/trailing fences if present.
 	const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
 	const inner = fenceMatch ? fenceMatch[1] : text;
-	// Find first '[' and last ']' to ignore any wrapper text.
+	// Find first '[' and last ']' to ignore any wrapper text. A reply with no
+	// array at all is a protocol failure, not "no findings" — only an explicit
+	// [] means clean.
 	const start = inner.indexOf("[");
 	const end = inner.lastIndexOf("]");
-	if (start === -1 || end === -1 || end <= start) return [];
-	const slice = inner.slice(start, end + 1);
-	const parsed = JSON.parse(slice);
-	if (!Array.isArray(parsed)) return [];
+	if (start === -1 || end === -1 || end <= start) {
+		throw new Error(`no JSON array in reply: ${JSON.stringify(text.slice(0, 120))}`);
+	}
+	let parsed = JSON.parse(inner.slice(start, end + 1));
+	// Tolerate {"findings": [...]} wrappers some models emit despite the schema.
+	if (!Array.isArray(parsed) && Array.isArray(parsed?.findings)) parsed = parsed.findings;
+	if (!Array.isArray(parsed)) throw new Error("reply JSON is not an array");
 	const findings: ReviewerFinding[] = [];
 	for (const item of parsed) {
 		if (!item || typeof item !== "object") continue;
@@ -1083,6 +1088,88 @@ function parseReviewerJson(rawText: string): ReviewerFinding[] {
 	return findings;
 }
 
+interface ModelCallResult {
+	text: string;
+	stopReason: string;
+	/** Set when the call failed outright (auth, HTTP, abort) or was truncated. */
+	errorMessage?: string;
+	usage?: { input: number; output: number; total: number; cost: number };
+	durationMs: number;
+}
+
+/**
+ * Single choke point for every nested model call.
+ *
+ *  - Goes through ctx.modelRegistry so request-time auth from models.json
+ *    (literal apiKey + custom headers) is applied. The compat
+ *    `completeSimple` only reads env-var keys, so gateway-configured models
+ *    fail auth through it.
+ *  - The registry resolves (never rejects) on provider failure, with
+ *    stopReason "error"/"aborted". Those are surfaced as errorMessage so a
+ *    failed reviewer can't masquerade as a clean "no findings" review.
+ *  - Temperature is dropped when reasoning is on: reasoning endpoints
+ *    (OpenAI responses, Anthropic thinking) reject or ignore it.
+ *  - maxTokens defaults high because reasoning tokens count against it on
+ *    several providers; a 4k cap truncates xhigh reviewers to nothing.
+ */
+const DEFAULT_MAX_OUTPUT_TOKENS = 32_000;
+
+async function callModel(
+	ctx: ExtensionContext,
+	model: Model,
+	systemPrompt: string,
+	userPrompt: string,
+	opts: { thinking: ThinkingLevelAlias; temperature: number; signal: AbortSignal | undefined; maxTokens?: number },
+): Promise<ModelCallResult> {
+	const started = Date.now();
+	const reasoning = model.reasoning && opts.thinking !== "off" ? opts.thinking : undefined;
+	const maxTokens = Math.min(opts.maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS, model.maxTokens || DEFAULT_MAX_OUTPUT_TOKENS);
+	try {
+		const response = await ctx.modelRegistry
+			.streamSimple(
+				model,
+				{ systemPrompt, messages: [{ role: "user", content: [{ type: "text", text: userPrompt }], timestamp: Date.now() }] },
+				{
+					signal: opts.signal,
+					maxTokens,
+					...(reasoning !== undefined ? { reasoning } : { temperature: opts.temperature }),
+				},
+			)
+			.result();
+		const text = response.content
+			.filter((c) => c.type === "text")
+			.map((c) => (c as { type: "text"; text: string }).text)
+			.join("");
+		let errorMessage: string | undefined;
+		if (response.stopReason === "error" || response.stopReason === "aborted") {
+			errorMessage = `${response.stopReason}: ${response.errorMessage ?? "(no message)"}`;
+		} else if (response.stopReason === "length" && !text.trim()) {
+			errorMessage = `truncated: hit maxTokens=${maxTokens} before producing output (reasoning budget exhausted?)`;
+		}
+		return {
+			text,
+			stopReason: response.stopReason,
+			errorMessage,
+			usage: response.usage
+				? {
+					input: response.usage.input,
+					output: response.usage.output,
+					total: response.usage.totalTokens,
+					cost: response.usage.cost?.total ?? 0,
+				}
+				: undefined,
+			durationMs: Date.now() - started,
+		};
+	} catch (err) {
+		return {
+			text: "",
+			stopReason: "error",
+			errorMessage: err instanceof Error ? err.message : String(err),
+			durationMs: Date.now() - started,
+		};
+	}
+}
+
 async function runReviewer(
 	model: Model,
 	reviewerSpec: ReviewerSpec,
@@ -1091,53 +1178,56 @@ async function runReviewer(
 	userPrompt: string,
 	temperature: number,
 	abortSignal: AbortSignal | undefined,
+	parse: (text: string) => ReviewerFinding[] = parseReviewerJson,
 ): Promise<Omit<ReviewerRunResult, "formattedSpec" | "spec" | "thinking" | "clamped">> {
-	const started = Date.now();
-	const { completeSimple } = await import("@mariozechner/pi-ai");
-	const reasoning = reasoningForRequest(reviewerSpec, model);
-	const response = await completeSimple(
-		model,
-		{ systemPrompt, messages: [{ role: "user", content: [{ type: "text", text: userPrompt }] }] },
-		{
-			signal: abortSignal,
-			temperature,
-			maxTokens: 4096,
-			...(reasoning !== undefined ? { reasoning } : {}),
-		},
-	);
-	const text = response.content
-		.filter((c) => c.type === "text")
-		.map((c) => (c as { type: "text"; text: string }).text)
-		.join("");
+	const call = await callModel(ctx, model, systemPrompt, userPrompt, {
+		thinking: reviewerSpec.thinking,
+		temperature,
+		signal: abortSignal,
+	});
 	let findings: ReviewerFinding[] = [];
-	let ok = true;
-	let errorMessage: string | undefined;
-	try {
-		findings = parseReviewerJson(text);
-	} catch (err) {
-		ok = false;
-		errorMessage = `json-parse: ${err instanceof Error ? err.message : String(err)}`;
+	let errorMessage = call.errorMessage;
+	if (!errorMessage) {
+		try {
+			findings = parse(call.text);
+		} catch (err) {
+			const truncated = call.stopReason === "length" ? " (output truncated at maxTokens)" : "";
+			errorMessage = `json-parse${truncated}: ${err instanceof Error ? err.message : String(err)}`;
+		}
 	}
 	return {
 		model,
-		ok,
+		ok: errorMessage === undefined,
 		findings,
-		rawText: text,
-		stopReason: response.stopReason,
+		rawText: call.text,
+		stopReason: call.stopReason,
 		errorMessage,
-		usage: response.usage
-			? {
-				input: response.usage.input,
-				output: response.usage.output,
-				total: response.usage.totalTokens,
-				cost: response.usage.cost?.total ?? 0,
-			}
-			: undefined,
-		durationMs: Date.now() - started,
+		usage: call.usage,
+		durationMs: call.durationMs,
 	};
 }
 
 const MAX_PARALLEL = 16;
+
+/** Workers bail early on abort, leaving holes in result arrays; never let those flow downstream. */
+function throwIfAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw new Error("multi-review aborted");
+}
+
+/**
+ * When no reviewer produced usable output, the run has no signal at all —
+ * report the failures instead of publishing an empty "clean" review.
+ */
+function allReviewersFailedResult(runs: ReviewerRunResult[], mode: ReviewMode): MultiReviewRunResult | null {
+	if (runs.length === 0 || runs.some((r) => r.ok)) return null;
+	return {
+		kind: "notify",
+		notifyMessage:
+			`multi-review · mode=${mode} · all ${runs.length} reviewers failed — no review produced:\n` +
+			runs.map((r) => `  ✗ ${r.formattedSpec}: ${r.errorMessage?.slice(0, 200) ?? "unknown error"}`).join("\n"),
+		notifyLevel: "error",
+	};
+}
 
 /**
  * Run every reviewer model against the same prompt with a concurrency cap.
@@ -1203,6 +1293,7 @@ async function runAllReviewers(
 	};
 
 	await Promise.all(Array.from({ length: cap }, () => worker()));
+	throwIfAborted(abortSignal);
 	return results;
 }
 
@@ -1226,108 +1317,100 @@ export interface DedupeGroup {
 	category: string;
 	title: string;
 	titles: string[]; // every distinct title model used
-	members: { spec: ModelSpec; comment: string; severity: ReviewerFinding["severity"] }[];
+	members: { spec: ModelSpec; comment: string; severity: ReviewerFinding["severity"]; line_start: number | null; line_end: number | null }[];
 	reviewerSpecs: ModelSpec[]; // unique specs that flagged this group
 	consensus: boolean; // ≥ 2 distinct reviewers
 }
 
-function isOverlapping(a: ReviewerFinding, b: ReviewerFinding): boolean {
-	if (a.file !== b.file) return false;
-	if (a.line_start === null || a.line_end === null || b.line_start === null || b.line_end === null) return true;
-	const aStart = a.line_start <= a.line_end ? a.line_start : a.line_end;
-	const aEnd = a.line_start <= a.line_end ? a.line_end : a.line_start;
-	const bStart = b.line_start <= b.line_end ? b.line_start : b.line_end;
-	const bEnd = b.line_start <= b.line_end ? b.line_end : b.line_start;
-	return aStart <= bEnd && bStart <= aEnd;
+/** Models cite slightly different lines for the same issue; allow this much slack. */
+const LINE_MATCH_SLACK = 3;
+
+function normalizedRange(start: number | null, end: number | null): [number, number] | null {
+	if (start === null && end === null) return null;
+	const a = start ?? end!;
+	const b = end ?? start!;
+	return a <= b ? [a, b] : [b, a];
+}
+
+/**
+ * Same file AND either both file-level, or line ranges within LINE_MATCH_SLACK.
+ * A file-level finding never matches a line-anchored one: otherwise one vague
+ * "this file has issues" comment absorbs every finding in the file and
+ * manufactures consensus.
+ */
+function groupAccepts(group: DedupeGroup, f: ReviewerFinding): boolean {
+	if (group.file !== f.file) return false;
+	const g = normalizedRange(group.line_start, group.line_end);
+	const r = normalizedRange(f.line_start, f.line_end);
+	if (g === null || r === null) return g === r;
+	return r[0] <= g[1] + LINE_MATCH_SLACK && g[0] <= r[1] + LINE_MATCH_SLACK;
 }
 
 /**
  * Greedy O(N²) dedupe. N is small (a few dozen findings per reviewer ×
  * a handful of reviewers), so the quadratic cost is fine and the simple
- * match predicate is easier to audit than a hash-based strategy. The
- * predicate permits same-file matches to overlap (line ranges touch) and
- * also short-circuits to "same file" when either side is file-level
- * (line_start === null).
+ * match predicate is easier to audit than a hash-based strategy.
+ *
+ * Each reviewer contributes at most one finding per group: two findings
+ * from the same model at nearby lines are that model saying "these are
+ * different issues", so they stay separate. Group ranges widen to the
+ * union of their members.
  */
 export function dedupeReviewerFindings(results: ReviewerRunResult[]): DedupeGroup[] {
-	const placed = new Set<string>();
-	const allFindings: { spec: ModelSpec; index: number; finding: ReviewerFinding }[] = [];
-	for (const r of results) {
-		if (!r.ok) continue;
-		r.findings.forEach((finding, index) => {
-			allFindings.push({ spec: r.spec, index, finding });
-		});
-	}
-
 	const groups: DedupeGroup[] = [];
-	for (const { spec, index, finding } of allFindings) {
-		const key = `${spec}::${index}`;
-		if (placed.has(key)) continue;
-
-		const group: DedupeGroup = {
-			id: `g${groups.length + 1}`,
-			file: finding.file,
-			line_start: finding.line_start,
-			line_end: finding.line_end,
-			severity: finding.severity,
-			category: finding.category,
-			title: finding.title,
-			titles: [finding.title],
-			members: [{ spec, comment: finding.comment, severity: finding.severity }],
-			reviewerSpecs: [spec],
-			consensus: false,
-		};
-		placed.add(key);
-
-		// Fuse with anything overlapping from later reviewers.
-		for (let j = allFindings.indexOf({ spec, index, finding }) + 1; j < allFindings.length; j++) {
-			const jt = allFindings[j];
-			if (placed.has(`${jt.spec}::${jt.index}`)) continue;
-			if (!isOverlapping(finding, jt.finding)) continue;
-			// Already in? Skip.
-			if (group.reviewerSpecs.includes(jt.spec)) {
-				// Same reviewer reporting the same area twice — fuse but don't double-count.
-				group.members.push({ spec: jt.spec, comment: jt.finding.comment, severity: jt.finding.severity });
-				if (!group.titles.includes(jt.finding.title)) group.titles.push(jt.finding.title);
-				if (SEVERITY_RANK[jt.finding.severity] > SEVERITY_RANK[group.severity]) {
-					group.severity = jt.finding.severity;
-				}
-				placed.add(`${jt.spec}::${jt.index}`);
+	for (const r of results) {
+		if (!r?.ok) continue;
+		for (const finding of r.findings) {
+			const member = {
+				spec: r.spec,
+				comment: finding.comment,
+				severity: finding.severity,
+				line_start: finding.line_start,
+				line_end: finding.line_end,
+			};
+			const group = groups.find((g) => !g.reviewerSpecs.includes(r.spec) && groupAccepts(g, finding));
+			if (!group) {
+				groups.push({
+					id: "",
+					file: finding.file,
+					line_start: finding.line_start,
+					line_end: finding.line_end,
+					severity: finding.severity,
+					category: finding.category,
+					title: finding.title,
+					titles: [finding.title],
+					members: [member],
+					reviewerSpecs: [r.spec],
+					consensus: false,
+				});
 				continue;
 			}
-			group.members.push({ spec: jt.spec, comment: jt.finding.comment, severity: jt.finding.severity });
-			group.reviewerSpecs.push(jt.spec);
-			if (!group.titles.includes(jt.finding.title)) group.titles.push(jt.finding.title);
-			if (SEVERITY_RANK[jt.finding.severity] > SEVERITY_RANK[group.severity]) {
-				group.severity = jt.finding.severity;
+			group.members.push(member);
+			group.reviewerSpecs.push(r.spec);
+			group.consensus = true;
+			if (!group.titles.includes(finding.title)) group.titles.push(finding.title);
+			if (SEVERITY_RANK[finding.severity] > SEVERITY_RANK[group.severity]) group.severity = finding.severity;
+			const g = normalizedRange(group.line_start, group.line_end);
+			const f = normalizedRange(finding.line_start, finding.line_end);
+			if (g && f) {
+				group.line_start = Math.min(g[0], f[0]);
+				group.line_end = Math.max(g[1], f[1]);
 			}
-			placed.add(`${jt.spec}::${jt.index}`);
 		}
-
-		group.consensus = group.reviewerSpecs.length >= 2;
-		// Line ranges — expand to cover all member ranges if previously null.
-		if (group.line_start === null || group.line_end === null) {
-			let minStart: number | null = null;
-			let maxEnd: number | null = null;
-			for (const m of group.members) {
-				// re-extract from the allFindings list; a small downside is that we
-				// don't carry line_start/line_end on the group member so this stays
-				// best-effort. For file-level entries, leaving null is correct.
-			}
-			group.line_start = minStart;
-			group.line_end = maxEnd;
-		}
-		groups.push(group);
 	}
 
-	// Sort by severity desc, then file, then line_start.
+	// Sort by severity desc, consensus first, then file, then line_start.
 	groups.sort((a, b) => {
 		const s = SEVERITY_RANK[b.severity] - SEVERITY_RANK[a.severity];
 		if (s !== 0) return s;
+		const c = b.reviewerSpecs.length - a.reviewerSpecs.length;
+		if (c !== 0) return c;
 		const f = a.file.localeCompare(b.file);
 		if (f !== 0) return f;
 		return (a.line_start ?? -1) - (b.line_start ?? -1);
 	});
+	// Ids follow display order so council/judge references read naturally.
+	groups.forEach((g, i) => { g.id = `g${i + 1}`; });
 	return groups;
 }
 
@@ -1338,12 +1421,6 @@ function formatRange(start: number | null, end: number | null): string {
 	return `L${start}-${end}`;
 }
 
-function formatGroup(g: DedupeGroup): string {
-	const badge = g.consensus ? `[CONSENSUS ×${g.reviewerSpecs.length}]` : `[×${g.reviewerSpecs.length}]`;
-	const range = formatRange(g.line_start, g.line_end);
-	return `${badge.padEnd(20)} ${g.severity.toUpperCase().padEnd(8)} ${g.file}:${range}  ${g.title}`;
-}
-
 // ---------- judge pass ----------
 
 /**
@@ -1352,14 +1429,14 @@ function formatGroup(g: DedupeGroup): string {
  * where each finding carries an attribution strip — that's the
  * 'per-model labels preserved' requirement from the design.
  */
-const JUDGE_SYSTEM_PROMPT = `You are a senior engineering lead synthesizing multiple code reviews. You receive a structured adjudication tree — do NOT invent or remove findings; rewrite them.
+const JUDGE_SYSTEM_PROMPT = `You are a senior engineering lead adjudicating multiple independent code reviews. You receive the deduplicated findings with every per-reviewer comment, plus the diff they reviewed. Your job is to decide which findings are real — reviewers hallucinate, misread hunks, and flag pre-existing code.
 
 Output a markdown document with this exact shape:
 
 # Multi-Model Code Review
 
 ## Summary
-Two- to four-sentence overall assessment, then a one-line "Top risks" list ordered by severity.
+Two- to four-sentence overall assessment, then a one-line "Top risks" list ordered by severity (confirmed findings only).
 
 ## Findings
 For each finding, in the order provided, write:
@@ -1367,23 +1444,21 @@ For each finding, in the order provided, write:
 ### <severity> · <title>
 - **File:** <path>:<lines> (or "file" if line numbers null)
 - **Category:** <category>
-- **Consensus:** <reviewer-count> reviewers: <comma-separated list>
-- **Comments:**
-  - <spec 1>: <comment 1>
-  - <spec 2>: <comment 2>
-  - …
+- **Raised by:** <reviewer-count> — <comma-separated short model names>
+- **Verdict:** confirmed | plausible | false positive — <one sentence citing the specific diff lines that support or refute it>
+- **Judge's take:** <one or two sentences: mechanics, root cause, or a concrete fix>
 
-End each finding with a sub-bullet:
-  - **Judge's take:** <one sentence; explain mechanics, root cause, or suggest a concrete fix.>
+When reviewers frame the same finding differently, say so in the take — do not silently pick one.
 
 After the findings, if any models errored or produced unparseable output, add a final '## Coverage' section listing missing reviewers.
 
 Rules:
-- Never merge findings the user didn't ask to merge.
-- Keep each finding ≤ 80 words (excluding the per-model comments list).
+- Keep every finding in the output (mark false positives, never delete them). Do not invent new findings.
+- Verify against the diff. A finding about code the diff doesn't touch is at most "plausible" unless the diff clearly breaks it.
+- You may adjust the displayed severity by one step when the evidence warrants; note the change in the take.
+- Keep each finding ≤ 90 words. Do not paste reviewer comments verbatim; they are shown separately.
 - Use file paths exactly as given — do not rewrite to absolute paths.
-- Severity ladder is critical > high > medium > low > info > none.
-- If two reviewers disagree in framing, surface both — do not pick one.`;
+- Severity ladder is critical > high > medium > low > info > none.`;
 
 interface JudgeResult {
 	markdown: string;
@@ -1428,6 +1503,11 @@ function renderGroupsForJudge(target: ReviewTarget, groups: DedupeGroup[]): stri
 			}
 		}
 	}
+	if (target.diffText) {
+		lines.push("");
+		lines.push("## Diff under review");
+		lines.push(budgetDiff(target.diffText));
+	}
 	return lines.join("\n");
 }
 
@@ -1453,7 +1533,7 @@ function synthesizeNoFindingsMarkdown(target: ReviewTarget, reviewerRuns: Review
 	lines.push("## Reviewer coverage");
 	for (const r of reviewerRuns) {
 		const status = r.ok ? "ok" : `failed: ${r.errorMessage?.slice(0, 160) ?? "unknown"}`;
-		lines.push(`- \`${r.formattedSpec}\` — ${status}; ${(r.durationMs / 1000).toFixed(1)}s`);
+		lines.push(`- \`${r.formattedSpec}\`${r.clamped ? " (thinking clamped by provider)" : ""} — ${status}; ${(r.durationMs / 1000).toFixed(1)}s`);
 	}
 	if (failed.length > 0) {
 		lines.push("");
@@ -1598,7 +1678,7 @@ async function runTriageFanOut(
 			if (idx >= resolved.length) return;
 			const slot = resolved[idx];
 			try {
-				const r = await runReviewer(slot.model, slot.rs, ctx, TRIAGE_REVIEWER_SYSTEM_PROMPT, userPrompt, temperature, abortSignal);
+				const r = await runReviewer(slot.model, slot.rs, ctx, TRIAGE_REVIEWER_SYSTEM_PROMPT, userPrompt, temperature, abortSignal, () => []);
 				const full: ReviewerRunResult = {
 					formattedSpec: formatReviewerSpec(slot.rs),
 					spec: slot.rs.spec,
@@ -1639,6 +1719,7 @@ async function runTriageFanOut(
 		}
 	};
 	await Promise.all(Array.from({ length: cap }, () => worker()));
+	throwIfAborted(abortSignal);
 
 	let escalateCount = 0;
 	const fileSet = new Set<string>();
@@ -2078,6 +2159,7 @@ async function runCouncilRound2FanOut(
 	groups: DedupeGroup[],
 	r1Runs: ReviewerRunResult[],
 	concurrency: number,
+	temperature: number,
 	signal: AbortSignal | undefined,
 	ctx: ExtensionContext,
 	onProgress?: (done: number, total: number, latest: ReviewerRunResult) => void,
@@ -2097,7 +2179,7 @@ async function runCouncilRound2FanOut(
 			const myAlias = aliases.get(idx)!;
 			const r2UserPrompt = buildCouncilRound2Prompt(groups, r1Runs, aliases, idx, myAlias);
 			try {
-				const r = await runReviewer(slot.model, slot.rs, ctx, COUNCIL_R2_SYSTEM_PROMPT, r2UserPrompt, /*temp*/ 0.2, signal);
+				const r = await runReviewer(slot.model, slot.rs, ctx, COUNCIL_R2_SYSTEM_PROMPT, r2UserPrompt, temperature, signal, () => []);
 				const full: ReviewerRunResult = {
 					formattedSpec: formatReviewerSpec(slot.rs),
 					spec: slot.rs.spec,
@@ -2138,11 +2220,12 @@ async function runCouncilRound2FanOut(
 		}
 	};
 	await Promise.all(Array.from({ length: cap }, () => worker()));
+	throwIfAborted(signal);
 	return r2Results;
 }
 
 /**
- * Council judge call. Single completeSimple per round; only invoked when
+ * Council judge call. Single model call per round; only invoked when
  * there's at least one disputed finding (otherwise we skip runtime cost).
  */
 async function runCouncilJudge(
@@ -2153,24 +2236,17 @@ async function runCouncilJudge(
 	r2Results: Array<{ run: ReviewerRunResult; verdicts: Map<string, CouncilVerdict> }>,
 	signal: AbortSignal | undefined,
 	temperature: number,
+	thinking: ThinkingLevelAlias,
+	ctx: ExtensionContext,
 ): Promise<{ decisions: Map<string, CouncilDecision>; durationMs: number; errorMessage?: string }> {
-	const started = Date.now();
-	const { completeSimple } = await import("@mariozechner/pi-ai");
 	const judgeUserPrompt = buildCouncilJudgePrompt(groups, r1Runs, aliases, r2Results);
-	const response = await completeSimple(
-		judge,
-		{ systemPrompt: COUNCIL_JUDGE_SYSTEM_PROMPT, messages: [{ role: "user", content: [{ type: "text", text: judgeUserPrompt }] }] },
-		{ signal, temperature, maxTokens: 8192 },
-	);
-	const text = response.content
-		.filter((c) => c.type === "text")
-		.map((c) => (c as { type: "text"; text: string }).text)
-		.join("");
+	const call = await callModel(ctx, judge, COUNCIL_JUDGE_SYSTEM_PROMPT, judgeUserPrompt, { thinking, temperature, signal });
+	if (call.errorMessage) return { decisions: new Map(), durationMs: call.durationMs, errorMessage: call.errorMessage };
 	const expectedIds = new Set(groups.map((g) => g.id));
-	const parsed = parseCouncilJson(text, expectedIds);
+	const parsed = parseCouncilJson(call.text, expectedIds);
 	return {
 		decisions: parsed.decisions,
-		durationMs: Date.now() - started,
+		durationMs: call.durationMs,
 		errorMessage: parsed.ok ? undefined : parsed.errorMessage,
 	};
 }
@@ -2183,38 +2259,20 @@ async function runJudge(
 	ctx: ExtensionContext,
 	abortSignal: AbortSignal | undefined,
 	temperature: number,
+	thinking: ThinkingLevelAlias,
 ): Promise<JudgeResult> {
-	const started = Date.now();
-	const { completeSimple } = await import("@mariozechner/pi-ai");
-
 	const groupsPayload = renderGroupsForJudge(target, groups);
 	const coverage = failedSpecs.length > 0
 		? `, missing: ${failedSpecs.join(", ")}`
 		: "";
 	const userPrompt = `${groupsPayload}\n\n## Coverage notes\nReviewers that didn't return usable output: ${failedSpecs.length}${coverage}\n\nNow produce the markdown per the schema in the system prompt. Output ONLY markdown — no preamble, no "Here's the review:" opener.`;
-
-	const response = await completeSimple(
-		judgeModel,
-		{ systemPrompt: JUDGE_SYSTEM_PROMPT, messages: [{ role: "user", content: [{ type: "text", text: userPrompt }] }] },
-		{ signal: abortSignal, temperature, maxTokens: 8192 },
-	);
-	const text = response.content
-		.filter((c) => c.type === "text")
-		.map((c) => (c as { type: "text"; text: string }).text)
-		.join("");
+	const call = await callModel(ctx, judgeModel, JUDGE_SYSTEM_PROMPT, userPrompt, { thinking, temperature, signal: abortSignal });
 	return {
-		markdown: text,
-		stopReason: response.stopReason,
-		errorMessage: response.errorMessage,
-		usage: response.usage
-			? {
-				input: response.usage.input,
-				output: response.usage.output,
-				total: response.usage.totalTokens,
-				cost: response.usage.cost?.total ?? 0,
-			}
-			: undefined,
-		durationMs: Date.now() - started,
+		markdown: call.errorMessage ? "" : call.text,
+		stopReason: call.stopReason,
+		errorMessage: call.errorMessage,
+		usage: call.usage,
+		durationMs: call.durationMs,
 	};
 }
 
@@ -2230,7 +2288,7 @@ export interface MultiReviewDetails {
 	groups: DedupeGroup[];
 	reviewerSpecs: ModelSpec[];
 	failedSpecs: ModelSpec[];
-	judge: ModelSpec;
+	judge: string;
 	judgeDurationMs: number;
 	judgeUsage?: { input: number; output: number; total: number; cost: number };
 	consensusCount: number;
@@ -2664,8 +2722,8 @@ async function runMultiReviewFromArgs(
 			notifyMessage:
 				"multi-review: no reviewers configured.\n\n" +
 				`Drop a "$PI_CODING_AGENT_DIR/multi-review.json" like:\n` +
-				`  { "reviewers": ["fireworks/.../model-a", "fireworks/.../model-b"], "judge": "fireworks/.../judge" }\n` +
-				`Or with per-reviewer thinking: "fireworks/.../model-a@xhigh"\n` +
+				`  { "reviewers": ["amd-gateway/gpt-6-astra", "amd-gateway/Grok-4.7"], "judge": "amd-gateway-anthropic/Claude-Opus-5.5" }\n` +
+				`Or with per-reviewer thinking: "amd-gateway/gpt-6-astra@xhigh"\n` +
 				`Then /reload.\n\nArgs: ${rawArgs.trim() || "(none)"}`,
 			notifyLevel: "warning",
 		};
@@ -2760,6 +2818,8 @@ async function runBalancedPipeline(
 		ctx,
 		(done, total, latest) => progress?.update({ phase: "reviewers running", done, total, latest: formatReviewerProgressLine(done, total, latest) }),
 	);
+	const balancedFailure = allReviewersFailedResult(completedRunResults, "balanced");
+	if (balancedFailure) return balancedFailure;
 	progress?.update({ phase: "dedupe pass", done: resolved.length, total: resolved.length });
 	setStatus(`multi-review · dedupe pass`, ctx);
 	const groups = dedupeReviewerFindings(completedRunResults);
@@ -2778,7 +2838,7 @@ async function runBalancedPipeline(
 	} else {
 		setStatus(`multi-review · ${groups.length} groups · invoking judge ${cfg.judge}`, ctx);
 		progress?.update({ phase: `${groups.length} groups · invoking judge ${shortSpec(cfg.judge)}`, done: undefined, total: undefined });
-		judgeResult = await runJudge(judge, groups, target, failedSpecs, ctx, signal, cfg.temperature);
+		judgeResult = await runJudge(judge, groups, target, failedSpecs, ctx, signal, cfg.temperature, cfg.judgeThinking);
 		if (!judgeResult.markdown.trim()) {
 			judgeResult = {
 				...judgeResult,
@@ -2846,6 +2906,8 @@ async function runLightPipeline(
 		ctx,
 		(done, total, latest) => progress?.update({ phase: "reviewers running", done, total, latest: formatReviewerProgressLine(done, total, latest) }),
 	);
+	const lightFailure = allReviewersFailedResult(completedRunResults, "light");
+	if (lightFailure) return lightFailure;
 	progress?.update({ phase: "dedupe pass (no judge)", done: resolved.length, total: resolved.length });
 	setStatus(`multi-review · mode=light · dedupe pass (no judge)`, ctx);
 	const groups = dedupeReviewerFindings(completedRunResults);
@@ -2926,6 +2988,8 @@ async function runCouncilPipeline(
 		ctx,
 		(done, total, latest) => progress?.update({ phase: "council round 1", done, total, latest: formatReviewerProgressLine(done, total, latest) }),
 	);
+	const councilFailure = allReviewersFailedResult(r1Runs, "council");
+	if (councilFailure) return councilFailure;
 	progress?.update({ phase: "council dedupe pass", done: resolved.length, total: resolved.length });
 	setStatus(`multi-review · mode=council · dedupe pass`, ctx);
 	const groups = dedupeReviewerFindings(r1Runs);
@@ -2942,6 +3006,7 @@ async function runCouncilPipeline(
 			groups,
 			r1Runs,
 			cfg.concurrency,
+			cfg.temperature,
 			signal,
 			ctx,
 			(done, total, latest) => progress?.update({ phase: "council round 2", done, total, latest: formatReviewerProgressLine(done, total, latest) }),
@@ -2952,7 +3017,7 @@ async function runCouncilPipeline(
 		setStatus(`multi-review · mode=council · ${disputedIds.length} disputed of ${recaps.length}`, ctx);
 		if (disputedIds.length > 0) {
 			progress?.update({ phase: `${disputedIds.length} disputes · invoking judge ${shortSpec(cfg.judge)}`, done: undefined, total: undefined });
-			judgeResult = await runCouncilJudge(judge, groups, r1Runs, aliases, r2Results, signal, cfg.temperature);
+			judgeResult = await runCouncilJudge(judge, groups, r1Runs, aliases, r2Results, signal, cfg.temperature, cfg.judgeThinking, ctx);
 			setStatus(`multi-review · mode=council · judge deliberated (${(judgeResult.durationMs / 1000).toFixed(1)}s)`, ctx);
 		}
 
@@ -2989,6 +3054,7 @@ async function runCouncilPipeline(
 				`round 1: ${r1Runs.length} reviewers (${(r1Runs.reduce((s, r) => s + r.durationMs, 0) / 1000).toFixed(1)}s)` +
 				`\nround 2: ${r2Results.length} reviewers (${(r2DurationMs / 1000).toFixed(1)}s)` +
 				(disputed > 0 ? `\njudge: ${cfg.judge} (${(judgeResult.durationMs / 1000).toFixed(1)}s, ${disputed} dispute${disputed === 1 ? "" : "s"})` : `\njudge: skipped (no disputes)`) +
+				(judgeResult.errorMessage ? `\njudge error (disputes left at original severity): ${judgeResult.errorMessage.slice(0, 200)}` : "") +
 				(totalCost > 0 ? `   $${totalCost.toFixed(4)}` : "") + `\n` +
 				`recap: ${unanimous} unanimous · ${disputed} disputed.\n` +
 				`Press Ctrl+O to expand per-model attribution + council decisions.`,
@@ -3060,6 +3126,8 @@ async function runTriagePipeline(
 		(done, total, latest) => progress?.update({ phase: "triage reviewers", done, total, latest: formatReviewerProgressLine(done, total, latest) }),
 	);
 
+	const triageFailure = allReviewersFailedResult(triage.reviewerRuns, "triage");
+	if (triageFailure) return triageFailure;
 	const thresholdMet = triage.escalateCount >= cfg.triageEscalationThreshold;
 	const escalatedFiles = triage.escalatedFiles;
 
@@ -3192,7 +3260,7 @@ export default function (pi: ExtensionAPI) {
 					if (persist) {
 						const result = persistReviewerChoices(picked);
 						if (result.ok) {
-							ctx.ui.notify(`multi-review · saved ${picked.length} reviewers to ${result.path}`, "success");
+							ctx.ui.notify(`multi-review · saved ${picked.length} reviewers to ${result.path}`, "info");
 							cacheConfigForFreshRead();
 						} else {
 							ctx.ui.notify(`multi-review · could not save (${result.error}); proceeding for this run only`, "warning");
@@ -3276,7 +3344,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const result = persistReviewerChoices(picked);
 			if (result.ok) {
-				ctx.ui.notify(`multi-review-pick · saved ${picked.length} reviewers to ${result.path}`, "success");
+				ctx.ui.notify(`multi-review-pick · saved ${picked.length} reviewers to ${result.path}`, "info");
 				cacheConfigForFreshRead();
 			} else {
 				ctx.ui.notify(`multi-review-pick · save failed: ${result.error}`, "error");
