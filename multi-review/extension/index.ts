@@ -1131,6 +1131,16 @@ export interface ReviewerFinding {
 	comment: string;
 	/** Title + core comment (no evidence/suggestion), used for dedupe matching. */
 	match_text?: string;
+	/** Structured parts of `comment` (which keeps them merged for display/judge). */
+	parts?: FindingParts;
+}
+
+export interface FindingParts {
+	core: string;
+	evidence?: string;
+	/** Concrete trigger → observed vs expected; makes the finding test-ready. */
+	repro?: string;
+	suggestion?: string;
 }
 
 export interface ReviewerRunResult {
@@ -1172,6 +1182,7 @@ Output ONLY a JSON array:
     "title": "<≤80 chars>",
     "comment": "<what is wrong, ≤400 chars>",
     "evidence": "<the execution path / spec clause / lines that prove it, ≤400 chars>",
+    "repro": "<concrete trigger → observed vs expected, e.g. \"set('k', v, 1000), get('k') at t+500ms → undefined; expected v\". Omit only for pure design/docs findings. ≤300 chars>",
     "suggestion": "<optional concrete fix, ≤200 chars>"
   }
 ]
@@ -1382,14 +1393,22 @@ export function parseReviewerJson(rawText: string): ReviewerFinding[] {
 		const title = (pickText(raw, ["title", "summary", "name", "headline"]) || core.slice(0, 80) || "(untitled)").slice(0, 200);
 		const evidenceText = pickText(raw, ["evidence", "reasoning", "justification", "trace", "proof"]);
 		const suggestionText = pickText(raw, ["suggestion", "fix", "recommendation", "remediation"]);
+		const reproText = pickText(raw, ["repro", "reproduction", "trigger", "steps", "test_case", "example"]);
 		const evidence = evidenceText ? `\nEvidence: ${evidenceText}` : "";
+		const repro = reproText ? `\nRepro: ${reproText}` : "";
 		const suggestion = suggestionText ? `\nSuggestion: ${suggestionText}` : "";
-		const comment = (core + evidence + suggestion).slice(0, 2400);
+		const comment = (core + evidence + repro + suggestion).slice(0, 2800);
 		const filePath = pickText(raw, ["file", "path", "filename", "file_path"]);
 		if (!filePath) continue;
 		findings.push({
 			file: filePath, line_start: lineStart, line_end: lineEnd, severity, category, title, comment,
 			match_text: `${title} ${core}`,
+			parts: {
+				core,
+				evidence: evidenceText || undefined,
+				repro: reproText || undefined,
+				suggestion: suggestionText || undefined,
+			},
 		});
 	}
 	// Entries existed but none was usable: a protocol failure, not a clean review.
@@ -1814,7 +1833,15 @@ export interface DedupeGroup {
 	category: string;
 	title: string;
 	titles: string[]; // every distinct title model used
-	members: { spec: ModelSpec; comment: string; severity: ReviewerFinding["severity"]; line_start: number | null; line_end: number | null }[];
+	members: {
+		spec: ModelSpec;
+		comment: string;
+		severity: ReviewerFinding["severity"];
+		line_start: number | null;
+		line_end: number | null;
+		title?: string;
+		parts?: FindingParts;
+	}[];
 	reviewerSpecs: ModelSpec[]; // unique specs that flagged this group
 	consensus: boolean; // ≥ 2 distinct reviewers
 	/** Cross-checks from reviewers who did NOT raise the finding (verify round). */
@@ -1928,7 +1955,15 @@ function newGroup(spec: ModelSpec, finding: ReviewerFinding): DedupeGroup {
 }
 
 function memberOf(spec: ModelSpec, finding: ReviewerFinding): DedupeGroup["members"][number] {
-	return { spec, comment: finding.comment, severity: finding.severity, line_start: finding.line_start, line_end: finding.line_end };
+	return {
+		spec,
+		comment: finding.comment,
+		severity: finding.severity,
+		line_start: finding.line_start,
+		line_end: finding.line_end,
+		title: finding.title,
+		parts: finding.parts,
+	};
 }
 
 function addToGroup(group: DedupeGroup, spec: ModelSpec, finding: ReviewerFinding): void {
@@ -2440,6 +2475,81 @@ function verificationLines(g: DedupeGroup): string[] {
 		...g.verifications.map((v) => `    - \`${v.spec}\` ${icon[v.verdict]}: ${v.evidence}`),
 		...(g.verificationNote ? [`    - note: ${g.verificationNote}`] : []),
 	];
+}
+
+/** Below this word overlap with the canonical description, a reviewer's framing is shown. */
+const DISTINCT_FRAMING_JACCARD = 0.25;
+
+/** Most actionable member: evidence and repro weigh most, then a fix, then detail. */
+function canonicalMember(g: DedupeGroup): DedupeGroup["members"][number] {
+	const score = (m: DedupeGroup["members"][number]) =>
+		(m.parts?.evidence ? 2 : 0) + (m.parts?.repro ? 2 : 0) + (m.parts?.suggestion ? 1 : 0) + Math.min(1, (m.parts?.core ?? m.comment).length / 1000);
+	return g.members.reduce((best, m) => (score(m) > score(best) ? m : best), g.members[0]);
+}
+
+function firstSentence(text: string, max = 160): string {
+	const flat = text.replace(/\s+/g, " ").trim();
+	const cut = flat.match(/^(.+?[.!?])(\s|$)/)?.[1] ?? flat;
+	return cut.length > max ? `${cut.slice(0, max - 1)}…` : cut;
+}
+
+/**
+ * The lead's view: one canonical description per issue (plus the first
+ * repro/fix any reviewer offered), other framings as one-liners, severity
+ * dissent flagged, verification compact. Verbatim per-reviewer text stays
+ * in details.groups — ~30–40% of the full markdown was repetition.
+ */
+export function synthesizeLeadView(
+	target: ReviewTarget,
+	groups: DedupeGroup[],
+	runs: ReviewerRunResult[],
+	label: string,
+	detailHint?: string,
+): string {
+	const ok = runs.filter((r) => r.ok);
+	const lines: string[] = [`# Multi-Model Code Review (${label})`, ""];
+	lines.push(
+		`Scope: \`${target.label}\` · ${groups.length} issue${groups.length === 1 ? "" : "s"} from ${ok.length} reviewer${ok.length === 1 ? "" : "s"} · ` +
+			`${groups.filter((g) => g.consensus).length} raised independently by ≥2`,
+	);
+	lines.push(`Reviewers: ${runs.map((r) => `${shortSpec(r.formattedSpec)} ${r.ok ? `(${r.findings.length})` : `FAILED: ${r.errorMessage?.slice(0, 100) ?? "?"}`}`).join(" · ")}`);
+	if (detailHint) lines.push(detailHint);
+	lines.push("");
+	if (groups.length > 0) lines.push("## Issues", "");
+	for (const g of groups) {
+		const canon = canonicalMember(g);
+		const tally = verificationTally(g);
+		lines.push(`### ${g.id} · ${g.severity.toUpperCase()} · ${g.title} — ×${g.reviewerSpecs.length}${tally ? ` · ${tally}` : ""}`);
+		lines.push(`- **Where:** \`${g.file}:${formatRange(g.line_start, g.line_end)}\` · ${g.category}`);
+		lines.push(`- **Raised by:** ${g.members.map((m) => shortSpec(m.spec) + (m.severity !== g.severity ? ` (says ${m.severity.toUpperCase()})` : "")).join(", ")}`);
+		lines.push(`- **What:** ${(canon.parts?.core ?? canon.comment).replace(/\s+/g, " ")}`);
+		const evidence = canon.parts?.evidence;
+		const repro = canon.parts?.repro ?? g.members.find((m) => m.parts?.repro)?.parts?.repro;
+		const fix = canon.parts?.suggestion ?? g.members.find((m) => m.parts?.suggestion)?.parts?.suggestion;
+		if (evidence) lines.push(`- **Evidence:** ${evidence.replace(/\s+/g, " ")}`);
+		if (repro) lines.push(`- **Repro:** ${repro.replace(/\s+/g, " ")}`);
+		if (fix) lines.push(`- **Fix:** ${fix.replace(/\s+/g, " ")}`);
+		// At most one alternative framing: the most distinct from the canonical
+		// one, and only if it differs at all. Paraphrases are noise for the lead;
+		// verbatim text stays available in details.groups by issue id.
+		const canonWords = keywords(canon.parts?.core ?? canon.comment);
+		const alt = g.members
+			.filter((m) => m !== canon)
+			.map((m) => ({ m, overlap: jaccard(canonWords, keywords(m.parts?.core ?? m.comment)) }))
+			.filter((x) => x.overlap < DISTINCT_FRAMING_JACCARD)
+			.sort((a, b) => a.overlap - b.overlap)[0];
+		if (alt) lines.push(`- **Another angle:** ${shortSpec(alt.m.spec)}: "${firstSentence(alt.m.parts?.core ?? alt.m.comment, 120)}"`);
+		if (g.verifications?.length) {
+			const mark = { confirmed: "✓", refuted: "✗", uncertain: "?" } as const;
+			lines.push(`- **Verification:** ${g.verifications.map((v) => `${mark[v.verdict]} ${shortSpec(v.spec)}: ${v.evidence.replace(/\s+/g, " ").slice(0, 240)}`).join(" · ")}`);
+		} else if (g.verificationNote) {
+			lines.push(`- **Verification:** ${g.verificationNote}`);
+		}
+		lines.push("");
+	}
+	if (groups.length === 0) lines.push(`No findings from ${ok.length} reviewer${ok.length === 1 ? "" : "s"}.`, "");
+	lines.push(...warningLines(target));
+	return lines.join("\n");
 }
 
 /** A suspicion dressed as a group so the verify round can check it like any claim. */
@@ -3109,7 +3219,7 @@ function leadJudgmentInstructions(hasSpec: boolean): string {
 	}
 	lines.push(
 		"### Act On",
-		"Real issues that would block a PR: what, where (file:line), which models raised it, why it matters, the fix. Aim for ≤5; more means you aren't filtering hard enough.",
+		"Real issues that would block a PR, numbered. Each: what, where (file:line), which models raised it, why it matters, **Repro** (the concrete trigger → observed vs expected; take the reviewer's and correct it if needed), **Test** (the failing test that will prove the fix), and the fix. Aim for ≤5; more means you aren't filtering hard enough.",
 		"### Consider",
 		"Legitimate but debatable now — state the tradeoff.",
 		"### Noted",
@@ -3119,7 +3229,10 @@ function leadJudgmentInstructions(hasSpec: boolean): string {
 		"### Agreement Map",
 		"Where models agreed or diverged, and what that pattern suggests.",
 		"",
-		"Do not apply fixes unless the user asks.",
+		"Do not apply fixes unless the user asks. If they do, work from your verdict, not this raw review:",
+		"1. For each Act On item: write its test from the repro, run it and see it FAIL, fix, see it PASS. A test that passes before the fix doesn't prove anything; rewrite it.",
+		"2. Run the project's full test suite.",
+		"3. Confirm with a re-review of the new diff: multi_review with verify: true, `focus` on the areas you touched, and `suspicions` = each fixed Act On item phrased as a claim that it is still present (e.g. \"g2 still present: get() returns expired entries at cache.ts:6\"). Report each as fixed (refuted by verifiers, not raised) or still present, plus any new issues the fixes introduced.",
 	);
 	return lines.join("\n");
 }
@@ -3131,7 +3244,15 @@ async function runMultiReviewFromArgs(
 	signal: AbortSignal | undefined,
 	transientReviewers: ModelSpec[] | null = TRANSIENT_REVIEWERS,
 	onUpdate?: ToolUpdateFn,
-	runOptions: { agentLead?: boolean; brief?: BriefInput; focus?: string; flags?: Partial<ReviewFlags>; deadlineMs?: number } = {},
+	runOptions: {
+		agentLead?: boolean;
+		brief?: BriefInput;
+		focus?: string;
+		flags?: Partial<ReviewFlags>;
+		deadlineMs?: number;
+		/** Where the lead can find verbatim per-reviewer text (headless: result.json). */
+		detailHint?: string;
+	} = {},
 ): Promise<MultiReviewRunResult> {
 	const cfg = loadConfig();
 	const agentLead = runOptions.agentLead ?? false;
@@ -3204,7 +3325,7 @@ async function runMultiReviewFromArgs(
 		const judge = agentLead ? null : resolveJudge(ctx, cfg);
 		if (!agentLead && !judge) target.warnings.push(`judge ${cfg.judge} not in registry; showing deterministic synthesis`);
 		const resolvedRows = resolved.map((r) => ({ rs: r.rs, model: r.model, clamped: r.clamped }));
-		const result = await runReviewPipeline(ctx, cfg, flags, target, resolvedRows, runOpts, judge, agentLead, signal, progress, runOptions.deadlineMs);
+		const result = await runReviewPipeline(ctx, cfg, flags, target, resolvedRows, runOpts, judge, agentLead, signal, progress, runOptions.deadlineMs, runOptions.detailHint);
 		progress.finish("done");
 		return result;
 	} catch (err) {
@@ -3234,6 +3355,7 @@ async function runReviewPipeline(
 	signal: AbortSignal | undefined,
 	progress: MultiReviewProgressReporter,
 	deadlineMs?: number,
+	detailHint?: string,
 ): Promise<MultiReviewRunResult> {
 	const label = describeFlags(flags);
 	const userPrompt = buildReviewUserPrompt(target);
@@ -3283,7 +3405,9 @@ async function runReviewPipeline(
 	let judgeLabel = agentLead ? "(main agent)" : "(none)";
 	let judgeDurationMs = 0;
 	let judgeUsage: JudgeResult["usage"];
-	if (groups.length === 0) {
+	if (agentLead) {
+		markdown = synthesizeLeadView(target, groups, runs, `${label} · you judge`, detailHint);
+	} else if (groups.length === 0) {
 		markdown = synthesizeNoFindingsMarkdown(target, runs, label);
 	} else if (judge) {
 		progress.update({ phase: `${groups.length} groups · invoking judge ${shortSpec(cfg.judge)}`, done: undefined, total: undefined });
@@ -3297,7 +3421,7 @@ async function runReviewPipeline(
 			: `# Multi-Model Code Review (judge returned nothing)\n\nJudge \`${cfg.judge}\` failed (${jr.errorMessage ?? `stopReason=${jr.stopReason}`}); deterministic synthesis follows.\n\n` +
 				synthesizeMarkdownFromGroups(target, groups, runs, label);
 	} else {
-		markdown = synthesizeMarkdownFromGroups(target, groups, runs, agentLead ? `${label} · main agent judges` : label);
+		markdown = synthesizeMarkdownFromGroups(target, groups, runs, label);
 	}
 	if (suspicions.length > 0) markdown += `\n\n${suspicionMarkdown(suspicions, groups, flags.verify).join("\n")}`;
 
@@ -3358,6 +3482,7 @@ async function runAgentLedReview(
 	signal: AbortSignal | undefined,
 	onUpdate?: ToolUpdateFn,
 	deadlineMs?: number,
+	detailHint?: string,
 ): Promise<{ text: string; markdown: string; details: MultiReviewDetails } | { error: string }> {
 	const parts: string[] = [];
 	const focus = typeof params.focus === "string" ? params.focus.trim() : "";
@@ -3378,6 +3503,7 @@ async function runAgentLedReview(
 		focus: params.scope === "area" ? undefined : focus,
 		flags: { verify: params.verify, quick: params.quick },
 		deadlineMs,
+		detailHint,
 	});
 	if (!result.injectMessage) return { error: result.notifyMessage };
 	const { content: markdown, details } = result.injectMessage;
@@ -3467,7 +3593,10 @@ async function runHeadless(pi: ExtensionAPI, args: string, ctx: ExtensionContext
 	if (!Number.isFinite(maxSeconds) || maxSeconds < 60) return fail("--max-seconds must be a number ≥ 60");
 	let out: Awaited<ReturnType<typeof runAgentLedReview>>;
 	try {
-		out = await runAgentLedReview(pi, ctx, req, undefined, undefined, started + maxSeconds * 1000);
+		out = await runAgentLedReview(
+			pi, ctx, req, undefined, undefined, started + maxSeconds * 1000,
+			`Verbatim per-reviewer text, by issue id: ${outPath} → details.groups[].members`,
+		);
 	} catch (err) {
 		return fail(err instanceof Error ? err.message : String(err));
 	}

@@ -132,7 +132,19 @@ The flow:
 3. It runs `/multi-review-run` in the background (Bash, `run_in_background`),
    waits for the completion notification, and reads `result.md`.
 4. It delivers the lead verdict: Intent · Reviewers · Spec conformance ·
-   Act On · Consider · Noted · Dismissed · Agreement Map.
+   Act On · Consider · Noted · Dismissed · Agreement Map. It also saves
+   the verdict as `verdict.md`, a checklist where each Act On item has a
+   repro, a test and a fix.
+5. **If you ask it to fix**, it works from `verdict.md`, not the raw
+   review:
+   - for each item: write the failing test from the repro → see it fail →
+     fix → see it pass;
+   - run the full suite;
+   - **confirmation re-review**: `--verify` on the new diff, with each
+     fixed item as a suspicion ("A1 still present: …").
+
+   Reviewers hunt for regressions while verifiers check each old issue.
+   Each item comes back fixed or still present.
 
 Claude Code becomes the lead with the implementation context, just as
 pi's main agent is inside pi. The skill pre-approves only `pi -p`,
@@ -241,7 +253,8 @@ extglob — documented limitation.
    execution path, trace security inputs to the sink, no "I'd have done it
    differently", empty review is valid). Output is ONLY a JSON array of
    `{file, line_start, line_end, severity, category, title, comment,
-   evidence, suggestion}`. Category `spec` marks unmet requirements. The
+   evidence, repro, suggestion}`. `repro` is the concrete trigger and the
+   observed vs expected result, which makes every finding test-ready. Category `spec` marks unmet requirements. The
    parser tolerates fences, prose wrap, and `{"findings": [...]}`; only an
    explicit `[]` means clean.
 
@@ -266,8 +279,16 @@ extglob — documented limitation.
    failure (shown under Warnings); the issues it was assigned stay
    unverified, never counted as refuted.
 
-7. **Lead judgment** — when the agent called the tool, the result is the
-   grouped findings plus a reviewer roster plus pstack-style instructions:
+7. **Lead judgment** — when an agent leads (the tool, or `/multi-review-run`),
+   the result is a **compact lead view**. Each issue shows one canonical
+   description (the most actionable member) with Evidence / Repro / Fix,
+   at most one genuinely different angle from another reviewer, severity
+   dissent ("says MEDIUM"), and the verification tally with evidence.
+   Verbatim per-reviewer text stays in `details.groups[].members`. The main
+   gain is structure: one actionable entry per issue. Size drops modestly,
+   about 19% on a quick run, more with verbose reviewers. Then come
+   pstack-style instructions:
+   every Act On item gets a Repro and the Test that will prove the fix,
    verify single-reviewer findings before Act On, aim for ≤ 5 Act On items,
    give a reason for each dismissal, and add a spec conformance table when a
    spec was given. The tool result renders with the review panel

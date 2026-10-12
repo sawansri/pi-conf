@@ -1,6 +1,6 @@
 ---
 name: multi-review
-description: Multi-model code review through pi's multi-review extension. Reviewers from other model families (Sonnet 5.5, gpt-6-sol, gpt-6-luna), each with read-only repo access, review the current change, a PR, or a spec implementation in parallel. You write the brief and act as lead reviewer on their findings. Use when the user asks for a multi-model review, a second opinion from other models, or a check of an implementation against a spec.
+description: Multi-model code review through pi's multi-review extension. Reviewers from other model families (Sonnet 5.5, gpt-6-sol, gpt-6-luna), each with read-only repo access, review the current change, a PR, or a spec implementation in parallel. You write the brief, act as lead reviewer on their findings, and, if asked, fix the issues test-first and confirm the fixes with a re-review. Use when the user asks for a multi-model review, a second opinion from other models, a check of an implementation against a spec, or to fix and confirm review findings.
 argument-hint: "[--spec=path] [--verify] [--quick] [#PR | area to review]"
 allowed-tools: Bash(pi -p *) Bash(mkdir *) Bash(git *) Bash(gh pr *) Read Write
 ---
@@ -66,11 +66,45 @@ pi -p "/multi-review-run --brief=<brief.json> --out=<dir>/result.json" < /dev/nu
 - Progress lines and the final `OK <md> <json>` / `FAILED <json>` line go to stderr. Exit code 0 means success.
 - On failure, read `result.json` (`{"ok": false, "error": ...}`) and tell the user what went wrong. Typical causes: the reviewer models aren't reachable, a spec path is wrong, or the extension isn't installed.
 
-## 4. Judge and report
+## 4. Judge, report, and save the verdict
 
-Read `<dir>/result.md`. It contains the grouped findings with per-reviewer comments, verification verdicts, how your suspicions fared, a reviewer roster, and a **Lead judgment** section. Follow that section. It asks you to verify single-reviewer findings by reading the code, to weigh verification evidence rather than votes, and to say which of your suspicions held up. Reply in its format: Intent · Reviewers · (Spec conformance) · Act On · Consider · Noted · Dismissed · Agreement Map.
+Read `<dir>/result.md`. It is the compact lead view. Each issue has one canonical description with **Evidence**, **Repro** and **Fix**, other reviewers' framings as one-liners, and its verification tally and evidence. Then come your suspicions, warnings, and a **Lead judgment** section. Follow that section:
+- verify single-reviewer findings by reading the code;
+- weigh verification evidence rather than votes;
+- say which of your suspicions held up.
 
-`result.json` has the same content in structured form (`details.groups`, `details.suspicions`, `details.warnings`) if you need to look something up.
+Reply in its format: Intent · Reviewers · (Spec conformance) · Act On · Consider · Noted · Dismissed · Agreement Map. Every Act On item gets a **Repro** and a **Test**.
+
+If you need a reviewer's exact wording, `result.json` → `details.groups[].members` has the verbatim per-reviewer text (look issues up by id).
+
+Then write your verdict to `<dir>/verdict.md`. That file, not the raw review, is the working document for any fix session:
+
+```markdown
+# Verdict — <scope> (<date>)
+Review: <dir>/result.md
+
+## Act On
+- [ ] A1 (g2) <title> — `file:line`
+  - Repro: <trigger → observed vs expected>
+  - Test: <test file / name and what it asserts>
+  - Fix: <approach>
+## Consider / Noted / Dismissed
+<one line each>
+```
+
+## 5. If the user asks you to fix
+
+Don't edit until asked. Then work through `verdict.md`:
+1. **Test first.** For each Act On item, write the test from its repro, run it and see it **fail**, then fix and see it **pass**. A test that passes before the fix proves nothing; rewrite it. Tick the item in `verdict.md`.
+2. **Run the full test suite.**
+3. **Confirmation re-review.** Write a new brief and run step 3 again:
+   - `intent`: "Fixes for the issues in <dir>/verdict.md: …" plus the original intent.
+   - `focus`: the areas the fixes touched.
+   - `suspicions`: each fixed Act On item, phrased as a claim that it is still present (e.g. `"A1 still present: get() returns expired entries at cache.ts:6"`).
+   - `verify`: true.
+
+   Reviewers hunt for new problems in the fixed diff while verifiers check each old issue.
+4. **Report** each Act On item as **fixed** (its suspicion was refuted and nobody raised it) or **still present**, plus any new issues the fixes introduced. Update `verdict.md` to match.
 
 ## Prerequisites
 
