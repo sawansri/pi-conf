@@ -35,17 +35,18 @@ judge model writes the synthesis.
 |---------|-----|
 | Slash command | `/multi-review [--spec=path] [--verify] [--quick] [--direct] [PR-number \| free-text focus]` |
 | Slash command | `/multi-review-pick`: open the multi-select TUI picker to choose reviewer models from your registry (optionally saved to `multi-review.json`) |
-| LLM-callable tool | `multi_review({intent?, spec_path?, requirements?, context_files?, focus?, scope?, pr_number?, verify?, quick?})`. The agent can call it on its own too |
+| LLM-callable tool | `multi_review({intent?, spec_path?, requirements?, suspicions?, context_files?, focus?, scope?, pr_number?, verify?, quick?})`. The agent can call it on its own too |
 
 Tool parameters:
 
 | Param | Meaning |
 |-------|---------|
-| `intent` | One paragraph: what the change must accomplish. Reviewers challenge the execution, not the intent. |
+| `intent` | What the change must accomplish, plus facts reviewers can't find in the repo (external API behaviour, constraints, out-of-scope items). Goals, not a narration of the implementation. Reviewers challenge the execution, not the intent. |
 | `spec_path` | Repo-relative spec/design doc, passed to reviewers verbatim as the source of truth (60k char cap). |
 | `requirements` | Checkable requirements, one per item. Reviewers report unmet ones as category `spec`. |
 | `context_files` | Up to 12 paths reviewers get in full (callers, types, tests). |
-| `focus` | Risky areas. A hint layered on the diff; it never replaces the diff. |
+| `focus` | Risk **areas** ("config-file merge lifecycle"), never hypotheses. A hint layered on the diff; it never replaces the diff. |
+| `suspicions` | The lead's own bug hypotheses (≤ 20). **Never shown to reviewers.** They're matched against what reviewers find independently and, with `verify`, cross-checked by verifiers. |
 | `scope` | `diff` (default: working tree vs default branch, or the PR) or `area` (no diff; review what `focus` describes). |
 | `pr_number` | As for the slash command. |
 | `verify`, `quick` | Same as `--verify` / `--quick`. |
@@ -57,6 +58,39 @@ If the configured reviewer pool is empty AND the agent has UI access,
 `/multi-review` opens the picker as a fallback. You can save the choice to
 `multi-review.json` or use it for the current run only (transient
 override, never touches the file).
+
+## Brief discipline: what reviewers are told
+
+The brief is specific about **facts** and vague about **where the bugs
+are**:
+
+- **Tell reviewers:** requirements (a checklist from the spec), facts
+  outside the repo (for example "pi's `models.json` supports `${NAME}`
+  interpolation"), constraints, and what's out of scope. Without these,
+  reviewers miss real bugs or invent wrong ones.
+- **Don't tell them** the lead's hypotheses ("does `--mcp,!--no-mcp`
+  compile?", "is maxTokens == contextWindow valid?"). Hypotheses anchor
+  every reviewer on the same spots. "Found by 3 reviewers" then measures
+  the prompt rather than independent discovery, and the author's blind
+  spots get copied into the reviewers'. The intent describes goals rather
+  than the implementation, for the same reason: reviewers should verify
+  what the code does, not take it as given.
+
+The lead's hypotheses go in `suspicions` instead. The grouping call matches
+each one against the independent findings, and `--verify` sends them to
+verifiers as claims of their own. The result has a **Lead suspicions**
+section and panel lines like:
+
+```
+lead suspicions: 1/2 raised independently
+  s1: The expiry comparison in get() is inverted … ✓ g1 ✓2 ✗0 ?0
+  s2: Deleting from the Map while iterating … skips entries · not raised ✓0 ✗2 ?0
+```
+
+A suspicion raised independently is the strongest signal there is. One
+that nobody raised is either wrong (s2 above: both verifiers refuted it,
+and the lead dismissed its own hypothesis) or a shared blind spot, and the
+verifier evidence or the lead's own reading decides which.
 
 ## Review options
 

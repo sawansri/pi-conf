@@ -141,6 +141,17 @@ Cross-check every issue (adds ✓/✗/? badges with evidence):
 /multi-review --verify --spec=docs/feature-spec.md
 ```
 
+Calling the tool directly, the agent keeps its hypotheses out of the brief:
+```
+multi_review
+  intent: "Implements Phase 1 of agent-roadmap.md … (goals + external facts, not implementation narrative)"
+  spec_path: agent-roadmap.md
+  requirements: ["1.1: models.json per-model entries include contextWindow …", …]
+  focus: "API-key handling across agents, mcp.json merge lifecycle, CLI flag parsing, test isolation and CI wiring"
+  suspicions: ["CLI11 add_flag(\"--mcp,!--no-mcp\") may not set false for --no-mcp", "refresh without a key may keep a stale Authorization header"]
+  verify: true
+```
+
 Fast first look:
 ```
 /multi-review --quick

@@ -225,12 +225,13 @@ export function parseBoolFlag(rawArgs: string, name: string): { present: boolean
 export interface BriefInput {
 	intent?: string;
 	requirements?: string[];
+	suspicions?: string[];
 	specPath?: string;
 	contextFiles?: string[];
 }
 
 function hasBriefInput(b: BriefInput): boolean {
-	return Boolean(b.intent?.trim() || b.specPath || b.requirements?.length || b.contextFiles?.length);
+	return Boolean(b.intent?.trim() || b.specPath || b.requirements?.length || b.contextFiles?.length || b.suspicions?.length);
 }
 
 
@@ -568,6 +569,8 @@ export interface ReviewTarget {
 export interface ReviewBrief {
 	intent: string;
 	requirements: string[];
+	/** The lead's own bug hypotheses. Never shown to finding reviewers (anchoring); see SuspicionResult. */
+	suspicions: string[];
 	spec?: { path: string; text: string };
 	contextFiles: { path: string; text: string }[];
 }
@@ -576,6 +579,7 @@ const SPEC_BUDGET_CHARS = 60_000;
 const CONTEXT_FILE_BUDGET_CHARS = 40_000;
 const CONTEXT_TOTAL_BUDGET_CHARS = 150_000;
 const MAX_CONTEXT_FILES = 12;
+const MAX_SUSPICIONS = 20;
 
 function clip(text: string, budget: number, label: string): string {
 	if (text.length <= budget) return text;
@@ -600,12 +604,13 @@ export function readSpecFile(cwd: string, specPath: string): { path: string; tex
 /** Read the files the brief asks reviewers to see in full; unreadable ones become warnings. */
 export function buildBrief(
 	cwd: string,
-	input: { intent?: string; requirements?: string[]; specPath?: string; contextFiles?: string[] },
+	input: BriefInput,
 	warnings: string[],
 ): ReviewBrief {
 	const brief: ReviewBrief = {
 		intent: input.intent?.trim() ?? "",
 		requirements: (input.requirements ?? []).map((r) => r.trim()).filter(Boolean),
+		suspicions: (input.suspicions ?? []).map((r) => r.trim()).filter(Boolean).slice(0, MAX_SUSPICIONS),
 		contextFiles: [],
 	};
 	if (input.specPath) {
@@ -1811,6 +1816,21 @@ export interface DedupeGroup {
 	verificationNote?: string;
 	/** Verifiers assigned in the verify round (0 = every reviewer raised it). */
 	verifiers?: number;
+	/** Finding keys (`run:finding`) that formed this group, when grouped by the model. */
+	keys?: FindingKey[];
+}
+
+/**
+ * One of the lead's hypotheses, checked without showing it to reviewers:
+ * did anyone raise it independently, and (with --verify) does it hold up?
+ */
+export interface SuspicionResult {
+	id: string;
+	text: string;
+	/** Ids of groups that independently describe the same defect. */
+	raisedBy: string[];
+	verifications?: Verification[];
+	verificationNote?: string;
 }
 
 export interface Verification {
@@ -1945,12 +1965,14 @@ export function dedupeReviewerFindings(results: ReviewerRunResult[], clusters?: 
 		for (const cluster of clusters) {
 			let group: DedupeGroup | undefined;
 			for (const key of cluster) {
+				if (key.startsWith("S:")) continue;
 				const [ri, fi] = key.split(":").map(Number);
 				const r = results[ri];
 				const finding = r?.findings[fi];
 				if (!r || !finding) continue;
 				if (!group) group = newGroup(r.spec, finding);
 				else addToGroup(group, r.spec, finding);
+				(group.keys ??= []).push(key);
 			}
 			if (group) groups.push(group);
 		}
@@ -1987,7 +2009,9 @@ const CLUSTER_SYSTEM_PROMPT = `You group code-review findings from several indep
 
 Two findings belong together only if they describe the SAME underlying defect (same root cause, same fix) — not merely the same file, nearby lines, or the same spec. Different requirements, different bugs on adjacent lines, and a bug vs. a missing test are separate issues.
 
-Output ONLY a JSON array of clusters; each cluster is an array of finding ids, e.g. [["0:1","2:0"],["1:3"]].
+Ids starting with "S:" are NOT findings but the lead reviewer's hypotheses. Put a hypothesis in the cluster of the finding(s) describing the same defect, or leave it alone in its own cluster if no finding matches. Match on the defect, not the topic.
+
+Output ONLY a JSON array of clusters; each cluster is an array of ids, e.g. [["0:1","2:0","S:0"],["1:3"],["S:1"]].
 - Every id appears in exactly one cluster.
 - Never put two findings from the same reviewer (same number before the colon) in one cluster.
 - Singletons are fine.`;
@@ -2007,9 +2031,14 @@ async function clusterFindingsWithModel(
 	results: ReviewerRunResult[],
 	signal: AbortSignal | undefined,
 	timeoutMs: number,
+	suspicions: string[] = [],
 ): Promise<{ clusters: FindingKey[][] } | { error: string }> {
 	const items: string[] = [];
 	const known = new Set<FindingKey>();
+	suspicions.forEach((text, i) => {
+		known.add(`S:${i}`);
+		items.push(`- id S:${i} | lead hypothesis (not a finding) | ${text.replace(/\s+/g, " ").slice(0, 500)}`);
+	});
 	results.forEach((r, ri) => {
 		if (!r?.ok) return;
 		r.findings.forEach((f, fi) => {
@@ -2019,7 +2048,7 @@ async function clusterFindingsWithModel(
 			items.push(`- id ${key} | ${f.file}:${formatRange(f.line_start, f.line_end)} | ${f.category} | ${f.title} — ${core}`);
 		});
 	});
-	if (known.size < 2) return { clusters: [...known].map((k) => [k]) };
+	if (known.size - suspicions.length === 0 || known.size < 2) return { clusters: [...known].map((k) => [k]) };
 	const call = await callModel(ctx, model, CLUSTER_SYSTEM_PROMPT, `## Findings\n${items.join("\n")}`, {
 		thinking,
 		temperature: 0,
@@ -2061,25 +2090,48 @@ async function clusterFindingsWithModel(
 	return { clusters };
 }
 
-/** Semantic grouping with lexical fallback; never fails the run. */
+/**
+ * Semantic grouping with lexical fallback; never fails the run. Also maps
+ * each lead suspicion to the groups that independently describe it.
+ */
 async function groupFindings(
 	ctx: ExtensionContext,
 	cfg: MultiReviewConfig,
 	results: ReviewerRunResult[],
 	signal: AbortSignal | undefined,
 	progress?: MultiReviewProgressReporter,
-): Promise<DedupeGroup[]> {
-	if (cfg.dedupeModel === "lexical") return dedupeReviewerFindings(results);
+	suspicions: string[] = [],
+): Promise<{ groups: DedupeGroup[]; suspicionMatches: string[][] }> {
+	const lexical = () => {
+		const groups = dedupeReviewerFindings(results);
+		return { groups, suspicionMatches: suspicions.map((t) => matchSuspicionLexically(t, groups)) };
+	};
+	if (cfg.dedupeModel === "lexical") return lexical();
 	const parsedSpec = parseReviewerSpec(cfg.dedupeModel ?? cfg.judge, "low");
 	const model = parsedSpec ? findModel(ctx, parsedSpec.spec) : null;
-	if (!parsedSpec || !model) return dedupeReviewerFindings(results);
+	if (!parsedSpec || !model) return lexical();
 	progress?.update({ phase: `grouping findings (${shortSpec(parsedSpec.spec)})`, done: undefined, total: undefined });
-	const out = await clusterFindingsWithModel(ctx, model, parsedSpec.thinking, results, signal, 120_000);
+	const out = await clusterFindingsWithModel(ctx, model, parsedSpec.thinking, results, signal, 120_000, suspicions);
 	if ("error" in out) {
 		progress?.update({ phase: "grouping fell back to lexical", latest: `grouping model failed: ${out.error.slice(0, 120)}` });
-		return dedupeReviewerFindings(results);
+		return lexical();
 	}
-	return dedupeReviewerFindings(results, out.clusters);
+	const groups = dedupeReviewerFindings(results, out.clusters);
+	const groupOfKey = new Map<FindingKey, string>();
+	for (const g of groups) for (const k of g.keys ?? []) groupOfKey.set(k, g.id);
+	const suspicionMatches = suspicions.map((_, i) => {
+		const cluster = out.clusters.find((c) => c.includes(`S:${i}`)) ?? [];
+		return [...new Set(cluster.map((k) => groupOfKey.get(k)).filter((id): id is string => Boolean(id)))];
+	});
+	return { groups, suspicionMatches };
+}
+
+/** Fallback suspicion matching: shared distinctive vocabulary with a group's text. */
+function matchSuspicionLexically(text: string, groups: DedupeGroup[]): string[] {
+	const words = keywords(text);
+	return groups
+		.filter((g) => jaccard(words, keywords(`${g.titles.join(" ")} ${g.members.map((m) => m.comment).join(" ")}`)) >= 0.12)
+		.map((g) => g.id);
 }
 
 // ---------- verification round ----------
@@ -2121,6 +2173,12 @@ Output ONLY a JSON array, one entry per finding:
 function buildVerifyPrompt(basePrompt: string, groups: DedupeGroup[]): string {
 	const lines = [basePrompt, "", "## Findings to verify"];
 	for (const g of groups) {
+		if (g.category === "suspicion") {
+			lines.push(`### ${g.id} — unconfirmed hypothesis (no location given; find it yourself)`);
+			lines.push(`Claim: ${g.title}`);
+			lines.push("");
+			continue;
+		}
 		lines.push(`### ${g.id} — ${g.severity.toUpperCase()} · ${g.category} · ${g.file}:${formatRange(g.line_start, g.line_end)}`);
 		lines.push(`Title: ${g.title}`);
 		g.members.forEach((m, i) => lines.push(`Reviewer ${i + 1}: ${m.comment.replace(/\n/g, " ")}`));
@@ -2377,6 +2435,50 @@ function verificationLines(g: DedupeGroup): string[] {
 	];
 }
 
+/** A suspicion dressed as a group so the verify round can check it like any claim. */
+function suspicionAsGroup(sus: SuspicionResult): DedupeGroup {
+	return {
+		id: sus.id,
+		file: "(lead hypothesis)",
+		line_start: null,
+		line_end: null,
+		severity: "info",
+		category: "suspicion",
+		title: sus.text,
+		titles: [sus.text],
+		members: [],
+		reviewerSpecs: [],
+		consensus: false,
+	};
+}
+
+/**
+ * The lead's suspicions vs. independent discovery. "Raised independently"
+ * is the strong signal; "not raised" means either a wrong hypothesis or a
+ * shared blind spot — verification (or the lead's own reading) decides.
+ */
+function suspicionMarkdown(suspicions: SuspicionResult[], groups: DedupeGroup[], verified: boolean): string[] {
+	const byId = new Map(groups.map((g) => [g.id, g]));
+	const lines = ["## Lead suspicions (hidden from reviewers)"];
+	for (const sus of suspicions) {
+		const raised = sus.raisedBy.map((id) => byId.get(id)).filter((g): g is DedupeGroup => Boolean(g));
+		const status = raised.length > 0
+			? `raised independently — ${raised.map((g) => `${g.id} "${g.title}" (×${g.reviewerSpecs.length})`).join("; ")}`
+			: "not raised by any reviewer";
+		lines.push(`- **${sus.id}:** ${sus.text}`);
+		lines.push(`    - ${status}`);
+		if (sus.verifications?.length) {
+			const g = { verifications: sus.verifications } as DedupeGroup;
+			lines.push(`    - verification (${verificationTally(g)}):`);
+			for (const v of sus.verifications) lines.push(`        - \`${v.spec}\` ${v.verdict}: ${v.evidence}`);
+		} else if (verified) {
+			lines.push(`    - verification: ${sus.verificationNote ?? "no verdict returned"}`);
+		}
+	}
+	lines.push("");
+	return lines;
+}
+
 function warningLines(target: ReviewTarget): string[] {
 	if (target.warnings.length === 0) return [];
 	return ["## Warnings", ...target.warnings.map((w) => `- ${w}`), ""];
@@ -2510,6 +2612,7 @@ export interface MultiReviewDetails {
 	totalFindings: number;
 	/** Review markdown, kept apart from tool-result text (which adds lead instructions). */
 	markdown?: string;
+	suspicions?: SuspicionResult[];
 }
 
 const SEVERITY_COLOR: Record<ReviewerFinding["severity"], "error" | "warning" | "accent" | "muted" | "dim"> = {
@@ -2591,6 +2694,18 @@ function renderMultiReviewMessage(
 				const color = v.verdict === "confirmed" ? "success" : v.verdict === "refuted" ? "warning" : "dim";
 				container.addChild(new Text(`    ${theme.fg(color, `${mark} ${specShort}:`)} ${v.evidence}`, 0, 0));
 			}
+		}
+	}
+
+	if (details.suspicions?.length) {
+		container.addChild(new Spacer(1));
+		const raised = details.suspicions.filter((x) => x.raisedBy.length > 0).length;
+		container.addChild(new Text(theme.fg("muted", `lead suspicions: ${raised}/${details.suspicions.length} raised independently`), 0, 0));
+		for (const sus of details.suspicions) {
+			const tally = sus.verifications?.length ? ` ${verificationTally({ verifications: sus.verifications } as DedupeGroup)}` : "";
+			const mark = sus.raisedBy.length > 0 ? theme.fg("success", `✓ ${sus.raisedBy.join(",")}`) : theme.fg("dim", "· not raised");
+			const text = options.expanded ? sus.text : truncateToWidth(sus.text, 90);
+			container.addChild(new Text(`  ${theme.fg("muted", `${sus.id}:`)} ${text} ${mark}${theme.fg("dim", tally)}`, 0, 0));
 		}
 	}
 
@@ -2947,8 +3062,8 @@ export function buildHandoffPrompt(rawArgs: string, flags: ReviewFlags, specPath
 	} else {
 		lines.push("2. **Intent.** Work out what the change is supposed to do from this conversation, commit messages, and the PR description. If you genuinely can't tell, ask the user instead of calling the tool.");
 	}
-	lines.push("3. **Brief.** Call the `multi_review` tool once. Reviewers are other model families with read-only repo access; they do NOT see this conversation, so the brief must carry everything they need:");
-	lines.push("   - `intent`: one paragraph — what the change must accomplish and the constraints that matter. Reviewers challenge the execution, not the intent.");
+	lines.push("3. **Brief.** Call the `multi_review` tool once. Reviewers are other model families with read-only repo access; they do NOT see this conversation, so the brief must carry what they can't discover — but NOT where you think the bugs are. Independent discovery is the point: hypotheses in the brief anchor every reviewer on the same spots, turn \"consensus\" into an echo of your prompt, and copy your blind spots into theirs.");
+	lines.push("   - `intent`: what the change must accomplish, plus facts reviewers can't find in the repo (external tool/API behaviour, deployment constraints, what's deliberately out of scope). State goals, not a narration of the implementation — reviewers should verify what the code does, not take your description of it as given. Reviewers challenge the execution, not the intent.");
 	if (specPath) {
 		lines.push("   - `requirements`: every concrete, checkable requirement / acceptance criterion in the spec, one per item, quoted or tightly paraphrased. Include the edge cases and error behaviour the spec pins down.");
 		lines.push(`   - \`spec_path\`: "${specPath}" (the full spec is passed to reviewers verbatim).`);
@@ -2956,7 +3071,8 @@ export function buildHandoffPrompt(rawArgs: string, flags: ReviewFlags, specPath
 		lines.push("   - `requirements`: only if the user stated explicit acceptance criteria.");
 	}
 	lines.push("   - `context_files`: up to 8 repo paths reviewers should read in full beyond the diff — callers, types/interfaces, tests that pin the behaviour. Skip files the diff already shows whole.");
-	lines.push(`   - \`focus\`: risky spots that deserve extra scrutiny${focus ? `, plus the user's request: "${focus}"` : ""}.`);
+	lines.push(`   - \`focus\`: risk AREAS only (e.g. "API-key handling across agents", "config-file merge lifecycle", "test isolation"), never hypotheses ("does X compile?", "is Y null when Z?")${focus ? `, plus the user's request: "${focus}"` : ""}.`);
+	lines.push("   - `suspicions`: your specific hypotheses about possible bugs, one per item. They are NOT shown to the reviewers; they're checked against what reviewers find independently (and cross-checked by verifiers when verify is on), so you learn which of your suspicions others reached on their own.");
 	if (parsed.kind === "pr") lines.push(`   - \`pr_number\`: ${parsed.number}`);
 	if (parsed.kind === "text") lines.push(`   - \`scope\`: "area" (and put the area description in \`focus\`)`);
 	if (flags.verify) lines.push("   - `verify`: true (each finding is cross-checked by reviewers who didn't raise it)");
@@ -2972,6 +3088,7 @@ function leadJudgmentInstructions(hasSpec: boolean): string {
 		"## Lead judgment (you)",
 		"You are the lead reviewer, not an aggregator. Reviewers saw only your brief and the repo; you have the conversation and can read the code. Before putting a single-reviewer finding in Act On, verify it yourself. Findings raised independently by ≥2 models are the strongest signal, but check them too. Be slow to dismiss correctness and security findings.",
 		"Dismiss: hypotheticals the call sites rule out, \"I would have done it differently\", findings about code the change didn't touch, and nits inflated to fill a review.",
+		"If the result lists your suspicions: one raised independently is strong signal; one nobody raised is either wrong or a shared blind spot — read the code (or weigh its verification evidence) before deciding. Say which of your suspicions held up.",
 		"If a finding has independent verification (✓ confirmed / ✗ refuted / ? uncertain by reviewers who did not raise it), weigh the evidence, not the vote: a refutation citing concrete code usually means Dismissed; a split verdict means read the code yourself.",
 		"",
 		"Reply to the user in this format:",
@@ -3127,13 +3244,22 @@ async function runReviewPipeline(
 	const failure = allReviewersFailedResult(runs, label);
 	if (failure) return failure;
 
-	const groups = await groupFindings(ctx, cfg, runs, signal, progress);
+	const suspicionTexts = target.brief?.suspicions ?? [];
+	const { groups, suspicionMatches } = await groupFindings(ctx, cfg, runs, signal, progress, suspicionTexts);
 	// Grouping and judge calls turn an abort into an error + fallback; a
 	// cancelled run must stop here, not publish a fallback review.
 	throwIfAborted(signal);
-	if (flags.verify && groups.length > 0) {
-		const { failures } = await runVerification(ctx, cfg, rows, groups, userPrompt, runOpts, signal, progress);
+	const suspicions: SuspicionResult[] = suspicionTexts.map((text, i) => ({ id: `s${i + 1}`, text, raisedBy: suspicionMatches[i] ?? [] }));
+	// Suspicions ride the verify round as claims of their own: every reviewer
+	// is eligible (none raised them), and they never touched discovery.
+	const suspicionGroups = suspicions.map(suspicionAsGroup);
+	if (flags.verify && groups.length + suspicionGroups.length > 0) {
+		const { failures } = await runVerification(ctx, cfg, rows, [...groups, ...suspicionGroups], userPrompt, runOpts, signal, progress);
 		for (const f of failures) target.warnings.push(`verifier failed (its findings stay unverified): ${f}`);
+		suspicionGroups.forEach((g, i) => {
+			suspicions[i].verifications = g.verifications;
+			suspicions[i].verificationNote = g.verificationNote;
+		});
 	}
 
 	let markdown: string;
@@ -3156,6 +3282,7 @@ async function runReviewPipeline(
 	} else {
 		markdown = synthesizeMarkdownFromGroups(target, groups, runs, agentLead ? `${label} · main agent judges` : label);
 	}
+	if (suspicions.length > 0) markdown += `\n\n${suspicionMarkdown(suspicions, groups, flags.verify).join("\n")}`;
 
 	const details: MultiReviewDetails = {
 		target,
@@ -3167,6 +3294,7 @@ async function runReviewPipeline(
 		judgeUsage,
 		consensusCount: groups.filter((g) => g.consensus).length,
 		totalFindings: groups.reduce((s, g) => s + g.members.length, 0),
+		suspicions: suspicions.length > 0 ? suspicions : undefined,
 	};
 	const verified = groups.filter((g) => g.verifications?.length).length;
 	return {
@@ -3176,6 +3304,7 @@ async function runReviewPipeline(
 			`scope: ${target.label}   files: ${target.files.length}   diff bytes: ${target.diffText.length}\n` +
 			`reviewers: ${runs.length}   issues: ${groups.length}   consensus: ${details.consensusCount}` +
 			(flags.verify ? `   verified: ${verified}/${groups.length}` : "") +
+			(suspicions.length ? `   suspicions raised independently: ${suspicions.filter((x) => x.raisedBy.length).length}/${suspicions.length}` : "") +
 			(target.warnings.length ? `\nwarnings: ${target.warnings.length} (see review)` : ""),
 		notifyLevel: "info",
 		injectMessage: { customType: "multi-review", content: markdown, details },
@@ -3359,8 +3488,9 @@ export default function (pi: ExtensionAPI) {
 			"Run a multi-model code review on the current change (PR, working-tree diff, or a described area), optionally against a spec.",
 		promptGuidelines: [
 			"Use multi_review when the user asks for a code review, a second opinion, or a check of an implementation against a spec.",
-			"Before calling, understand the change yourself and write the brief: reviewers do not see the conversation.",
-			"`intent` is one paragraph on what the change must accomplish. With a spec, pass spec_path and list its checkable requirements.",
+			"Before calling, understand the change yourself and write the brief: reviewers do not see the conversation. Give them what they can't discover, not where you think the bugs are — independent discovery is what makes their agreement meaningful.",
+			"`intent`: goals plus facts reviewers can't find in the repo (external API behaviour, constraints, out-of-scope items) — not a narration of the implementation. With a spec, pass spec_path and list its checkable requirements.",
+			"`focus`: risk areas only, never hypotheses. Put your specific bug hypotheses in `suspicions`; they are hidden from reviewers and checked against what they find on their own.",
 			"`context_files` are repo paths reviewers should read in full (callers, types, tests) — not files already whole in the diff.",
 			"Set verify=true for high-stakes changes (independent cross-check of every finding); quick=true for small diffs or a cheap first look.",
 			"After results return, follow the lead-judgment instructions in the result. Do not apply fixes unless asked.",
@@ -3377,6 +3507,12 @@ export default function (pi: ExtensionAPI) {
 				description: "Concrete, checkable requirements (usually from the spec) reviewers must verify one by one.",
 				maxItems: 40,
 			})),
+			suspicions: Type.Optional(Type.Array(Type.String({ maxLength: 600 }), {
+				description:
+					"Your own hypotheses about possible bugs. NOT shown to reviewers (they'd anchor on them); checked against " +
+					"what reviewers find independently and, with verify, cross-checked by verifiers.",
+				maxItems: 20,
+			})),
 			context_files: Type.Optional(Type.Array(Type.String(), {
 				description: "Repo-relative paths reviewers should see in full beyond the diff (callers, types, tests). Max 12.",
 				maxItems: 12,
@@ -3392,8 +3528,8 @@ export default function (pi: ExtensionAPI) {
 			})),
 			focus: Type.Optional(Type.String({
 				description:
-					"Risky areas to scrutinize, or — with no diff — the area to review. Examples: 'the token refresh path', " +
-					"'error handling in the new parser'.",
+					"Risk AREAS to scrutinize (not hypotheses — use `suspicions`), or, with scope='area', the area to review. " +
+					"Examples: 'the token refresh path', 'config-file merge lifecycle'.",
 				maxLength: 2000,
 			})),
 			verify: Type.Optional(Type.Boolean({
@@ -3417,6 +3553,7 @@ export default function (pi: ExtensionAPI) {
 				intent: params.intent,
 				specPath: params.spec_path,
 				requirements: params.requirements,
+				suspicions: params.suspicions,
 				contextFiles: params.context_files,
 			};
 			const result = await runMultiReviewFromArgs(pi, ctx, parts.join(" "), signal, TRANSIENT_REVIEWERS, onUpdate, {
