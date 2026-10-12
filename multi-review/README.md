@@ -33,9 +33,9 @@ judge model writes the synthesis.
 
 | Surface | How |
 |---------|-----|
-| Slash command | `/multi-review [--spec=path] [--mode=balanced\|light\|triage\|council] [--direct] [PR-number \| free-text focus]` |
+| Slash command | `/multi-review [--spec=path] [--verify] [--quick] [--direct] [PR-number \| free-text focus]` |
 | Slash command | `/multi-review-pick`: open the multi-select TUI picker to choose reviewer models from your registry (optionally saved to `multi-review.json`) |
-| LLM-callable tool | `multi_review({intent?, spec_path?, requirements?, context_files?, focus?, scope?, pr_number?, mode?})`. The agent can call it on its own too |
+| LLM-callable tool | `multi_review({intent?, spec_path?, requirements?, context_files?, focus?, scope?, pr_number?, verify?, quick?})`. The agent can call it on its own too |
 
 Tool parameters:
 
@@ -47,62 +47,65 @@ Tool parameters:
 | `context_files` | Up to 12 paths reviewers get in full (callers, types, tests). |
 | `focus` | Risky areas. A hint layered on the diff; it never replaces the diff. |
 | `scope` | `diff` (default: working tree vs default branch, or the PR) or `area` (no diff; review what `focus` describes). |
-| `pr_number`, `mode` | As for the slash command. |
+| `pr_number` | As for the slash command. |
+| `verify`, `quick` | Same as `--verify` / `--quick`. |
 
 Argument autocompletion completes only the token you're typing (`--spec=`,
-`--mode=…`, `--direct`, `#`) and keeps what's already typed.
+`--verify`, `--quick`, `--direct`, `#`) and keeps what's already typed.
 
 If the configured reviewer pool is empty AND the agent has UI access,
 `/multi-review` opens the picker as a fallback. You can save the choice to
 `multi-review.json` or use it for the current run only (transient
 override, never touches the file).
 
-## Review modes
+## Review options
 
-The run shape varies by `mode`. Set the default via `multi-review.mode` in
-the defaults file, override per-run with `--mode=X` on the slash command or
-the `mode` parameter on the `multi_review` tool.
+The modes used to mix three separate choices: breadth (which reviewers),
+depth (a second checking round), and who writes the verdict. Now each is
+its own option:
 
-| Mode | What it does | When to use | Cost |
-|------|-------------|-----------|------|
-| `balanced` *(default)* | N reviewers → grouping → the main agent judges. With `--direct`: one external judge writes the synthesis | Default | ~1× baseline |
-| `light` | N reviewers → grouping → deterministic markdown, no external judge. Same as balanced when the agent leads | Direct mode when you want speed / lower cost | ~0.9× |
-| `triage` | N reviewers with verdict prompt (`escalate: bool`, `files_to_escalate`, `reasoning`), no tools. If ≥ `multi-review.triageEscalationThreshold` reviewers say escalate, automatically re-runs balanced with focus on those files. | Big diffs where most areas are noise; you want a cheap first pass | ~0.4× (no escalate) to ~1.4× (deep) |
-| `council` | 2 rounds of de-identified deliberation + judge iff round-2 disagrees. Round-1 raises findings; round-2 has each reviewer weigh in on each peer finding (agree / disagree / extend); judge arbitrates only the disputed ones. | High-stakes architectural reviews where disagreement is the signal | ~2× baseline (always round-2) + judge when disputed |
+| Option | What it does | When | Cost / time (5-reviewer pool) |
+|--------|-------------|------|------------------------------|
+| *(default)* | Full pool, reviewers with read-only tools → grouping → the main agent judges | Most reviews | ~1× · 1–3 min (Grok-4.7@high is the long pole) |
+| `--verify` | Adds a cross-check round: each issue goes to `verifiersPerFinding` (2) reviewers **who did not raise it**. With tools, they reply confirmed / refuted / uncertain plus code evidence | High-stakes changes; when false positives are expensive | ~1.5–2× |
+| `--quick` | `quickReviewers` pool (Kimi / DeepSeek / Gemini at `@low`), single completions, no tools | Small diffs, a cheap first look | ~0.2× · 20–40s |
+| `--direct` | No agent hand-off: the configured judge writes the synthesis (print/RPC modes always do this) | Scripting, or when you don't want the agent involved | +1 judge call |
 
-### Council-mode details
+Options combine: `--quick --verify` is a fast pass that still cross-checks.
+Verification batches each verifier's assigned issues into one session.
+Reviewers whose own review failed can still verify; having raised nothing,
+they're the most independent checkers. An issue every reviewer raised is
+marked *unanimous* (no one is left to check it independently), and the
+lead agent checks those itself.
 
-Round 1 is the same structured `[{file, line, severity, ...}]` prompt that
-all other modes use. Round 2 takes the dedupe-pass output, de-identifies
-each reviewer's contributions behind stable letter aliases (A, B, C, …,
-aligned by `provider/id`), and asks each reviewer to emit per-finding
-verdicts:
+How verification shows up:
+- The review panel shows a `✓n ✗n ?n` badge per issue (amber if anything
+  was refuted). The expanded view shows each verifier's evidence.
+- The lead agent is told to weigh the evidence, not the vote: a refutation
+  that cites concrete code usually means Dismissed, and a split verdict
+  means it reads the code itself.
+- In a live test, a quick reviewer claimed that deleting from a `Map` while
+  iterating skips keys. Both verifiers refuted it, citing iteration
+  semantics.
 
-```json
-[
-  {"target_finding_id": "g1", "verdict": "agree", "comment": "real"},
-  {"target_finding_id": "g3", "verdict": "extend",  "comment": "also breaks on Windows path with backslash", "suggested_severity": "high"}
-]
-```
+**Legacy modes** still parse: `--mode=council` → `--verify`,
+`--mode=triage` → `--quick`, and `--mode=balanced|light` → default. In
+`multi-review.json`, `"mode": "council"` sets `verify: true`.
 
-A group's verdict distribution drives escalation:
-- **0 disagree + 0 extend** = unanimous; no judge call, finding is rendered with the per-model round-1+round-2 attribution directly.
-- **Any disagree or extend** = disputed; judge runs once over the disputed-only list and emits `{target_finding_id, final_severity, verdict_text}` per entry. Severity may be promoted or demoted by one step based on technical grounds.
-
-Anonymity is **approximate**: aliases are stable per round (same A→spec
-across all reviewers). An alert reviewer can pattern-match their own
-involvement in a finding. Randomizing the alias map per-recipient per-round
-would tighten this; that's a future polish item.
-
-Sample triage verdict from a reviewer:
-```json
-{"escalate": true, "files_to_escalate": ["src/auth/login.ts"], "reasoning": "Token refresh race window widened without lock acquisition."}
-```
+Why council and triage were removed:
+- **Council** had every reviewer vote, text-only, on every finding,
+  including its own. Omitted votes counted as agreement, and anonymous
+  aliases added complexity without real independence. Verify is cheaper
+  and targets false positives directly.
+- **Triage** sent the full diff to every reviewer just to get a yes/no,
+  then re-ran all of them on the same diff when escalating, costing more
+  than a normal run. Tool-using reviewers plus the agent-written focus
+  already narrow attention.
 
 ## Wire-up
 
 1. **Arg parsing** — three shapes: `[/multi-review]`, `[/multi-review <pr>]`,
-   `[/multi-review <free-text focus>]`, plus `--spec=path`, `--mode=X`, and
+   `[/multi-review <free-text focus>]`, plus `--spec=path`, `--verify`, `--quick`, and
    `--direct` anywhere. Accepts `#1234`, raw `1234`, and `…/pull/1234`
    style URLs. Trailing prose after a PR number flows into the focus hint.
 
@@ -170,6 +173,15 @@ extglob — documented limitation.
    see Defaults). Bare specs fall back to model defaults; the SDK clamps
    per model.
 
+6b. **Verification** (`--verify`) — `assignVerifiers` gives each issue to
+   up to `verifiersPerFinding` reviewers outside its raisers, least-loaded
+   first. Each verifier gets the same brief and diff plus its assigned
+   issues (with the reviewers' comments, de-identified) and returns
+   `[{id, verdict, evidence}]`. Off-schema field names and verdict words
+   are normalized. A reply with no usable verdicts counts as a verifier
+   failure (shown under Warnings); the issues it was assigned stay
+   unverified, never counted as refuted.
+
 7. **Lead judgment** — when the agent called the tool, the result is the
    grouped findings plus a reviewer roster plus pstack-style instructions:
    verify single-reviewer findings before Act On, aim for ≤ 5 Act On items,
@@ -200,8 +212,13 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
   "judgeThinking": "high",
   "concurrency": 5,
   "temperature": 0.2,
-  "mode": "balanced",
-  "triageEscalationThreshold": 1,
+  "verify": false,
+  "verifiersPerFinding": 2,
+  "quickReviewers": [
+    "amd-gateway/Kimi-K2.7-Code@low",
+    "amd-gateway/DeepSeek-V4-Pro@low",
+    "amd-gateway/gemini-3.8-flash@low"
+  ],
   "reviewerTools": true,
   "reviewerTimeoutSec": 300,
   "dedupeModel": "amd-gateway-anthropic/Claude-Opus-5.5@low"
@@ -216,9 +233,9 @@ and tells you the exact shape to drop. Unknown fields, wrong types, or
 malformed JSON all degrade silently to in-code defaults so the file is
 never load-bearing.
 
-`mode` accepts `balanced` | `light` | `triage` | `council` (default `balanced`).
-`triageEscalationThreshold` is the count of reviewers needed to escalate
-in `triage` mode (default `1`); bump it to 2+ for consensus-only escalation.
+`verify: true` turns the verification round on for every run. The
+`quickReviewers` pool is used by `--quick`; its entries take the same
+`provider/id@level` form as `reviewers`.
 
 ### Per-reviewer thinking level (optional)
 

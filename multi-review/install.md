@@ -49,8 +49,15 @@ cat > ~/.pi/agent/multi-review.json << 'EOF'
   "judgeThinking": "high",
   "concurrency": 5,
   "temperature": 0.2,
-  "mode": "balanced",
-  "triageEscalationThreshold": 1
+  "verify": false,
+  "verifiersPerFinding": 2,
+  "quickReviewers": [
+    "amd-gateway/Kimi-K2.7-Code@low",
+    "amd-gateway/DeepSeek-V4-Pro@low",
+    "amd-gateway/gemini-3.8-flash@low"
+  ],
+  "reviewerTools": true,
+  "reviewerTimeoutSec": 300
 }
 EOF
 ```
@@ -70,8 +77,7 @@ cat > ~/.pi/agent/multi-review.json << 'EOF'
     "amd-gateway/gpt-6-astra@xhigh",
     "amd-gateway/Grok-4.7@max",
     "amd-gateway/Kimi-K2.7-Code"
-  ],
-  "mode": "balanced"
+  ]
 }
 EOF
 ```
@@ -80,29 +86,24 @@ Allowed levels: `off | minimal | low | medium | high | xhigh | max`. If a model
 clamps a level (e.g. `xhigh` on gemini-3.8-flash), the notify surfaces it
 under "clamped" so you can spot it without guessing.
 
-### Picking a mode
+### Review options
 
-Set `"mode"` in the defaults file (or override per-run with
-`--mode=balanced|light|triage|council`):
+- *(default)* — full pool with read-only tools; the main agent judges.
+- `--verify` — each issue is cross-checked by 2 reviewers who didn't
+  raise it (confirmed / refuted / uncertain, with evidence). ~1.5–2× cost.
+  Set `"verify": true` to make it the default.
+- `--quick` — the `quickReviewers` pool, no tools. 20–40s.
+- `--direct` — skip the agent; the configured judge synthesizes.
 
-- `balanced` — fan-out; the main agent judges (with `--direct`, an
-  external judge does). Default.
-- `light` — fan-out with deterministic synthesis. Only differs from
-  balanced in `--direct` runs, where it skips the judge call.
-- `triage` — cheap verdict first; auto-escalates to balanced when at
-  least `triageEscalationThreshold` reviewers (default 1) report a
-  concrete concern. Use for big diffs where most areas are noise.
-- `council` — 2 rounds of de-identified deliberation (raise, then
-  peer-aware verdicts) + judge iff round-2 disagreed/extended on
-  something. Roughly 2× cost; use for high-stakes architectural
-  reviews where disagreement is the signal.
+Old `--mode=` values still parse: `council` → `--verify`,
+`triage` → `--quick`, `balanced` and `light` → default.
 
 ## 3. Verify the two surfaces
 
 ### Slash command
 
 Inside pi, type `/multi-review ` and you should see completions for
-`--spec=`, `--mode=…`, `--direct`, `#`.
+`--spec=`, `--verify`, `--quick`, `--direct`, `#`.
 
 The command hands the task to your main agent. It reads the change, writes
 the reviewer brief, calls `multi_review`, and replies with an Act On /
@@ -130,7 +131,17 @@ Review an area of the codebase (no diff):
 
 Skip the agent and use the configured judge (also what print/RPC modes do):
 ```
-/multi-review --direct --mode=light
+/multi-review --direct
+```
+
+Cross-check every issue (adds ✓/✗/? badges with evidence):
+```
+/multi-review --verify --spec=docs/feature-spec.md
+```
+
+Fast first look:
+```
+/multi-review --quick
 ```
 
 Open the reviewer picker to (re-)configure your pool without dragging
@@ -170,10 +181,12 @@ multi-review · pool: 5 (amd-gateway/gpt-6-astra@xhigh, amd-gateway/Grok-4.7@hig
 Per-run status updates flow through the same status key and a temporary
 progress widget below the editor:
 ```
-multi-review · mode=balanced · resolving scope
-multi-review · mode=balanced · reviewers running (4/5)
+multi-review · mode=balanced+verify · resolving scope
+multi-review · mode=balanced+verify · reviewers running (4/5)
 latest: ✓ gpt-6-astra@xhigh (4/5) — 4 findings, 33.8s, 5 tool calls
-multi-review · mode=balanced · grouping findings (Claude-Opus-5.5)
+multi-review · mode=balanced+verify · grouping findings (Claude-Opus-5.5)
+multi-review · mode=balanced+verify · verifying findings (3/5)
+latest: ✓ DeepSeek-V4-Pro@high verified 3/3 (2 confirmed, 1 refuted), 8.9s
 multi-review · done
 ```
 When called through the `multi_review` tool, the same progress is also sent
@@ -186,12 +199,13 @@ via tool updates so the pending tool row changes as reviewers complete.
 | `no reviewers configured` | Add `multi-review.json` per step 2 |
 | A reviewer shows `timed out after 300s` | Raise `reviewerTimeoutSec`, or lower that reviewer's `@level` (Grok-4.7@high takes ~3 min with tools) |
 | `cannot read spec …` | `--spec` paths are relative to pi's cwd; the run refuses to continue without the spec rather than silently dropping it |
+| An issue shows `unanimous` instead of ✓/✗ | Every reviewer raised it, so nobody independent was left to verify it; the lead agent checks those itself |
 | `none of the configured reviewers resolved` | Confirm each spec is rule-typed in `~/.pi/agent/models.json` AND has its API key wired (`/login` or env var); the extension never adds models itself |
 | `judge model missing` | Same as above for `multi-review.json` → `judge` |
 | `git fetch origin pull/N/head failed` | Network or auth problem in the git remote; try running fetch by hand |
 | `gh pr view failed` | Either missing `gh`, unauthed, or repo isn't GitHub'd; we silently fall back to `git fetch`+`git diff` |
 | Judge output truncated | Calls request up to 32k output tokens (capped at the model's maxTokens); trim the reviewer pool if a judge still truncates |
-| Watching a run in print/RPC mode | Set `MULTI_REVIEW_DEBUG=1`; progress lines go to stderr. When scripting `pi -p`, close stdin (`< /dev/null`) or pi waits for it |
+| Watching a run in print/RPC mode | Set `MULTI_REVIEW_DEBUG=1`; progress lines go to stderr (`=2` also dumps raw reviewer replies). When scripting `pi -p`, close stdin (`< /dev/null`) or pi waits for it |
 | Directory listing empty in free-text mode | Either nothing tracked + nothing non-ignored-added by git, or all paths matched gitignore. Run `git ls-files --others --exclude-standard` in the project to see what we'd find. |
 | `.gitignore` patterns not honored | We support `*`/`?`/`[…]`/`**`/leading-`/`/trailing-`/`/`!` negation. No `{a,b}` alternation or extglob. Files that need deeper .gitignore features should be reviewed with `git` directly. |
 
