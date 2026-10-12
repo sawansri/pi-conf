@@ -37,6 +37,17 @@ Project-local instead: use `.pi/extensions/multi-review` in the repo. Pi
 loads any subdirectory that contains an `index.ts`. Restart pi or run
 `/reload`.
 
+### Claude Code (optional)
+
+To trigger reviews from Claude Code, install the skill:
+
+```bash
+ln -sfn ~/Projects/pi-conf/multi-review/claude-code ~/.claude/skills/multi-review
+```
+
+Then `/multi-review` in Claude Code (see README, "Using it from other
+harnesses"). It needs `pi` on PATH and the extension installed as above.
+
 ## 2. (Optional) Drop a defaults file
 
 ```bash

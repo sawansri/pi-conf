@@ -26,6 +26,7 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolUpdateCallback, ExtensionAPI, ExtensionContext, ExecResult } from "@mariozechner/pi-coding-agent";
 import type { Api, Model as PiModel } from "@mariozechner/pi-ai";
@@ -1779,6 +1780,12 @@ async function runAllReviewers(
 }
 
 const STRAGGLER_MIN_GRACE_MS = 45_000;
+
+/** Time-budget reserves for deadline-capped (headless) runs. */
+const MIN_PHASE_MS = 45_000;
+const GROUPING_RESERVE_MS = 30_000;
+const VERIFY_RESERVE_MS = 150_000;
+const FINAL_RESERVE_MS = 20_000;
 const STRAGGLER_GRACE_FACTOR = 0.5;
 
 /** Successful answers needed before stragglers get a deadline; pools of ≤2 always wait for everyone. */
@@ -3124,7 +3131,7 @@ async function runMultiReviewFromArgs(
 	signal: AbortSignal | undefined,
 	transientReviewers: ModelSpec[] | null = TRANSIENT_REVIEWERS,
 	onUpdate?: ToolUpdateFn,
-	runOptions: { agentLead?: boolean; brief?: BriefInput; focus?: string; flags?: Partial<ReviewFlags> } = {},
+	runOptions: { agentLead?: boolean; brief?: BriefInput; focus?: string; flags?: Partial<ReviewFlags>; deadlineMs?: number } = {},
 ): Promise<MultiReviewRunResult> {
 	const cfg = loadConfig();
 	const agentLead = runOptions.agentLead ?? false;
@@ -3197,7 +3204,7 @@ async function runMultiReviewFromArgs(
 		const judge = agentLead ? null : resolveJudge(ctx, cfg);
 		if (!agentLead && !judge) target.warnings.push(`judge ${cfg.judge} not in registry; showing deterministic synthesis`);
 		const resolvedRows = resolved.map((r) => ({ rs: r.rs, model: r.model, clamped: r.clamped }));
-		const result = await runReviewPipeline(ctx, cfg, flags, target, resolvedRows, runOpts, judge, agentLead, signal, progress);
+		const result = await runReviewPipeline(ctx, cfg, flags, target, resolvedRows, runOpts, judge, agentLead, signal, progress, runOptions.deadlineMs);
 		progress.finish("done");
 		return result;
 	} catch (err) {
@@ -3226,9 +3233,16 @@ async function runReviewPipeline(
 	agentLead: boolean,
 	signal: AbortSignal | undefined,
 	progress: MultiReviewProgressReporter,
+	deadlineMs?: number,
 ): Promise<MultiReviewRunResult> {
 	const label = describeFlags(flags);
 	const userPrompt = buildReviewUserPrompt(target);
+	// With a deadline (headless callers inside a capped shell), each phase's
+	// timeout shrinks to fit, keeping a reserve for the phases after it.
+	const fit = (opts: ReviewerRunOptions, reserveMs: number): ReviewerRunOptions =>
+		deadlineMs === undefined
+			? opts
+			: { ...opts, timeoutMs: Math.max(MIN_PHASE_MS, Math.min(opts.timeoutMs, deadlineMs - Date.now() - reserveMs)) };
 	progress.update({ phase: `fanning out to ${rows.length} reviewers (cap ${cfg.concurrency})`, done: 0, total: rows.length });
 	const runs = await runAllReviewers(
 		rows,
@@ -3238,7 +3252,7 @@ async function runReviewPipeline(
 		cfg.temperature,
 		signal,
 		ctx,
-		runOpts,
+		fit(runOpts, GROUPING_RESERVE_MS + (flags.verify ? VERIFY_RESERVE_MS : 0)),
 		(done, total, latest) => progress.update({ phase: "reviewers running", done, total, latest: formatReviewerProgressLine(done, total, latest) }),
 	);
 	const failure = allReviewersFailedResult(runs, label);
@@ -3253,8 +3267,11 @@ async function runReviewPipeline(
 	// Suspicions ride the verify round as claims of their own: every reviewer
 	// is eligible (none raised them), and they never touched discovery.
 	const suspicionGroups = suspicions.map(suspicionAsGroup);
-	if (flags.verify && groups.length + suspicionGroups.length > 0) {
-		const { failures } = await runVerification(ctx, cfg, rows, [...groups, ...suspicionGroups], userPrompt, runOpts, signal, progress);
+	const verifyTimeLeft = deadlineMs === undefined ? Number.POSITIVE_INFINITY : deadlineMs - Date.now() - FINAL_RESERVE_MS;
+	if (flags.verify && verifyTimeLeft < MIN_PHASE_MS) {
+		target.warnings.push(`verification skipped: only ${Math.max(0, Math.round(verifyTimeLeft / 1000))}s left of the run's time budget`);
+	} else if (flags.verify && groups.length + suspicionGroups.length > 0) {
+		const { failures } = await runVerification(ctx, cfg, rows, [...groups, ...suspicionGroups], userPrompt, fit(runOpts, FINAL_RESERVE_MS), signal, progress);
 		for (const f of failures) target.warnings.push(`verifier failed (its findings stay unverified): ${f}`);
 		suspicionGroups.forEach((g, i) => {
 			suspicions[i].verifications = g.verifications;
@@ -3309,6 +3326,158 @@ async function runReviewPipeline(
 		notifyLevel: "info",
 		injectMessage: { customType: "multi-review", content: markdown, details },
 	};
+}
+
+/**
+ * Brief fields shared by the multi_review tool and the headless
+ * /multi-review-run command (snake_case, as the tool schema exposes them).
+ */
+export interface ReviewRequest {
+	intent?: string;
+	spec_path?: string;
+	requirements?: string[];
+	suspicions?: string[];
+	context_files?: string[];
+	focus?: string;
+	scope?: "diff" | "area";
+	pr_number?: number;
+	verify?: boolean;
+	quick?: boolean;
+}
+
+/**
+ * Agent-led review: the caller (pi's main agent, or an external harness
+ * such as Claude Code via /multi-review-run) wrote the brief and will judge
+ * the results, so no external judge runs. Returns the findings markdown
+ * plus lead-judgment instructions, or an error.
+ */
+async function runAgentLedReview(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	params: ReviewRequest,
+	signal: AbortSignal | undefined,
+	onUpdate?: ToolUpdateFn,
+	deadlineMs?: number,
+): Promise<{ text: string; markdown: string; details: MultiReviewDetails } | { error: string }> {
+	const parts: string[] = [];
+	const focus = typeof params.focus === "string" ? params.focus.trim() : "";
+	if (typeof params.pr_number === "number") parts.push(String(params.pr_number));
+	else if (params.scope === "area") {
+		if (!focus) return { error: "multi_review: scope='area' needs `focus` describing the area to review." };
+		parts.push(focus);
+	}
+	const result = await runMultiReviewFromArgs(pi, ctx, parts.join(" "), signal, TRANSIENT_REVIEWERS, onUpdate, {
+		agentLead: true,
+		brief: {
+			intent: params.intent,
+			specPath: params.spec_path,
+			requirements: params.requirements,
+			suspicions: params.suspicions,
+			contextFiles: params.context_files,
+		},
+		focus: params.scope === "area" ? undefined : focus,
+		flags: { verify: params.verify, quick: params.quick },
+		deadlineMs,
+	});
+	if (!result.injectMessage) return { error: result.notifyMessage };
+	const { content: markdown, details } = result.injectMessage;
+	const hasSpec = Boolean(params.spec_path || params.requirements?.length);
+	return { text: `${markdown}\n\n${leadJudgmentInstructions(hasSpec)}`, markdown, details };
+}
+
+/** Validate a brief file's JSON into a ReviewRequest; wrong-typed fields are errors, unknown keys ignored. */
+export function parseReviewRequest(raw: unknown): ReviewRequest | { error: string } {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { error: "brief must be a JSON object" };
+	const o = raw as Record<string, unknown>;
+	const req: ReviewRequest = {};
+	const str = (k: keyof ReviewRequest) => {
+		if (o[k] === undefined) return;
+		if (typeof o[k] !== "string") throw new Error(`"${k}" must be a string`);
+		(req as Record<string, unknown>)[k] = o[k];
+	};
+	const strs = (k: keyof ReviewRequest) => {
+		if (o[k] === undefined) return;
+		if (!Array.isArray(o[k]) || !(o[k] as unknown[]).every((x) => typeof x === "string")) throw new Error(`"${k}" must be an array of strings`);
+		(req as Record<string, unknown>)[k] = o[k];
+	};
+	const bool = (k: keyof ReviewRequest) => {
+		if (o[k] === undefined) return;
+		if (typeof o[k] !== "boolean") throw new Error(`"${k}" must be true or false`);
+		(req as Record<string, unknown>)[k] = o[k];
+	};
+	try {
+		// A list of focus areas is a harmless shape slip; join instead of failing the run.
+		if (Array.isArray(o.focus) && o.focus.every((x) => typeof x === "string")) o.focus = (o.focus as string[]).join("; ");
+		str("intent"); str("spec_path"); str("focus");
+		strs("requirements"); strs("suspicions"); strs("context_files");
+		bool("verify"); bool("quick");
+		if (o.scope !== undefined) {
+			if (o.scope !== "diff" && o.scope !== "area") throw new Error(`"scope" must be "diff" or "area"`);
+			req.scope = o.scope;
+		}
+		if (o.pr_number !== undefined) {
+			if (typeof o.pr_number !== "number" || !Number.isInteger(o.pr_number) || o.pr_number <= 0) throw new Error(`"pr_number" must be a positive integer`);
+			req.pr_number = o.pr_number;
+		}
+	} catch (err) {
+		return { error: err instanceof Error ? err.message : String(err) };
+	}
+	return req;
+}
+
+/**
+ * Headless entry for other harnesses:
+ * `pi -p "/multi-review-run --brief=b.json [--out=r.json] [--max-seconds=540]" < /dev/null`.
+ * The run fits its phases into --max-seconds (default 540: inside a 10-minute
+ * shell cap) by shrinking reviewer/verifier timeouts and skipping
+ * verification when too little time is left, never by overrunning.
+ * Writes `{ok, text, markdown, details}` JSON plus a `.md` of `text` next to
+ * it and sets a non-zero exit code on failure (with `{ok:false, error}`
+ * written). Progress and the final `OK|FAILED <paths>` line go to stderr:
+ * pi's print mode redirects stdout, so callers should pass --out and rely
+ * on it plus the exit code.
+ */
+const HEADLESS_DEFAULT_MAX_SECONDS = 540;
+
+async function runHeadless(pi: ExtensionAPI, args: string, ctx: ExtensionContext): Promise<void> {
+	process.env.MULTI_REVIEW_DEBUG ||= "1";
+	const started = Date.now();
+	const briefFlag = parseValueFlag(args, "brief");
+	const outFlag = parseValueFlag(briefFlag.rest, "out");
+	const maxFlag = parseValueFlag(outFlag.rest, "max-seconds");
+	const maxSeconds = maxFlag.value ? Number(maxFlag.value) : HEADLESS_DEFAULT_MAX_SECONDS;
+	const outPath = path.resolve(ctx.cwd, outFlag.value ?? path.join(os.tmpdir(), `multi-review-${Date.now()}.json`));
+	const mdPath = outPath.replace(/\.json$/, "") + ".md";
+	const fail = (error: string) => {
+		fs.mkdirSync(path.dirname(outPath), { recursive: true });
+		fs.writeFileSync(outPath, JSON.stringify({ ok: false, error }, null, 2) + "\n");
+		console.error(`multi-review-run: ${error}`);
+		console.error(`FAILED ${outPath}`);
+		process.exitCode = 1;
+	};
+	if (!briefFlag.value) return fail("missing --brief=<path to brief JSON>");
+	let raw: unknown;
+	try {
+		raw = JSON.parse(fs.readFileSync(path.resolve(ctx.cwd, briefFlag.value), "utf8"));
+	} catch (err) {
+		return fail(`cannot read brief ${briefFlag.value}: ${err instanceof Error ? err.message : String(err)}`);
+	}
+	const req = parseReviewRequest(raw);
+	if ("error" in req) return fail(`invalid brief: ${req.error}`);
+	if (!Number.isFinite(maxSeconds) || maxSeconds < 60) return fail("--max-seconds must be a number ≥ 60");
+	let out: Awaited<ReturnType<typeof runAgentLedReview>>;
+	try {
+		out = await runAgentLedReview(pi, ctx, req, undefined, undefined, started + maxSeconds * 1000);
+	} catch (err) {
+		return fail(err instanceof Error ? err.message : String(err));
+	}
+	if ("error" in out) return fail(out.error);
+	const { target, ...rest } = out.details;
+	const details = { ...rest, scope: target.label, warnings: target.warnings };
+	fs.mkdirSync(path.dirname(outPath), { recursive: true });
+	fs.writeFileSync(outPath, JSON.stringify({ ok: true, text: out.text, markdown: out.markdown, details }, null, 2) + "\n");
+	fs.writeFileSync(mdPath, out.text + "\n");
+	console.error(`OK ${mdPath} ${outPath}`);
 }
 
 const ARG_COMPLETIONS: Array<{ token: string; label: string; description: string }> = [
@@ -3431,6 +3600,16 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// Headless entry for other harnesses (Claude Code etc.): brief in, findings out.
+	pi.registerCommand("multi-review-run", {
+		description:
+			"Headless review for external harnesses: /multi-review-run --brief=<brief.json> [--out=<result.json>] [--max-seconds=540]. " +
+			"Brief fields mirror the multi_review tool. Writes findings + lead instructions to <out> and <out>.md.",
+		handler: async (args, ctx) => {
+			await runHeadless(pi, args, ctx);
+		},
+	});
+
 	// Slash command — picker entry point. Opens the multi-select TUI
 	// directly without running the rest of the pipeline. Useful for
 	// configuring the pool in advance without dragging scope into it.
@@ -3542,34 +3721,11 @@ export default function (pi: ExtensionAPI) {
 			})),
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const parts: string[] = [];
-			const focus = typeof params.focus === "string" ? params.focus.trim() : "";
-			if (typeof params.pr_number === "number") parts.push(String(params.pr_number));
-			else if (params.scope === "area") {
-				if (!focus) throw new Error("multi_review: scope='area' needs `focus` describing the area to review.");
-				parts.push(focus);
-			}
-			const brief: BriefInput = {
-				intent: params.intent,
-				specPath: params.spec_path,
-				requirements: params.requirements,
-				suspicions: params.suspicions,
-				contextFiles: params.context_files,
-			};
-			const result = await runMultiReviewFromArgs(pi, ctx, parts.join(" "), signal, TRANSIENT_REVIEWERS, onUpdate, {
-				agentLead: true,
-				brief,
-				focus: params.scope === "area" ? undefined : focus,
-				flags: { verify: params.verify, quick: params.quick },
-			});
-			if (!result.injectMessage) {
-				throw new Error(result.notifyMessage);
-			}
-			const { content: markdown, details } = result.injectMessage;
-			const hasSpec = Boolean(params.spec_path || params.requirements?.length);
+			const out = await runAgentLedReview(pi, ctx, params, signal, onUpdate);
+			if ("error" in out) throw new Error(out.error);
 			return {
-				content: [{ type: "text", text: `${markdown}\n\n${leadJudgmentInstructions(hasSpec)}` }],
-				details: { ...details, markdown },
+				content: [{ type: "text", text: out.text }],
+				details: { ...out.details, markdown: out.markdown },
 			};
 		},
 		renderResult(result, options, theme) {

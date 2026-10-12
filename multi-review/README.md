@@ -92,6 +92,52 @@ that nobody raised is either wrong (s2 above: both verifiers refuted it,
 and the lead dismissed its own hypothesis) or a shared blind spot, and the
 verifier evidence or the lead's own reading decides which.
 
+## Using it from other harnesses (Claude Code, scripts, CI)
+
+The review engine runs headless, so any harness that can run a shell
+command can be the lead reviewer:
+
+```bash
+pi -p "/multi-review-run --brief=brief.json --out=/tmp/mr/result.json" < /dev/null
+```
+
+- **Input:** `brief.json` has the same fields as the `multi_review` tool
+  (`intent`, `spec_path`, `requirements`, `suspicions`, `context_files`,
+  `focus`, `scope`, `pr_number`, `verify`, `quick`). Wrong-typed fields are
+  rejected and unknown keys ignored.
+- **Output:** `result.json` holds `{ok, text, markdown, details}`, where
+  `details` has `groups`, `suspicions`, `warnings` and the reviewer roster.
+  `result.md` holds `text`: the findings plus the lead-judgment
+  instructions. On failure: `{ok: false, error}` and exit code 1.
+- **No external judge runs.** The caller is the lead and judges the results.
+- **Scope** comes from the working directory. Run it from the repo root.
+- **stderr** carries progress and the final `OK <md> <json>` /
+  `FAILED <json>` line. pi's print mode redirects stdout, so use `--out`
+  and the exit code. `< /dev/null` is required (`pi -p` waits for stdin).
+
+### Claude Code
+
+`claude-code/SKILL.md` is a Claude Code skill wrapping this:
+
+```bash
+ln -sfn ~/Projects/pi-conf/multi-review/claude-code ~/.claude/skills/multi-review
+```
+
+The flow:
+1. In Claude Code, `/multi-review [--spec=path] [--verify] [--quick] [#PR | area]`,
+   or a request like "get a multi-model review of this".
+2. Claude reads the diff and the spec, then writes the brief with the same
+   discipline: goals and outside facts, risk areas, and its hypotheses
+   kept in `suspicions`.
+3. It runs `/multi-review-run` in the background (Bash, `run_in_background`),
+   waits for the completion notification, and reads `result.md`.
+4. It delivers the lead verdict: Intent · Reviewers · Spec conformance ·
+   Act On · Consider · Noted · Dismissed · Agreement Map.
+
+Claude Code becomes the lead with the implementation context, just as
+pi's main agent is inside pi. The skill pre-approves only `pi -p`,
+`mkdir`, `git`, `gh pr`, Read and Write.
+
 ## Review options
 
 The modes used to mix three separate choices: breadth (which reviewers),
