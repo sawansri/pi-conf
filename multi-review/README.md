@@ -227,7 +227,7 @@ its own option:
 
 | Option | What it does | When | Cost / time (5-reviewer pool) |
 |--------|-------------|------|------------------------------|
-| *(default)* | Sonnet 5.5 + gpt-6-sol + gpt-6-luna + Gemini 4 Argon with read-only tools → grouping → the main agent judges | Most reviews | ~1× · ~2–3 min on a 700-line diff |
+| *(default)* | Sonnet 5.5 + gpt-6-sol + gpt-6-luna + Gemini 4 Argon@medium with read-only tools → grouping → the main agent judges | Most reviews | ~1× · ~2–3 min on a 700-line diff |
 | `--verify` | Adds a cross-check round: each issue goes to `verifiersPerFinding` (2) reviewers **who did not raise it**. With tools, they reply confirmed / refuted / uncertain plus code evidence | High-stakes changes; when false positives are expensive | ~1.5–2× |
 | `--quick` | `quickReviewers` pool (gpt-6-luna@low, Haiku 5.5, Gemini Flash@low), single completions, no tools | Small diffs, a cheap first look | ~0.2× · 10–50s |
 | `--direct` | No agent hand-off: the configured judge writes the synthesis (print/RPC modes always do this) | Scripting, or when you don't want the agent involved | +1 judge call |
@@ -404,7 +404,12 @@ Findings:
 - **Gemini 4 Argon joined the default pool after this benchmark** and
   isn't in the table yet. It's a frontier model from a different family
   (Google) than the Claude and GPT reviewers, so its blind spots should
-  overlap least with theirs.
+  overlap least with theirs. On a narrow area review it took ~350s at
+  `@high` (past the straggler cutoff) and ~270s at `@medium`, where it
+  confirmed the main findings and added one no other reviewer raised.
+- **DeepSeek V4.1 Flash** (the gateway's pre-1017 checkpoint) works with
+  tools and thinking but was too slow to review: cut as a straggler at
+  `@high`, timed out at 900s at `@max` after ~200k characters of reasoning.
 - **Parse failures were the biggest quality loss.** 4 of 25 runs lost all
   output to malformed JSON (raw backslashes and quotes from quoted code).
   This led to the string-aware JSON repair, plus a model re-emit fallback.
@@ -428,7 +433,7 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
     "amd-gateway-anthropic/Claude-Sonnet-5.5@high",
     "amd-gateway/gpt-6-sol@xhigh",
     "amd-gateway/gpt-6-luna@high",
-    "amd-gateway/gemini-4-argon@high"
+    "amd-gateway/gemini-4-argon@medium"
   ],
   "judge": "amd-gateway-anthropic/Claude-Opus-5.5",
   "judgeThinking": "high",

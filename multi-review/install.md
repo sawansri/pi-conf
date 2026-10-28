@@ -60,7 +60,7 @@ cat > ~/.pi/agent/multi-review.json << 'EOF'
     "amd-gateway-anthropic/Claude-Sonnet-5.5@high",
     "amd-gateway/gpt-6-sol@xhigh",
     "amd-gateway/gpt-6-luna@high",
-    "amd-gateway/gemini-4-argon@high"
+    "amd-gateway/gemini-4-argon@medium"
   ],
   "judge": "amd-gateway-anthropic/Claude-Opus-5.5",
   "judgeThinking": "high",
@@ -210,7 +210,7 @@ follows it.
 
 The status footer shows the loaded pool on session start:
 ```
-multi-review · pool: 4 (amd-gateway-anthropic/Claude-Sonnet-5.5@high, amd-gateway/gpt-6-sol@xhigh, amd-gateway/gpt-6-luna@high, amd-gateway/gemini-4-argon@high)
+multi-review · pool: 4 (amd-gateway-anthropic/Claude-Sonnet-5.5@high, amd-gateway/gpt-6-sol@xhigh, amd-gateway/gpt-6-luna@high, amd-gateway/gemini-4-argon@medium)
 ```
 
 Per-run status updates flow through the same status key and a temporary

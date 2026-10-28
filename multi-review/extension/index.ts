@@ -156,7 +156,10 @@ export function describeFlags(flags: ReviewFlags): string {
  * zero dubious findings and was the fastest; gpt-6-sol adds the most valid
  * extras per minute; gpt-6-luna is precise (zero dubious) and fast.
  * Gemini 4 Argon was added after the benchmark as a frontier model from a
- * third family (Google), for diversity of blind spots. Gemini 3.8 Flash
+ * third family (Google), for diversity of blind spots; at @medium, since
+ * @high (~350s on a narrow area review) ran past the straggler cutoff.
+ * DeepSeek V4.1 Flash was tried too: tools and thinking work, but @high
+ * was cut as a straggler and @max timed out at 900s. Gemini 3.8 Flash
  * was dropped from the main pool: on this gateway it routinely ran past the
  * straggler cutoff even at @medium, adding delay and no findings. Raising
  * reasoning to max didn't improve any model, so levels stay moderate for
@@ -168,7 +171,7 @@ const DEFAULTS: MultiReviewConfig = {
 		"amd-gateway-anthropic/Claude-Sonnet-5.5@high",
 		"amd-gateway/gpt-6-sol@xhigh",
 		"amd-gateway/gpt-6-luna@high",
-		"amd-gateway/gemini-4-argon@high",
+		"amd-gateway/gemini-4-argon@medium",
 	],
 	judge: "amd-gateway-anthropic/Claude-Opus-5.5",
 	judgeThinking: "high",
