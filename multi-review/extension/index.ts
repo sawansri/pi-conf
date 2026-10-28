@@ -158,7 +158,10 @@ export function describeFlags(flags: ReviewFlags): string {
  * Gemini 4 Argon was added after the benchmark as a frontier model from a
  * third family (Google), for diversity of blind spots; at @medium, since
  * @high (~350s on a narrow area review) ran past the straggler cutoff.
- * DeepSeek V4.1 Flash was tried too: tools and thinking work, but @high
+ * gpt-6.1-sol@high replaced gpt-6-sol@xhigh: about as fast (153s vs 125s on
+ * a narrow area review) and it caught both models' unique findings; at
+ * @xhigh it took 386s. Grok-4.7 and GLM-5.3-Flash were too slow (900s
+ * timeouts; GLM@high 777s). DeepSeek V4.1 Flash was tried too: tools and thinking work, but @high
  * was cut as a straggler and @max timed out at 900s. Gemini 3.8 Flash
  * was dropped from the main pool: on this gateway it routinely ran past the
  * straggler cutoff even at @medium, adding delay and no findings. Raising
@@ -169,7 +172,7 @@ export function describeFlags(flags: ReviewFlags): string {
 const DEFAULTS: MultiReviewConfig = {
 	reviewers: [
 		"amd-gateway-anthropic/Claude-Sonnet-5.5@high",
-		"amd-gateway/gpt-6-sol@xhigh",
+		"amd-gateway/gpt-6.1-sol@high",
 		"amd-gateway/gpt-6-luna@high",
 		"amd-gateway/gemini-4-argon@medium",
 	],

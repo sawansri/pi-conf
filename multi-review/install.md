@@ -58,7 +58,7 @@ cat > ~/.pi/agent/multi-review.json << 'EOF'
 {
   "reviewers": [
     "amd-gateway-anthropic/Claude-Sonnet-5.5@high",
-    "amd-gateway/gpt-6-sol@xhigh",
+    "amd-gateway/gpt-6.1-sol@high",
     "amd-gateway/gpt-6-luna@high",
     "amd-gateway/gemini-4-argon@medium"
   ],
@@ -92,7 +92,7 @@ cat > ~/.pi/agent/multi-review.json << 'EOF'
 {
   "reviewers": [
     "amd-gateway-anthropic/Claude-Sonnet-5.5@high",
-    "amd-gateway/gpt-6-sol@xhigh",
+    "amd-gateway/gpt-6.1-sol@high",
     "amd-gateway/gpt-6-luna"
   ]
 }
@@ -210,7 +210,7 @@ follows it.
 
 The status footer shows the loaded pool on session start:
 ```
-multi-review · pool: 4 (amd-gateway-anthropic/Claude-Sonnet-5.5@high, amd-gateway/gpt-6-sol@xhigh, amd-gateway/gpt-6-luna@high, amd-gateway/gemini-4-argon@medium)
+multi-review · pool: 4 (amd-gateway-anthropic/Claude-Sonnet-5.5@high, amd-gateway/gpt-6.1-sol@high, amd-gateway/gpt-6-luna@high, amd-gateway/gemini-4-argon@medium)
 ```
 
 Per-run status updates flow through the same status key and a temporary
@@ -218,7 +218,7 @@ progress widget below the editor:
 ```
 multi-review · mode=balanced+verify · resolving scope
 multi-review · mode=balanced+verify · reviewers running (2/4)
-latest: ✓ gpt-6-sol@xhigh (2/4) — 11 findings, 132.5s, 24 tool calls
+latest: ✓ gpt-6.1-sol@high (2/4) — 11 findings, 132.5s, 24 tool calls
 multi-review · mode=balanced+verify · grouping findings (Claude-Opus-5.5)
 multi-review · mode=balanced+verify · verifying findings (2/3)
 latest: ✓ gpt-6-luna@high verified 3/3 (2 confirmed, 1 refuted), 8.9s

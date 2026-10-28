@@ -227,7 +227,7 @@ its own option:
 
 | Option | What it does | When | Cost / time (5-reviewer pool) |
 |--------|-------------|------|------------------------------|
-| *(default)* | Sonnet 5.5 + gpt-6-sol + gpt-6-luna + Gemini 4 Argon@medium with read-only tools → grouping → the main agent judges | Most reviews | ~1× · ~2–3 min on a 700-line diff |
+| *(default)* | Sonnet 5.5 + gpt-6.1-sol + gpt-6-luna + Gemini 4 Argon@medium with read-only tools → grouping → the main agent judges | Most reviews | ~1× · ~2–3 min on a 700-line diff |
 | `--verify` | Adds a cross-check round: each issue goes to `verifiersPerFinding` (2) reviewers **who did not raise it**. With tools, they reply confirmed / refuted / uncertain plus code evidence | High-stakes changes; when false positives are expensive | ~1.5–2× |
 | `--quick` | `quickReviewers` pool (gpt-6-luna@low, Haiku 5.5, Gemini Flash@low), single completions, no tools | Small diffs, a cheap first look | ~0.2× · 10–50s |
 | `--direct` | No agent hand-off: the configured judge writes the synthesis (print/RPC modes always do this) | Scripting, or when you don't want the agent involved | +1 judge call |
@@ -411,6 +411,14 @@ Findings:
 - **DeepSeek V4.1 Flash** (the gateway's pre-1017 checkpoint) works with
   tools and thinking but was too slow to review: cut as a straggler at
   `@high`, timed out at 900s at `@max` after ~200k characters of reasoning.
+- **gpt-6.1-sol@high replaced gpt-6-sol@xhigh.** On the same narrow area
+  review: 6-sol@xhigh took 125s (5 findings), 6.1-sol@xhigh 386s (6),
+  6.1-sol@high 153s (6, including each other model's unique finding),
+  6.1-sol@medium 83s (4).
+- **Grok-4.7 and GLM-5.3-Flash are still too slow** on this gateway, even
+  with GLM's on-prem endpoint no longer hanging. Grok timed out at 900s
+  at `@high` and `@xhigh` (3–4.5 min per turn). GLM took 777s at `@high`
+  (4 findings, rated lower) and timed out at `@max`.
 - **Parse failures were the biggest quality loss.** 4 of 25 runs lost all
   output to malformed JSON (raw backslashes and quotes from quoted code).
   This led to the string-aware JSON repair, plus a model re-emit fallback.
@@ -432,7 +440,7 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
 {
   "reviewers": [
     "amd-gateway-anthropic/Claude-Sonnet-5.5@high",
-    "amd-gateway/gpt-6-sol@xhigh",
+    "amd-gateway/gpt-6.1-sol@high",
     "amd-gateway/gpt-6-luna@high",
     "amd-gateway/gemini-4-argon@medium"
   ],
