@@ -306,8 +306,9 @@ extglob — documented limitation.
    `ctx.modelRegistry.streamSimple()` call. Both paths use registry auth
    (literal keys and custom headers in `models.json`). Each reviewer gets
    `reviewerTimeoutSec` (default 420). **Straggler cutoff:** once a quorum
-   (⅔ of the pool, at least 2) has answered, the rest get half as long
-   again as the quorum took (min 45s), then are cut. A degraded endpoint
+   (⅔ of the pool, at least 2) has answered, the rest get as long again
+   as the quorum took (min 45s, and never cut before 300s in total), then
+   are cut. A degraded endpoint
    no longer holds the whole review hostage. Aborts are authoritative: a
    call returns when its signal fires even if the provider stream hangs.
    Abort is threaded from the tool's signal. Fail-soft: one reviewer's failure doesn't stop the rest, but

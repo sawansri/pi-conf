@@ -2021,9 +2021,10 @@ async function runAllReviewers(
 	let done = 0;
 	const total = resolved.length;
 
-	// Straggler cutoff: once a quorum has answered, the rest get half as long
-	// again as the quorum took (min STRAGGLER_MIN_GRACE_MS). A degraded endpoint
-	// otherwise holds the whole review hostage until its full timeout.
+	// Straggler cutoff: once a quorum has answered, the rest get as long
+	// again as the quorum took (min STRAGGLER_MIN_GRACE_MS, and never before
+	// STRAGGLER_MIN_TOTAL_MS overall). A degraded endpoint otherwise holds
+	// the whole review hostage until its full timeout.
 	const started = Date.now();
 	const quorum = stragglerQuorum(total);
 	const straggler = new AbortController();
@@ -2034,7 +2035,7 @@ async function runAllReviewers(
 		if (ok) okCount++;
 		if (stragglerTimer || okCount < quorum || done >= total) return;
 		const quorumMs = Date.now() - started;
-		const graceMs = Math.max(STRAGGLER_MIN_GRACE_MS, quorumMs * STRAGGLER_GRACE_FACTOR);
+		const graceMs = Math.max(STRAGGLER_MIN_GRACE_MS, quorumMs * STRAGGLER_GRACE_FACTOR, STRAGGLER_MIN_TOTAL_MS - quorumMs);
 		stragglerTimer = setTimeout(() => {
 			straggler.abort(`cut as straggler: ${quorum}/${total} reviewers finished in ${Math.round(quorumMs / 1000)}s, waited ${Math.round(graceMs / 1000)}s more`);
 		}, graceMs);
@@ -2097,7 +2098,14 @@ const MIN_PHASE_MS = 45_000;
 const GROUPING_RESERVE_MS = 30_000;
 const VERIFY_RESERVE_MS = 150_000;
 const FINAL_RESERVE_MS = 20_000;
-const STRAGGLER_GRACE_FACTOR = 0.5;
+const STRAGGLER_GRACE_FACTOR = 1.0;
+/**
+ * Stragglers are never cut before this much total time. Reviewer times vary
+ * 2-5x between runs, so a deadline relative to a fast quorum alone cut
+ * healthy main reviewers (Argon@medium ~270s, gpt-6.1-sol@high ~160s).
+ * reviewerTimeoutSec still caps the wait.
+ */
+const STRAGGLER_MIN_TOTAL_MS = 300_000;
 
 /** Successful answers needed before stragglers get a deadline; pools of ≤2 always wait for everyone. */
 export function stragglerQuorum(total: number): number {
