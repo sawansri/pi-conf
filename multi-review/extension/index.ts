@@ -1411,8 +1411,10 @@ function normalizeSeverity(raw: string): ReviewerFinding["severity"] {
 
 export function parseReviewerJson(rawText: string): ReviewerFinding[] {
 	const text = rawText.trim();
-	// Strip leading/trailing fences if present.
-	const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+	// Strip a wrapping fence if present. A bare array is used as-is, and the
+	// match runs first fence to last: findings often quote fenced code, and a
+	// lazy match would land between two of those inner fences.
+	const fenceMatch = text.startsWith("[") ? null : text.match(/```(?:json)?\s*([\s\S]*)\s*```/i);
 	const inner = fenceMatch ? fenceMatch[1] : text;
 	// Find first '[' and last ']' to ignore any wrapper text. A reply with no
 	// array at all is a protocol failure, not "no findings" — only an explicit
