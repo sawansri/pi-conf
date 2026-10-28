@@ -28,7 +28,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentToolUpdateCallback, ExtensionAPI, ExtensionContext, ExecResult } from "@mariozechner/pi-coding-agent";
+import type { AgentSessionEvent, AgentToolUpdateCallback, ExtensionAPI, ExtensionContext, ExecResult } from "@mariozechner/pi-coding-agent";
 import type { Api, Model as PiModel } from "@mariozechner/pi-ai";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { createAgentSession, DefaultResourceLoader, getAgentDir, getMarkdownTheme, SessionManager, SettingsManager } from "@mariozechner/pi-coding-agent";
@@ -412,6 +412,8 @@ interface MultiReviewProgressPatch {
 
 interface MultiReviewProgressReporter {
 	update(patch: MultiReviewProgressPatch): void;
+	/** One line per running reviewer session (from ReviewTrace). */
+	activity(lines: string[]): void;
 	finish(summary: string): void;
 	clear(): void;
 }
@@ -436,6 +438,8 @@ function createProgressReporter(ctx: ExtensionContext, mode: string, onUpdate?: 
 		phase: "starting",
 	};
 	let clearTimer: ReturnType<typeof setTimeout> | undefined;
+	let activity: string[] = [];
+	let lastActivityLog = 0;
 
 	function renderLines(theme: { fg: (color: string, text: string) => string }, width: number): string[] {
 		const elapsed = `${Math.max(0, Math.round((Date.now() - startedAt) / 1000))}s`;
@@ -455,6 +459,7 @@ function createProgressReporter(ctx: ExtensionContext, mode: string, onUpdate?: 
 		];
 		if (state.latest) lines.push(truncateToWidth(theme.fg("dim", `latest: ${state.latest}`), width));
 		for (const ev of events.slice(-3)) lines.push(truncateToWidth(theme.fg("muted", `  ${ev}`), width));
+		for (const a of activity) lines.push(truncateToWidth(theme.fg("dim", `  ⋯ ${a}`), width));
 		return lines;
 	}
 
@@ -467,15 +472,23 @@ function createProgressReporter(ctx: ExtensionContext, mode: string, onUpdate?: 
 		// Print/RPC modes have no widget; this is the only way to watch a run there.
 		if (process.env.MULTI_REVIEW_DEBUG) console.error(`[${((Date.now() - startedAt) / 1000).toFixed(1)}s] ${statusLine}${state.latest ? ` · ${state.latest}` : ""}`);
 		setStatus(statusLine, ctx);
-		if (ctx.hasUI) {
-			ctx.ui.setWidget(PROGRESS_WIDGET_KEY, (_tui, theme) => ({
-				render: (width: number) => renderLines(theme, width),
-				invalidate: () => {},
-			}), { placement: "belowEditor" });
-		}
+		showWidget();
+		publishUpdate();
+	}
+
+	function showWidget(): void {
+		if (!ctx.hasUI) return;
+		ctx.ui.setWidget(PROGRESS_WIDGET_KEY, (_tui, theme) => ({
+			render: (width: number) => renderLines(theme, width),
+			invalidate: () => {},
+		}), { placement: "belowEditor" });
+	}
+
+	function publishUpdate(): void {
+		const live = activity.map((a) => `\n⋯ ${a}`).join("");
 		onUpdate?.({
-			content: [{ type: "text", text: `multi-review · ${mode} · ${state.phase}${state.done !== undefined && state.total !== undefined ? ` (${state.done}/${state.total})` : ""}${state.latest ? `\n${state.latest}` : ""}` }],
-			details: { phase: state.phase, done: state.done, total: state.total, latest: state.latest, mode },
+			content: [{ type: "text", text: `multi-review · ${mode} · ${state.phase}${state.done !== undefined && state.total !== undefined ? ` (${state.done}/${state.total})` : ""}${state.latest ? `\n${state.latest}` : ""}${live}` }],
+			details: { phase: state.phase, done: state.done, total: state.total, latest: state.latest, mode, activity },
 		});
 	}
 
@@ -485,8 +498,19 @@ function createProgressReporter(ctx: ExtensionContext, mode: string, onUpdate?: 
 			if (patch.latest) events.push(patch.latest);
 			publish();
 		},
+		activity(lines: string[]): void {
+			activity = lines;
+			// Print mode's only view: a heartbeat, not every throttled refresh.
+			if (process.env.MULTI_REVIEW_DEBUG && lines.length > 0 && Date.now() - lastActivityLog >= ACTIVITY_LOG_MS) {
+				lastActivityLog = Date.now();
+				for (const a of lines) console.error(`[${((Date.now() - startedAt) / 1000).toFixed(1)}s]   ⋯ ${a}`);
+			}
+			showWidget();
+			publishUpdate();
+		},
 		finish(summary: string): void {
 			state = { ...state, phase: summary, latest: undefined };
+			activity = [];
 			publish();
 			clearTimer = setTimeout(() => this.clear(), 4000);
 			clearTimer.unref?.();
@@ -503,6 +527,175 @@ function createProgressReporter(ctx: ExtensionContext, mode: string, onUpdate?: 
 			}
 		},
 	};
+}
+
+// ---------- live reviewer trace ----------
+
+/** Tool nested reviewers call to report their plan and each finished item. */
+const PROGRESS_TOOL = "progress";
+
+/** Snapshot/refresh cadence for progress.json and the activity lines. */
+const ACTIVITY_REFRESH_MS = 2_000;
+/** Stderr heartbeat cadence for print mode. */
+const ACTIVITY_LOG_MS = 30_000;
+
+/** What one reviewer or verifier session is doing right now. */
+interface ReviewerActivity {
+	reviewer: string;
+	phase: "review" | "verify";
+	state: "running" | "ok" | "failed";
+	startedAt: number;
+	finishedAt?: number;
+	turns: number;
+	toolCalls: number;
+	lastTool?: string;
+	/** Characters streamed so far: reasoning, and visible reply text. */
+	thinkingChars: number;
+	textChars: number;
+	/** Self-reported through the progress tool. */
+	plan: string[];
+	done: string[];
+	note?: string;
+}
+
+interface ReviewerTraceHandle {
+	onEvent(event: AgentSessionEvent): void;
+	finish(ok: boolean, note: string): void;
+}
+
+/** Compact `read index.ts:1400` style label for a tool call; paths relative to `cwd`. */
+function describeToolCall(name: string, args: unknown, cwd: string): string {
+	const a = (args ?? {}) as Record<string, unknown>;
+	const raw = [a.pattern, a.path, a.glob].find((v) => typeof v === "string") as string | undefined;
+	const target = raw && path.isAbsolute(raw) && raw.startsWith(cwd + path.sep) ? path.relative(cwd, raw) : raw;
+	const at = typeof a.offset === "number" ? `:${a.offset}` : "";
+	return target ? `${name} ${target.length > 60 ? `…${target.slice(-59)}` : target}${at}` : name;
+}
+
+function formatChars(n: number): string {
+	return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+}
+
+function formatActivityLine(a: ReviewerActivity, now: number): string {
+	const secs = Math.round(((a.finishedAt ?? now) - a.startedAt) / 1000);
+	const elapsed = secs >= 60 ? `${Math.floor(secs / 60)}m${String(secs % 60).padStart(2, "0")}s` : `${secs}s`;
+	const parts = [`${shortSpec(a.reviewer)} ${a.phase}`, elapsed];
+	if (a.plan.length > 0) {
+		// By count, not text: models rarely repeat a plan item verbatim.
+		const now = a.plan[a.done.length];
+		parts.push(`${Math.min(a.done.length, a.plan.length)}/${a.plan.length} checked${now && a.state === "running" ? ` (now: ${now.length > 50 ? `${now.slice(0, 49)}…` : now})` : ""}`);
+	}
+	if (a.turns > 0) parts.push(`turn ${a.turns}`, `${a.toolCalls} tool${a.toolCalls === 1 ? "" : "s"}`);
+	parts.push(`${formatChars(a.thinkingChars)} thinking`, `${formatChars(a.textChars)} text`);
+	if (a.lastTool) parts.push(`last: ${a.lastTool}`);
+	return parts.join(" · ");
+}
+
+/**
+ * Live view of every reviewer/verifier session, so the lead can watch a run
+ * instead of waiting on it blind. Writes to `dir`:
+ *  - progress.json: per-session snapshot (turns, tool calls, streamed
+ *    thinking/text size, last tool), rewritten at most every ACTIVITY_REFRESH_MS;
+ *  - trace.jsonl: each tool call and each completed assistant message
+ *    (thinking and text in full), appended as they happen.
+ * Running sessions also feed the progress widget / tool updates.
+ */
+class ReviewTrace {
+	readonly progressPath: string;
+	readonly tracePath: string;
+	private readonly sessions: ReviewerActivity[] = [];
+	private lastRefresh = 0;
+	private refreshTimer: ReturnType<typeof setTimeout> | undefined;
+
+	constructor(readonly dir: string, private readonly onActivity?: (lines: string[]) => void) {
+		fs.mkdirSync(dir, { recursive: true });
+		this.progressPath = path.join(dir, "progress.json");
+		this.tracePath = path.join(dir, "trace.jsonl");
+		fs.writeFileSync(this.tracePath, "");
+		this.refresh();
+	}
+
+	start(reviewer: string, phase: ReviewerActivity["phase"], cwd: string): ReviewerTraceHandle {
+		const a: ReviewerActivity = { reviewer, phase, state: "running", startedAt: Date.now(), turns: 0, toolCalls: 0, thinkingChars: 0, textChars: 0, plan: [], done: [] };
+		this.sessions.push(a);
+		this.append(a, { kind: "start" });
+		this.schedule();
+		return {
+			onEvent: (event) => {
+				if (event.type === "turn_start") a.turns++;
+				else if (event.type === "tool_execution_start" && event.toolName === PROGRESS_TOOL) {
+					const args = (event.args ?? {}) as { plan?: unknown; done?: unknown };
+					// Some models resend `plan: []` with every `done`; only a non-empty plan replaces it.
+					const plan = Array.isArray(args.plan) ? args.plan.filter((x): x is string => typeof x === "string") : [];
+					if (plan.length > 0) a.plan = plan;
+					if (typeof args.done === "string") a.done.push(args.done);
+					this.append(a, { kind: "progress", plan: args.plan, done: args.done });
+				} else if (event.type === "tool_execution_start") {
+					a.toolCalls++;
+					a.lastTool = describeToolCall(event.toolName, event.args, cwd);
+					this.append(a, { kind: "tool", tool: event.toolName, args: event.args });
+				} else if (event.type === "message_update") {
+					const e = event.assistantMessageEvent;
+					if (e.type === "thinking_delta") a.thinkingChars += e.delta.length;
+					else if (e.type === "text_delta") a.textChars += e.delta.length;
+				} else if (event.type === "message_end" && (event.message as { role?: string }).role === "assistant") {
+					const content = ((event.message as { content?: unknown[] }).content ?? []) as Array<{ type: string; text?: string; thinking?: string }>;
+					const thinking = content.filter((c) => c.type === "thinking").map((c) => c.thinking ?? "").join("\n");
+					const text = content.filter((c) => c.type === "text").map((c) => c.text ?? "").join("");
+					if (thinking || text) this.append(a, { kind: "message", turn: a.turns, thinking, text });
+				} else return;
+				this.schedule();
+			},
+			finish: (ok, note) => {
+				a.state = ok ? "ok" : "failed";
+				a.finishedAt = Date.now();
+				a.note = note;
+				this.append(a, { kind: "finish", ok, note });
+				this.refresh();
+			},
+		};
+	}
+
+	/** Stop the pending refresh; leaves the files for the lead to read. */
+	close(): void {
+		if (this.refreshTimer) clearTimeout(this.refreshTimer);
+		this.refreshTimer = undefined;
+		this.refresh();
+	}
+
+	private append(a: ReviewerActivity, entry: Record<string, unknown>): void {
+		const line = { t: new Date().toISOString(), reviewer: a.reviewer, phase: a.phase, ...entry };
+		try {
+			fs.appendFileSync(this.tracePath, JSON.stringify(line) + "\n");
+		} catch {
+			/* tracing must never fail a review */
+		}
+	}
+
+	private schedule(): void {
+		if (this.refreshTimer) return;
+		const wait = Math.max(0, ACTIVITY_REFRESH_MS - (Date.now() - this.lastRefresh));
+		this.refreshTimer = setTimeout(() => {
+			this.refreshTimer = undefined;
+			this.refresh();
+		}, wait);
+		this.refreshTimer.unref?.();
+	}
+
+	private refresh(): void {
+		this.lastRefresh = Date.now();
+		const now = Date.now();
+		try {
+			fs.writeFileSync(this.progressPath, JSON.stringify({
+				updatedAt: new Date(now).toISOString(),
+				trace: this.tracePath,
+				sessions: this.sessions.map((a) => ({ ...a, elapsedSec: Math.round(((a.finishedAt ?? now) - a.startedAt) / 1000) })),
+			}, null, 2) + "\n");
+		} catch {
+			/* tracing must never fail a review */
+		}
+		this.onActivity?.(this.sessions.filter((a) => a.state === "running").map((a) => formatActivityLine(a, now)));
+	}
 }
 
 // ---------- scope resolution ----------
@@ -1253,7 +1446,9 @@ Rules:
 /** Appended when the reviewer runs as a nested agent with read-only tools. */
 const REVIEWER_TOOLS_ADDENDUM = `
 
-You have read-only tools (read, grep, find, ls) on the repository. Use them to trace callers, types, and tests before asserting a finding — a diff alone hides most cross-file bugs. Stay focused: investigate what the change touches, not the whole repo. Your FINAL message must be only the JSON array.`;
+You have read-only tools (read, grep, find, ls) on the repository. Use them to trace callers, types, and tests before asserting a finding — a diff alone hides most cross-file bugs. Stay focused: investigate what the change touches, not the whole repo. Your FINAL message must be only the JSON array.
+
+Report progress with the progress tool so the lead can see how far along you are: first call it with \`plan\`, the 3–8 specific things you will check (areas, functions, or claims), then call it with \`done\` naming each one as you finish it.`;
 
 /**
  * Build the reviewer-side user prompt from a target. We truncate the diff
@@ -1563,6 +1758,30 @@ async function callModel(
 }
 
 /**
+ * Self-reported progress for nested reviewers: a plan up front, then each
+ * item as it's done. The tool only acknowledges; ReviewTrace reads the
+ * calls off the session's event stream.
+ */
+function createProgressTool() {
+	let planned = 0;
+	let done = 0;
+	return {
+		name: PROGRESS_TOOL,
+		label: "Progress",
+		description: "Report review progress to the lead. Call once with `plan` (the 3–8 things you will check), then with `done` (one item) as you finish each.",
+		parameters: Type.Object({
+			plan: Type.Optional(Type.Array(Type.String(), { description: "Things you will check, in order" })),
+			done: Type.Optional(Type.String({ description: "A plan item you just finished" })),
+		}),
+		async execute(_id: string, params: { plan?: string[]; done?: string }) {
+			if (params.plan?.length) planned = params.plan.length;
+			if (params.done) done++;
+			return { content: [{ type: "text" as const, text: `Recorded (${done}/${planned || "?"} done). Continue.` }], details: undefined };
+		},
+	};
+}
+
+/**
  * Run a reviewer as a nested pi agent with read-only tools so it can follow
  * callers, types, and tests instead of guessing from the diff. The child
  * session loads no extensions/skills/context files (no recursion into
@@ -1576,6 +1795,7 @@ async function runAgenticReviewer(
 	userPrompt: string,
 	signal: AbortSignal,
 	cwd: string = ctx.cwd,
+	onEvent?: (event: AgentSessionEvent) => void,
 ): Promise<ModelCallResult> {
 	const started = Date.now();
 	const settingsManager = SettingsManager.inMemory({});
@@ -1595,13 +1815,15 @@ async function runAgenticReviewer(
 		cwd,
 		model,
 		thinkingLevel: thinking,
-		tools: ["read", "grep", "find", "ls"],
+		tools: ["read", "grep", "find", "ls", PROGRESS_TOOL],
+		customTools: [createProgressTool()],
 		resourceLoader,
 		settingsManager,
 		sessionManager: SessionManager.inMemory(cwd),
 	});
 	const onAbort = () => void session.abort();
 	signal.addEventListener("abort", onAbort, { once: true });
+	const unsubscribe = onEvent ? session.subscribe(onEvent) : undefined;
 	try {
 		if (signal.aborted) throw new Error("aborted before start");
 		const aborted = new Error("aborted");
@@ -1637,6 +1859,7 @@ async function runAgenticReviewer(
 		};
 	} finally {
 		signal.removeEventListener("abort", onAbort);
+		unsubscribe?.();
 		session.dispose();
 	}
 }
@@ -1682,6 +1905,9 @@ export interface ReviewerRunOptions {
 	timeoutMs: number;
 	/** Directory reviewers' tools see (a PR-head worktree for PR reviews); default ctx.cwd. */
 	cwd?: string;
+	/** Live per-session trace the lead can watch (progress.json, trace.jsonl). */
+	trace?: ReviewTrace;
+	tracePhase?: ReviewerActivity["phase"];
 }
 
 async function runReviewer(
@@ -1696,8 +1922,9 @@ async function runReviewer(
 	parse: (text: string) => ReviewerFinding[] = parseReviewerJson,
 ): Promise<Omit<ReviewerRunResult, "formattedSpec" | "spec" | "thinking" | "clamped">> {
 	const signal = withTimeout(abortSignal, runOpts.timeoutMs);
+	const tracer = runOpts.trace?.start(formatReviewerSpec(reviewerSpec), runOpts.tracePhase ?? "review", runOpts.cwd ?? ctx.cwd);
 	const call = runOpts.useTools
-		? await runAgenticReviewer(ctx, model, reviewerSpec.thinking, systemPrompt + REVIEWER_TOOLS_ADDENDUM, userPrompt, signal, runOpts.cwd)
+		? await runAgenticReviewer(ctx, model, reviewerSpec.thinking, systemPrompt + REVIEWER_TOOLS_ADDENDUM, userPrompt, signal, runOpts.cwd, tracer?.onEvent)
 		: await callModel(ctx, model, systemPrompt, userPrompt, {
 			thinking: reviewerSpec.thinking,
 			temperature,
@@ -1732,6 +1959,7 @@ async function runReviewer(
 			}
 		}
 	}
+	tracer?.finish(errorMessage === undefined, errorMessage ?? (runOpts.tracePhase === "verify" ? "done" : `${findings.length} findings`));
 	return {
 		model,
 		ok: errorMessage === undefined,
@@ -2609,7 +2837,7 @@ async function runVerification(
 		const row = rows.find((r) => r.rs.spec === spec);
 		if (!row) return;
 		const assigned = ids.map((id) => byId.get(id)!).filter(Boolean);
-		const run = await runReviewer(row.model, row.rs, ctx, VERIFY_SYSTEM_PROMPT, buildVerifyPrompt(basePrompt, assigned), cfg.temperature, signal, runOpts, () => []);
+		const run = await runReviewer(row.model, row.rs, ctx, VERIFY_SYSTEM_PROMPT, buildVerifyPrompt(basePrompt, assigned), cfg.temperature, signal, { ...runOpts, tracePhase: "verify" }, () => []);
 		let verdicts = new Map<string, Omit<Verification, "spec">>();
 		let error = run.errorMessage;
 		if (!error) {
@@ -3648,6 +3876,8 @@ async function runMultiReviewFromArgs(
 		deadlineMs?: number;
 		/** Where the lead can find verbatim per-reviewer text (headless: result.json). */
 		detailHint?: string;
+		/** Where the live trace goes (progress.json, trace.jsonl); default a fresh temp dir. */
+		traceDir?: string;
 		/** Triage the PR's existing review comments (CodeRabbit, collaborators). */
 		prComments?: { includeNits: boolean; includeResolved: boolean };
 	} = {},
@@ -3710,6 +3940,7 @@ async function runMultiReviewFromArgs(
 	const label = describeFlags(flags);
 	const progress = createProgressReporter(ctx, label, onUpdate);
 	let cleanupCheckout: (() => Promise<void>) | undefined;
+	let trace: ReviewTrace | undefined;
 	try {
 		const parsed = parseReviewArgs(rawArgs);
 		progress.update({ phase: "resolving scope" });
@@ -3721,6 +3952,8 @@ async function runMultiReviewFromArgs(
 		const runOpts: ReviewerRunOptions = flags.quick
 			? { useTools: false, timeoutMs: cfg.reviewerTimeoutSec * 1000 }
 			: reviewerRunOptions(cfg);
+		trace = new ReviewTrace(runOptions.traceDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "multi-review-")), (lines) => progress.activity(lines));
+		runOpts.trace = trace;
 		// PR reviews read the PR's actual code; brief files (spec, context) too,
 		// since the PR may add or change them.
 		if (target.kind === "pr" && target.pr) {
@@ -3792,13 +4025,15 @@ async function runMultiReviewFromArgs(
 		const judge = agentLead ? null : resolveJudge(ctx, cfg);
 		if (!agentLead && !judge) target.warnings.push(`judge ${cfg.judge} not in registry; showing deterministic synthesis`);
 		const resolvedRows = resolved.map((r) => ({ rs: r.rs, model: r.model, clamped: r.clamped }));
-		const result = await runReviewPipeline(ctx, cfg, flags, target, resolvedRows, runOpts, judge, agentLead, signal, progress, runOptions.deadlineMs, runOptions.detailHint, prReport);
+		const result = await runReviewPipeline(ctx, cfg, flags, target, resolvedRows, runOpts, judge, agentLead, signal, progress, runOptions.deadlineMs,
+			[runOptions.detailHint, `Reviewer trace (tool calls, thinking and replies per session): ${trace.tracePath}`].filter(Boolean).join("\n"), prReport);
 		progress.finish("done");
 		return result;
 	} catch (err) {
 		progress.finish("failed");
 		throw err;
 	} finally {
+		trace?.close();
 		await cleanupCheckout?.();
 	}
 }
@@ -3973,6 +4208,7 @@ async function runAgentLedReview(
 	onUpdate?: ToolUpdateFn,
 	deadlineMs?: number,
 	detailHint?: string,
+	traceDir?: string,
 ): Promise<{ text: string; markdown: string; details: MultiReviewDetails } | { error: string }> {
 	const parts: string[] = [];
 	const focus = typeof params.focus === "string" ? params.focus.trim() : "";
@@ -3995,6 +4231,7 @@ async function runAgentLedReview(
 		flags: { verify: params.verify, quick: params.quick },
 		deadlineMs,
 		detailHint,
+		traceDir,
 		prComments: params.pr_comments ? { includeNits: Boolean(params.include_nits), includeResolved: Boolean(params.include_resolved) } : undefined,
 	});
 	if (!result.injectMessage) return { error: result.notifyMessage };
@@ -4084,11 +4321,15 @@ async function runHeadless(pi: ExtensionAPI, args: string, ctx: ExtensionContext
 	const req = parseReviewRequest(raw);
 	if ("error" in req) return fail(`invalid brief: ${req.error}`);
 	if (!Number.isFinite(maxSeconds) || maxSeconds < 60) return fail("--max-seconds must be a number ≥ 60");
+	// The trace sits next to the result so the caller can watch the run live.
+	const traceDir = path.dirname(outPath);
+	console.error(`TRACE ${path.join(traceDir, "progress.json")} ${path.join(traceDir, "trace.jsonl")}`);
 	let out: Awaited<ReturnType<typeof runAgentLedReview>>;
 	try {
 		out = await runAgentLedReview(
 			pi, ctx, req, undefined, undefined, started + maxSeconds * 1000,
 			`Verbatim per-reviewer text, by issue id: ${outPath} → details.groups[].members`,
+			traceDir,
 		);
 	} catch (err) {
 		return fail(err instanceof Error ? err.message : String(err));

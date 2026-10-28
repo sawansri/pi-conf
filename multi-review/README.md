@@ -170,6 +170,17 @@ pi -p "/multi-review-run --brief=brief.json --out=/tmp/mr/result.json" < /dev/nu
 - **stderr** carries progress and the final `OK <md> <json>` /
   `FAILED <json>` line. pi's print mode redirects stdout, so use `--out`
   and the exit code. `< /dev/null` is required (`pi -p` waits for stdin).
+- **Live trace** next to `result.json`: `progress.json` is a snapshot of
+  every reviewer and verifier session (state, items checked out of its
+  plan, turns, tool calls, streamed thinking/text size, last tool),
+  rewritten every 2s. Reviewers report the plan themselves through a
+  `progress` tool: the 3–8 things they'll check up front, then each one
+  as it's done (Sonnet tends to finish before marking items).
+  `trace.jsonl` logs each tool call and each assistant message (thinking
+  and text in full) as it happens. stderr repeats the running sessions'
+  lines every 30s. Inside pi the same lines appear in the progress widget
+  and the tool's pending row, and the result names the trace file (a
+  temp dir).
 
 ### Claude Code
 

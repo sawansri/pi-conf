@@ -70,6 +70,7 @@ pi -p "/multi-review-run --brief=<brief.json> --out=<dir>/result.json" < /dev/nu
 - The run fits itself into `--max-seconds` (default 540, inside the 10-minute Bash cap). It shrinks reviewer timeouts, and when time runs short it skips verification with a warning instead of overrunning. Any such warning is in the result's Warnings section; mention it to the user.
 - `< /dev/null` is required: `pi -p` waits for stdin to close before it starts.
 - Progress lines and the final `OK <md> <json>` / `FAILED <json>` line go to stderr. Exit code 0 means success.
+- `<dir>/progress.json` shows each reviewer session live: state, plan items checked (self-reported), turns, tool calls, streamed thinking/text size, last tool. `<dir>/trace.jsonl` has every tool call and each assistant message (thinking and text) per session. If the user asks how the review is going, run it with `run_in_background` (interactive sessions only) and read `progress.json`. If a reviewer failed or timed out, read its entries in `trace.jsonl` to see what it was doing.
 - On failure, read `result.json` (`{"ok": false, "error": ...}`) and tell the user what went wrong. Typical causes: the reviewer models aren't reachable, a spec path is wrong, or the extension isn't installed.
 
 ## 4. Judge, report, and save the verdict
