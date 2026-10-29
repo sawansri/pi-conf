@@ -25,9 +25,11 @@
  * ~/.pi/agent/models.json. It only reads ctx.modelRegistry.
  */
 
+import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { AgentSessionEvent, AgentToolUpdateCallback, ExtensionAPI, ExtensionContext, ExecResult } from "@mariozechner/pi-coding-agent";
 import type { Api, Model as PiModel } from "@mariozechner/pi-ai";
 import { StringEnum } from "@mariozechner/pi-ai";
@@ -122,12 +124,34 @@ export interface MultiReviewConfig {
 	verify: boolean;
 	/** Independent verifiers per finding in the verification round. */
 	verifiersPerFinding: number;
+	/**
+	 * Models that never review, only verify: they join the verification
+	 * pool (with tools) but skip the fan-out. Unused in `--quick` runs.
+	 */
+	verifyOnly: string[];
 	/** Fast pool for `--quick` runs: single completions, no tools. */
 	quickReviewers: string[];
 	/** Run finding reviewers as nested agents with read-only repo tools. */
 	reviewerTools: boolean;
 	/** Per-reviewer wall-clock limit; a reviewer past it is reported as failed. */
 	reviewerTimeoutSec: number;
+	/**
+	 * Let the brief's `checks` and the verifiers' `run` tool execute code in a
+	 * nono (Landlock) sandbox: repo read-only, no network. Off, or no working
+	 * nono, means neither runs.
+	 */
+	sandbox: boolean;
+	/** Total time for the brief's checks, run once before the fan-out. */
+	checkTimeoutSec: number;
+	/** $HOME paths (toolchains) readable in the sandbox; the rest of $HOME is not. */
+	sandboxHomeDirs: string[];
+	/** Add built-in checks for the change's languages (C/C++: mr-cxx-check) when the sandbox works. */
+	autoChecks: boolean;
+	/**
+	 * A reviewer answering [] after fewer tool calls than this (progress
+	 * calls excluded) is nudged once to keep looking. 0 disables.
+	 */
+	minReviewToolCalls: number;
 	/**
 	 * Model (`provider/id[@level]`) that groups findings into issues; defaults
 	 * to the judge at low thinking. "lexical" skips the model call.
@@ -157,7 +181,9 @@ export function describeFlags(flags: ReviewFlags): string {
  * extras per minute; gpt-6-luna is precise (zero dubious) and fast.
  * Gemini 4 Argon was added after the benchmark as a frontier model from a
  * third family (Google), for diversity of blind spots; at @medium, since
- * @high (~350s on a narrow area review) ran past the straggler cutoff.
+ * @high (~350s on a narrow area review) ran past the straggler cutoff. As a
+ * reviewer it returned 0 findings on every run (one timed out) while its
+ * verifier verdicts cited concrete code, so it now only verifies.
  * gpt-6.1-sol@high replaced gpt-6-sol@xhigh: about as fast (153s vs 125s on
  * a narrow area review) and it caught both models' unique findings; at
  * @xhigh it took 386s. Grok-4.7 and GLM-5.3-Flash were too slow (900s
@@ -174,7 +200,6 @@ const DEFAULTS: MultiReviewConfig = {
 		"amd-gateway-anthropic/Claude-Sonnet-5.5@high",
 		"amd-gateway/gpt-6.1-sol@high",
 		"amd-gateway/gpt-6-luna@high",
-		"amd-gateway/gemini-4-argon@medium",
 	],
 	judge: "amd-gateway-anthropic/Claude-Opus-5.5",
 	judgeThinking: "high",
@@ -182,6 +207,7 @@ const DEFAULTS: MultiReviewConfig = {
 	temperature: 0.2,
 	verify: false,
 	verifiersPerFinding: 2,
+	verifyOnly: ["amd-gateway/gemini-4-argon@medium"],
 	quickReviewers: [
 		"amd-gateway/gpt-6-luna@low",
 		"amd-gateway-anthropic/Claude-Haiku-5.5",
@@ -189,10 +215,16 @@ const DEFAULTS: MultiReviewConfig = {
 	],
 	reviewerTools: true,
 	reviewerTimeoutSec: 420,
+	sandbox: true,
+	checkTimeoutSec: 120,
+	// Not all of ~/.cargo: it holds credentials.toml.
+	sandboxHomeDirs: [".nvm", ".cargo/bin", ".cargo/registry", ".cargo/git", ".rustup", ".pyenv", ".bun", ".deno", ".volta", "go", ".local/bin", ".local/lib"],
+	autoChecks: true,
+	minReviewToolCalls: 10,
 };
 
 function reviewerRunOptions(cfg: MultiReviewConfig): ReviewerRunOptions {
-	return { useTools: cfg.reviewerTools, timeoutMs: cfg.reviewerTimeoutSec * 1000 };
+	return { useTools: cfg.reviewerTools, timeoutMs: cfg.reviewerTimeoutSec * 1000, sandboxHomeDirs: cfg.sandboxHomeDirs, minToolCalls: cfg.minReviewToolCalls };
 }
 
 /**
@@ -238,10 +270,12 @@ export interface BriefInput {
 	suspicions?: string[];
 	specPath?: string;
 	contextFiles?: string[];
+	/** Shell commands (type-check, build, targeted tests) run once in the sandbox before the fan-out. */
+	checks?: string[];
 }
 
 function hasBriefInput(b: BriefInput): boolean {
-	return Boolean(b.intent?.trim() || b.specPath || b.requirements?.length || b.contextFiles?.length || b.suspicions?.length);
+	return Boolean(b.intent?.trim() || b.specPath || b.requirements?.length || b.contextFiles?.length || b.suspicions?.length || b.checks?.length);
 }
 
 
@@ -289,6 +323,9 @@ function loadConfig(): MultiReviewConfig {
 		if (typeof parsed.verifiersPerFinding === "number" && parsed.verifiersPerFinding >= 1 && parsed.verifiersPerFinding <= 8) {
 			cachedConfig.verifiersPerFinding = Math.floor(parsed.verifiersPerFinding);
 		}
+		if (Array.isArray(parsed.verifyOnly)) {
+			cachedConfig.verifyOnly = parsed.verifyOnly.filter((x: unknown): x is string => typeof x === "string" && x.includes("/"));
+		}
 		if (Array.isArray(parsed.quickReviewers)) {
 			cachedConfig.quickReviewers = parsed.quickReviewers.filter((x: unknown): x is string => typeof x === "string" && x.includes("/"));
 		}
@@ -298,6 +335,17 @@ function loadConfig(): MultiReviewConfig {
 		}
 		if (typeof parsed.reviewerTimeoutSec === "number" && parsed.reviewerTimeoutSec >= 10 && parsed.reviewerTimeoutSec <= 3600) {
 			cachedConfig.reviewerTimeoutSec = Math.floor(parsed.reviewerTimeoutSec);
+		}
+		if (typeof parsed.sandbox === "boolean") cachedConfig.sandbox = parsed.sandbox;
+		if (typeof parsed.autoChecks === "boolean") cachedConfig.autoChecks = parsed.autoChecks;
+		if (typeof parsed.checkTimeoutSec === "number" && parsed.checkTimeoutSec >= 10 && parsed.checkTimeoutSec <= 1800) {
+			cachedConfig.checkTimeoutSec = Math.floor(parsed.checkTimeoutSec);
+		}
+		if (Array.isArray(parsed.sandboxHomeDirs)) {
+			cachedConfig.sandboxHomeDirs = parsed.sandboxHomeDirs.filter((x: unknown): x is string => typeof x === "string" && x.length > 0 && !path.isAbsolute(x) && !x.split("/").includes(".."));
+		}
+		if (typeof parsed.minReviewToolCalls === "number" && parsed.minReviewToolCalls >= 0 && parsed.minReviewToolCalls <= 100) {
+			cachedConfig.minReviewToolCalls = Math.floor(parsed.minReviewToolCalls);
 		}
 	} catch {
 		cachedConfig = { ...DEFAULTS };
@@ -636,6 +684,14 @@ class ReviewTrace {
 					if (plan.length > 0) a.plan = plan;
 					if (typeof args.done === "string") a.done.push(args.done);
 					this.append(a, { kind: "progress", plan: args.plan, done: args.done });
+				} else if ((event as { type: string }).type === "multi_review_nudge") {
+					this.append(a, { kind: "nudge", toolCalls: (event as unknown as { toolCalls: number }).toolCalls });
+				} else if (event.type === "tool_execution_end" && (event.toolName === GIT_TOOL || event.toolName === RUN_TOOL)) {
+					// Executed commands are evidence; keep the head of what they returned.
+					const content = ((event.result as { content?: Array<{ type: string; text?: string }> } | undefined)?.content ?? []);
+					const text = content.filter((c) => c.type === "text").map((c) => c.text ?? "").join("");
+					this.append(a, { kind: "tool_result", tool: event.toolName, isError: event.isError, text: text.slice(0, 600) });
+					return;
 				} else if (event.type === "tool_execution_start") {
 					a.toolCalls++;
 					a.lastTool = describeToolCall(event.toolName, event.args, cwd);
@@ -766,6 +822,8 @@ export interface ReviewTarget {
 	pr?: { number: number; url: string; owner: string; repo: string; headSha: string };
 	/** Where reviewers' tools read files: the PR-head worktree when one was needed. */
 	reviewDir?: string;
+	/** Outcomes of the brief's checks, run before the fan-out. */
+	checkResults?: CheckResult[];
 }
 
 /**
@@ -780,6 +838,7 @@ export interface ReviewBrief {
 	suspicions: string[];
 	spec?: { path: string; text: string };
 	contextFiles: { path: string; text: string }[];
+	checks: string[];
 }
 
 const SPEC_BUDGET_CHARS = 60_000;
@@ -787,6 +846,7 @@ const CONTEXT_FILE_BUDGET_CHARS = 40_000;
 const CONTEXT_TOTAL_BUDGET_CHARS = 150_000;
 const MAX_CONTEXT_FILES = 12;
 const MAX_SUSPICIONS = 20;
+const MAX_CHECKS = 4;
 
 function clip(text: string, budget: number, label: string): string {
 	if (text.length <= budget) return text;
@@ -819,7 +879,12 @@ export function buildBrief(
 		requirements: (input.requirements ?? []).map((r) => r.trim()).filter(Boolean),
 		suspicions: (input.suspicions ?? []).map((r) => r.trim()).filter(Boolean).slice(0, MAX_SUSPICIONS),
 		contextFiles: [],
+		checks: (input.checks ?? []).map((c) => c.trim()).filter(Boolean),
 	};
+	if (brief.checks.length > MAX_CHECKS) {
+		warnings.push(`only the first ${MAX_CHECKS} of ${brief.checks.length} checks run`);
+		brief.checks = brief.checks.slice(0, MAX_CHECKS);
+	}
 	if (input.specPath) {
 		const spec = readSpecFile(cwd, input.specPath);
 		if ("error" in spec) warnings.push(spec.error);
@@ -1452,9 +1517,18 @@ Rules:
 /** Appended when the reviewer runs as a nested agent with read-only tools. */
 const REVIEWER_TOOLS_ADDENDUM = `
 
-You have read-only tools (read, grep, find, ls) on the repository. Use them to trace callers, types, and tests before asserting a finding — a diff alone hides most cross-file bugs. Stay focused: investigate what the change touches, not the whole repo. Your FINAL message must be only the JSON array.
+You have read-only tools (read, grep, find, ls, git) on the repository. Use them to trace callers, types, and tests before asserting a finding — a diff alone hides most cross-file bugs. Stay focused: investigate what the change touches, not the whole repo. Your FINAL message must be only the JSON array.
+
+\`git\` runs log, show, blame, or diff: blame and log the lines the change touches to learn why they are the way they are, and whether the change reverts an earlier fix. You have no web access: for the behaviour of a third-party library or tool, read its source on disk (node_modules, vendored directories, system headers, installed packages) instead of assuming.
 
 Report progress with the progress tool so the lead can see how far along you are: first call it with \`plan\`, the 3–8 specific things you will check (areas, functions, or claims), then call it with \`done\` naming each one as you finish it.`;
+
+/** Appended for verifiers when the sandbox is available. */
+const VERIFIER_RUN_ADDENDUM = `
+
+You also have \`run\`: a bash script in a sandbox where the repository is read-only, there is no network, and $TMPDIR is a scratch directory deleted after each call. When executing code can settle a claim (a targeted test, building the touched target, a short repro script), run it and cite the command and its result in your evidence. Keep runs short and targeted; never run the full test suite.
+
+For C/C++: \`mr-cxx-check FILE...\` recompiles those files with their compile_commands.json flags plus -Wall -Wextra and runs cppcheck (it is what produced any mr-cxx-check results above). For memory errors and undefined behaviour, compile a minimal repro with \`g++ -std=c++17 -fsanitize=address,undefined -g\` and run it. Prefer compiling single files or a small repro over building the project: the build directory is read-only and configure steps may need the network.`;
 
 /**
  * Build the reviewer-side user prompt from a target. We truncate the diff
@@ -1494,6 +1568,7 @@ function buildReviewUserPrompt(target: ReviewTarget): string {
 		chunks.push(...target.metaLines);
 		chunks.push("");
 	}
+	if (target.checkResults?.length) chunks.push(...checkPromptLines(target.checkResults));
 	if (target.diffText) {
 		chunks.push("## Diff");
 		chunks.push(budgetDiff(target.diffText));
@@ -1768,9 +1843,7 @@ async function callModel(
  * item as it's done. The tool only acknowledges; ReviewTrace reads the
  * calls off the session's event stream.
  */
-function createProgressTool() {
-	let planned = 0;
-	let done = 0;
+function createProgressTool(state: { plan: string[]; done: number; calls: number } = { plan: [], done: 0, calls: 0 }) {
 	return {
 		name: PROGRESS_TOOL,
 		label: "Progress",
@@ -1780,11 +1853,444 @@ function createProgressTool() {
 			done: Type.Optional(Type.String({ description: "A plan item you just finished" })),
 		}),
 		async execute(_id: string, params: { plan?: string[]; done?: string }) {
-			if (params.plan?.length) planned = params.plan.length;
-			if (params.done) done++;
-			return { content: [{ type: "text" as const, text: `Recorded (${done}/${planned || "?"} done). Continue.` }], details: undefined };
+			state.calls++;
+			if (params.plan?.length) state.plan = params.plan;
+			if (params.done) state.done++;
+			return { content: [{ type: "text" as const, text: `Recorded (${state.done}/${state.plan.length || "?"} done). Continue.` }], details: undefined };
 		},
 	};
+}
+
+// ---------- executing code: sandbox, git, checks ----------
+
+const GIT_TOOL = "git";
+const RUN_TOOL = "run";
+const RUN_DEFAULT_SEC = 120;
+const RUN_MAX_SEC = 300;
+const OUTPUT_CAPTURE_CHARS = 2_000_000;
+
+export interface CommandResult {
+	exitCode: number | null;
+	output: string;
+	timedOut: boolean;
+	durationMs: number;
+	/** Set when the command couldn't start or was aborted. */
+	error?: string;
+}
+
+/** Head for context, tail for the errors (build and test output ends with them). */
+export function clipOutput(text: string, head: number, tail: number): string {
+	if (text.length <= head + tail) return text;
+	return `${text.slice(0, head)}\n…(${text.length - head - tail} chars omitted)…\n${text.slice(-tail)}`;
+}
+
+/** Spawn with merged stdout/stderr, a hard timeout, and abort; `kill` replaces the default SIGKILL. */
+function runCommand(
+	cmd: string,
+	args: string[],
+	opts: { cwd: string; timeoutMs: number; signal?: AbortSignal; env?: NodeJS.ProcessEnv; kill?: (child: ReturnType<typeof spawn>) => void },
+): Promise<CommandResult> {
+	const started = Date.now();
+	return new Promise((resolve) => {
+		let out = "";
+		let timedOut = false;
+		let error: string | undefined;
+		let settled = false;
+		let killed = false;
+		const child = spawn(cmd, args, { cwd: opts.cwd, env: opts.env ?? process.env, stdio: ["ignore", "pipe", "pipe"] });
+		const collect = (chunk: Buffer) => {
+			out += chunk.toString("utf8");
+			if (out.length > OUTPUT_CAPTURE_CHARS) out = out.slice(0, 4_000) + "\n…(output too large, middle dropped)…\n" + out.slice(-OUTPUT_CAPTURE_CHARS / 2);
+		};
+		child.stdout.on("data", collect);
+		child.stderr.on("data", collect);
+		const kill = (why: "timeout" | "abort") => {
+			if (settled || killed) return;
+			killed = true;
+			if (why === "timeout") timedOut = true;
+			else error = "aborted";
+			if (opts.kill) opts.kill(child);
+			else child.kill("SIGKILL");
+		};
+		const timer = setTimeout(() => kill("timeout"), opts.timeoutMs);
+		const onAbort = () => kill("abort");
+		opts.signal?.addEventListener("abort", onAbort, { once: true });
+		if (opts.signal?.aborted) onAbort();
+		const done = (exitCode: number | null) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			opts.signal?.removeEventListener("abort", onAbort);
+			resolve({ exitCode, output: out, timedOut, durationMs: Date.now() - started, error });
+		};
+		child.on("error", (err) => {
+			error = err.message;
+			done(null);
+		});
+		child.on("close", (code) => done(code));
+	});
+}
+
+export function formatCommandResult(r: CommandResult, head = 2_000, tail = 10_000): string {
+	const status = r.timedOut
+		? `timed out after ${Math.round(r.durationMs / 1000)}s`
+		: r.error
+			? `failed to run: ${r.error}`
+			: `exit ${r.exitCode} (${(r.durationMs / 1000).toFixed(1)}s)`;
+	const body = r.output.trim() ? clipOutput(r.output, head, tail) : "(no output)";
+	return `${status}\n${body}`;
+}
+
+const SANDBOX_STATE_DIR = path.join(os.homedir(), ".cache", "multi-review");
+/** Helper scripts shipped with the extension (mr-cxx-check), on PATH inside the sandbox. */
+const SANDBOX_TOOLS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "tools");
+/** Host directories every toolchain needs, readable in the sandbox. */
+const SANDBOX_HOST_DIRS = ["/usr", "/etc", "/opt", "/snap", "/nix"];
+/**
+ * nono's built-in groups grant read access to system files; drop the one that
+ * makes /tmp writable, where PR worktrees and other runs' traces live.
+ */
+const NONO_PROFILE = { meta: { name: "multi-review-sandbox" }, groups: { exclude: ["system_write_linux"] } };
+
+/** Per-run additions to the sandbox: extra read-only paths and environment. */
+export interface SandboxExtras {
+	readPaths?: string[];
+	env?: Record<string, string>;
+}
+
+function isInside(child: string, parent: string): boolean {
+	const rel = path.relative(parent, child);
+	return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+function gitRoots(dir: string): { top: string; commonDir?: string } {
+	const r = spawnSync("git", ["rev-parse", "--show-toplevel", "--git-common-dir"], { cwd: dir, encoding: "utf8", timeout: 5_000 });
+	if (r.status !== 0) return { top: dir };
+	const [top, common] = r.stdout.trim().split("\n");
+	return { top: top || dir, commonDir: common ? path.resolve(dir, common) : undefined };
+}
+
+function nonoBinary(): string {
+	const local = path.join(os.homedir(), ".local", "bin", "nono");
+	const onPath = (process.env.PATH ?? "").split(path.delimiter).some((d) => d && fs.existsSync(path.join(d, "nono")));
+	return !onPath && fs.existsSync(local) ? local : "nono";
+}
+
+/**
+ * nono gives each run its own cgroup when resource limits are set; killing
+ * it takes every process in the run, including ones that setsid'd away.
+ */
+function killNonoCgroup(pid: number | undefined): void {
+	if (pid === undefined || typeof process.getuid !== "function") return;
+	const uid = process.getuid();
+	const cg = `/sys/fs/cgroup/user.slice/user-${uid}.slice/user@${uid}.service/nono.${pid}`;
+	try {
+		fs.writeFileSync(path.join(cg, "cgroup.kill"), "1");
+		setTimeout(() => fs.rmdir(cg, () => {}), 1_000).unref?.();
+	} catch {
+		/* already gone */
+	}
+}
+
+/**
+ * Run a bash script against the code under review under nono (Landlock):
+ * the repo and the host toolchain are read-only, TCP is blocked, the rest of
+ * $HOME is unreadable (so credentials there stay out of reach of whatever the
+ * script prints back to a model), and the only writable place is a scratch
+ * directory that serves as HOME and TMPDIR and is deleted afterwards. DNS
+ * lookups are not blocked: Landlock filters TCP only.
+ */
+export async function runInSandbox(
+	dir: string,
+	script: string,
+	timeoutMs: number,
+	homeDirs: string[],
+	signal?: AbortSignal,
+	extras: SandboxExtras = {},
+): Promise<CommandResult> {
+	fs.mkdirSync(SANDBOX_STATE_DIR, { recursive: true });
+	const profile = path.join(SANDBOX_STATE_DIR, "nono-profile.json");
+	fs.writeFileSync(profile, JSON.stringify(NONO_PROFILE));
+	// Not under /tmp: it is often noexec, and a compiled repro must run.
+	const scratch = fs.mkdtempSync(path.join(SANDBOX_STATE_DIR, "scratch-"));
+	const home = os.homedir();
+	const { top, commonDir } = gitRoots(dir);
+	const args = [
+		"-s", "run", "--no-audit", "--no-rollback", "--no-diagnostics", "-p", profile,
+		"--block-net", "--memory", "8G", "--max-processes", "4096",
+		"--allow", scratch, "--allow-file", "/dev/null", "--read", top, "--workdir", dir,
+	];
+	const read = [...SANDBOX_HOST_DIRS, ...homeDirs.map((rel) => path.join(home, rel)), SANDBOX_TOOLS_DIR, ...(extras.readPaths ?? [])];
+	// Worktrees (PR checkouts) keep their git objects in the main repo.
+	if (commonDir && !isInside(commonDir, top)) read.push(commonDir);
+	for (const p of read) if (fs.existsSync(p)) args.push("--read", p);
+	const env: Record<string, string> = {
+		PATH: `${SANDBOX_TOOLS_DIR}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+		HOME: scratch,
+		LANG: process.env.LANG ?? "C.UTF-8",
+		TERM: "dumb",
+		CI: "1",
+		TMPDIR: scratch,
+		XDG_CACHE_HOME: path.join(scratch, ".cache"),
+		npm_config_cache: path.join(scratch, ".npm"),
+		...extras.env,
+	};
+	// nono itself needs the real HOME (its state lives there); the script gets only `env`.
+	args.push("--", "/usr/bin/env", "-i", ...Object.entries(env).map(([k, v]) => `${k}=${v}`), "/usr/bin/bash", "-c", script);
+	try {
+		return await runCommand(nonoBinary(), args, {
+			cwd: dir,
+			timeoutMs,
+			signal,
+			env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, LANG: env.LANG },
+			// SIGTERM lets nono tear its cgroup down; the cgroup kill is the backstop.
+			kill: (child) => {
+				child.kill("SIGTERM");
+				setTimeout(() => {
+					child.kill("SIGKILL");
+					killNonoCgroup(child.pid);
+				}, 3_000).unref?.();
+			},
+		});
+	} finally {
+		fs.rmSync(scratch, { recursive: true, force: true });
+	}
+}
+
+let sandboxProbe: Promise<string | null> | undefined;
+
+/** Null when the sandbox works on this machine, else why not. Probed once per process. */
+export function sandboxUnavailable(signal?: AbortSignal): Promise<string | null> {
+	sandboxProbe ??= (async () => {
+		fs.mkdirSync(SANDBOX_STATE_DIR, { recursive: true });
+		const dir = fs.mkdtempSync(path.join(SANDBOX_STATE_DIR, "probe-"));
+		try {
+			const r = await runInSandbox(dir, `(echo x > f) 2>/dev/null && echo WROTE; echo probe > "$TMPDIR/p" && cat "$TMPDIR/p"`, 20_000, []);
+			if (r.exitCode === 0 && r.output.includes("probe") && !r.output.includes("WROTE")) return null;
+			if (r.error?.includes("ENOENT")) return "nono is not installed (https://nono.sh)";
+			return `nono sandbox probe failed: ${(r.error ?? r.output.trim()).slice(0, 200) || `exit ${r.exitCode}`}`;
+		} catch (err) {
+			return `nono sandbox unavailable: ${err instanceof Error ? err.message : String(err)}`;
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	})();
+	// A cancelled run stops waiting; the probe itself finishes and stays cached.
+	return abortable(sandboxProbe, signal, () => "aborted");
+}
+
+const GIT_SUBCOMMANDS = ["log", "show", "blame", "diff"] as const;
+/** Long options that write files, read files from outside the repo, or run configured programs. */
+const GIT_BLOCKED_LONG = ["--output", "--output-directory", "--no-index", "--ext-diff", "--textconv", "--contents", "--orderfile", "--open-files-in-pager", "--exec"];
+
+/**
+ * Why `args` may not reach git, or null. Git accepts unambiguous prefixes of
+ * long options (--cont for --contents), so any prefix of a blocked option is
+ * refused; and a path outside the repo would switch diff into no-index mode
+ * or point blame at a host file, so non-option arguments must stay inside it.
+ */
+export function gitArgProblem(top: string, args: string[]): string | null {
+	for (const a of args) {
+		if (a.startsWith("--") && a.length > 2) {
+			const name = a.split("=")[0];
+			if (name.length >= 4 && GIT_BLOCKED_LONG.some((b) => b.startsWith(name))) return `option ${a} is not allowed`;
+		} else if (/^-[A-Za-z]*O/.test(a)) {
+			return `option ${a} is not allowed`;
+		} else if (!a.startsWith("-")) {
+			// rev:path, rev..rev and plain paths all name files by their path part.
+			const p = a.includes(":") ? a.slice(a.indexOf(":") + 1) : a;
+			if (path.isAbsolute(p) || !isInside(path.resolve(top, p), top)) return `path ${a} is outside the repository`;
+		}
+	}
+	return null;
+}
+
+/** Read-only git history for reviewers: why the code is the way it is, and what touched it before. */
+export async function runGitTool(dir: string, subcommand: string, args: string[], signal?: AbortSignal): Promise<string> {
+	if (!(GIT_SUBCOMMANDS as readonly string[]).includes(subcommand)) return `git ${subcommand} is not allowed; use one of ${GIT_SUBCOMMANDS.join(", ")}`;
+	const problem = gitArgProblem(gitRoots(dir).top, args);
+	if (problem) return `git: ${problem}`;
+	const safety = subcommand === "blame" ? [] : ["--no-ext-diff", "--no-textconv"];
+	// A default cap the caller can override (the last -n wins).
+	const cap = subcommand === "log" ? ["-n", "30"] : [];
+	const r = await runCommand("git", ["--no-pager", subcommand, ...safety, ...cap, ...args], {
+		cwd: dir,
+		timeoutMs: 20_000,
+		signal,
+		env: { ...process.env, GIT_PAGER: "cat", PAGER: "cat", GIT_TERMINAL_PROMPT: "0" },
+	});
+	return r.exitCode === 0 && !r.error && !r.timedOut ? clipOutput(r.output, 4_000, 16_000) || "(no output)" : formatCommandResult(r, 1_000, 3_000);
+}
+
+function createGitTool(dir: string) {
+	return {
+		name: GIT_TOOL,
+		label: "Git",
+		description:
+			"Read-only git history of the repository: log, show, blame, or diff, with extra arguments as you would type them " +
+			"(e.g. subcommand \"blame\", args [\"-L\", \"120,140\", \"src/x.ts\"]; or \"log\", [\"-n\", \"10\", \"--oneline\", \"--\", \"src/x.ts\"]). " +
+			"Use it to learn why touched code is the way it is and whether the change reverts an earlier fix.",
+		parameters: Type.Object({
+			subcommand: StringEnum(GIT_SUBCOMMANDS),
+			args: Type.Optional(Type.Array(Type.String(), { description: "Arguments after the subcommand" })),
+		}),
+		async execute(_id: string, params: { subcommand: string; args?: string[] }, signal?: AbortSignal) {
+			const text = await runGitTool(dir, params.subcommand, params.args ?? [], signal);
+			return { content: [{ type: "text" as const, text }], details: undefined };
+		},
+	};
+}
+
+function createRunTool(dir: string, homeDirs: string[], extras: SandboxExtras = {}) {
+	return {
+		name: RUN_TOOL,
+		label: "Run",
+		description:
+			"Run a bash script in a sandbox (working directory: the repo) to settle a claim by execution: " +
+			"a targeted test, compiling the touched files, or a short repro script. The repository is read-only and there is no network; " +
+			"write files under $TMPDIR (a fresh scratch directory, also $HOME, deleted when the call ends). Put a whole repro (write files, then run them) in one script. " +
+			`Returns the exit code and output. Default timeout ${RUN_DEFAULT_SEC}s, max ${RUN_MAX_SEC}s.`,
+		parameters: Type.Object({
+			script: Type.String({ description: "bash script" }),
+			timeout_sec: Type.Optional(Type.Number({ description: `Seconds before the script is killed (max ${RUN_MAX_SEC})` })),
+		}),
+		async execute(_id: string, params: { script: string; timeout_sec?: number }, signal?: AbortSignal) {
+			const secs = Math.min(RUN_MAX_SEC, Math.max(5, params.timeout_sec ?? RUN_DEFAULT_SEC));
+			const r = await runInSandbox(dir, params.script, secs * 1000, homeDirs, signal, extras);
+			return { content: [{ type: "text" as const, text: formatCommandResult(r) }], details: undefined };
+		},
+	};
+}
+
+export interface CheckResult extends CommandResult {
+	command: string;
+	/** Set when the check never ran (budget spent, sandbox missing). */
+	skipped?: string;
+}
+
+/**
+ * Run the brief's checks once, in order, inside `budgetMs` in total, so every
+ * reviewer and verifier reads the same build/type-check/test output instead
+ * of guessing whether the change compiles.
+ */
+async function runChecks(
+	dir: string,
+	checks: string[],
+	budgetMs: number,
+	homeDirs: string[],
+	extras: SandboxExtras,
+	signal: AbortSignal | undefined,
+	onStart: (i: number, command: string) => void,
+): Promise<CheckResult[]> {
+	const deadline = Date.now() + budgetMs;
+	const results: CheckResult[] = [];
+	for (const [i, command] of checks.entries()) {
+		const left = deadline - Date.now();
+		if (left < 5_000 || signal?.aborted) {
+			results.push({ command, exitCode: null, output: "", timedOut: false, durationMs: 0, skipped: "check time budget spent" });
+			continue;
+		}
+		onStart(i, command);
+		results.push({ command, ...(await runInSandbox(dir, command, left, homeDirs, signal, extras)) });
+	}
+	return results;
+}
+
+const CXX_FILE = /\.(c|cc|cpp|cxx|c\+\+|h|hh|hpp|hxx|h\+\+|inl|ipp)$/i;
+
+/** compile_commands.json under `root`, where CMake and friends usually put it. */
+export function findCompileDb(root: string): string | undefined {
+	const candidates = [path.join(root, "compile_commands.json")];
+	try {
+		for (const d of fs.readdirSync(root).filter((n) => n.startsWith("build")).sort()) {
+			candidates.push(path.join(root, d, "compile_commands.json"));
+			try {
+				for (const sub of fs.readdirSync(path.join(root, d)).sort()) candidates.push(path.join(root, d, sub, "compile_commands.json"));
+			} catch { /* not a directory */ }
+		}
+		for (const sub of fs.readdirSync(path.join(root, "out")).sort()) candidates.push(path.join(root, "out", sub, "compile_commands.json"));
+	} catch { /* no out/ */ }
+	return candidates.find((c) => fs.existsSync(c));
+}
+
+function shellQuote(s: string): string {
+	return /^[\w./+-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * The built-in C/C++ check: mr-cxx-check on the changed files that still
+ * exist. A PR worktree has no build directory, so it borrows the main
+ * checkout's compile database (readable in the sandbox) with paths remapped.
+ */
+export function cxxAutoCheck(
+	files: string[],
+	reviewDir: string,
+	localDir: string,
+	warnings: string[],
+): { command: string; extras: SandboxExtras } | undefined {
+	const reviewTop = gitRoots(reviewDir).top;
+	const cxx = files.filter((f) => CXX_FILE.test(f) && fs.existsSync(path.join(reviewTop, f)));
+	if (cxx.length === 0) return undefined;
+	const command = `cd ${shellQuote(reviewTop)} && mr-cxx-check ${cxx.slice(0, 40).map(shellQuote).join(" ")}`;
+	if (findCompileDb(reviewTop)) return { command, extras: {} };
+	const localTop = gitRoots(localDir).top;
+	const db = localTop !== reviewTop ? findCompileDb(localTop) : undefined;
+	if (db) {
+		return {
+			command,
+			extras: { readPaths: [path.dirname(db)], env: { MR_CXX_DB: db, MR_CXX_REMAP: `${localTop}=${reviewTop}` } },
+		};
+	}
+	warnings.push("C/C++ files changed but no compile_commands.json was found, so they weren't compile-checked (configure with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON)");
+	return undefined;
+}
+
+function checkStatus(r: CheckResult): string {
+	if (r.skipped) return `not run (${r.skipped})`;
+	if (r.timedOut) return `timed out after ${Math.round(r.durationMs / 1000)}s`;
+	if (r.error) return `failed to run: ${r.error}`;
+	return `${r.exitCode === 0 ? "passed" : `FAILED (exit ${r.exitCode})`}, ${(r.durationMs / 1000).toFixed(1)}s`;
+}
+
+/** Check output for reviewers: failures in full-ish, passes as a short tail. */
+function checkPromptLines(results: CheckResult[]): string[] {
+	const lines = ["## Check results", "The lead's commands, run on the code under review in a sandbox before this review. Treat failures as evidence; don't re-report a failure as a finding unless the change causes it."];
+	for (const r of results) {
+		lines.push(`### \`${r.command}\` — ${checkStatus(r)}`);
+		if (r.skipped) continue;
+		const ok = r.exitCode === 0 && !r.timedOut && !r.error;
+		lines.push("```", r.output.trim() ? clipOutput(r.output.trim(), ok ? 0 : 1_500, ok ? 1_500 : 6_000) : "(no output)", "```");
+	}
+	lines.push("");
+	return lines;
+}
+
+/** Check summary for the lead's result view. */
+function checkLines(target: ReviewTarget): string[] {
+	const results = target.checkResults ?? [];
+	if (results.length === 0) return [];
+	const lines = ["## Checks (run before the review)"];
+	for (const r of results) {
+		lines.push(`- \`${r.command}\` — ${checkStatus(r)}`);
+		const ok = r.exitCode === 0 && !r.timedOut && !r.error;
+		if (!ok && !r.skipped && r.output.trim()) lines.push("  ```", ...clipOutput(r.output.trim(), 0, 3_000).split("\n").map((l) => `  ${l}`), "  ```");
+	}
+	lines.push("");
+	return lines;
+}
+
+/** A bare `[]` (optionally fenced): the reviewer says there's nothing to report. */
+export function isEmptyFindingsReply(text: string): boolean {
+	return /^\s*(```(?:json)?\s*)?\[\s*\]\s*(```)?\s*$/.test(text);
+}
+
+export interface AgenticExtras {
+	/** Directory for the sandboxed `run` tool; unset means no `run`. */
+	runDir?: string;
+	sandboxHomeDirs?: string[];
+	sandboxExtras?: SandboxExtras;
+	/** Nudge once when the reply is [] after fewer non-progress tool calls than this. */
+	minToolCalls?: number;
 }
 
 /**
@@ -1802,8 +2308,15 @@ async function runAgenticReviewer(
 	signal: AbortSignal,
 	cwd: string = ctx.cwd,
 	onEvent?: (event: AgentSessionEvent) => void,
+	extras: AgenticExtras = {},
 ): Promise<ModelCallResult> {
 	const started = Date.now();
+	const progressState = { plan: [] as string[], done: 0, calls: 0 };
+	const customTools: Array<ReturnType<typeof createProgressTool> | ReturnType<typeof createGitTool> | ReturnType<typeof createRunTool>> = [
+		createProgressTool(progressState),
+		createGitTool(cwd),
+	];
+	if (extras.runDir) customTools.push(createRunTool(extras.runDir, extras.sandboxHomeDirs ?? [], extras.sandboxExtras));
 	const settingsManager = SettingsManager.inMemory({});
 	const resourceLoader = new DefaultResourceLoader({
 		cwd,
@@ -1821,8 +2334,8 @@ async function runAgenticReviewer(
 		cwd,
 		model,
 		thinkingLevel: thinking,
-		tools: ["read", "grep", "find", "ls", PROGRESS_TOOL],
-		customTools: [createProgressTool()],
+		tools: ["read", "grep", "find", "ls", ...customTools.map((t) => t.name)],
+		customTools,
 		resourceLoader,
 		settingsManager,
 		sessionManager: SessionManager.inMemory(cwd),
@@ -1839,6 +2352,41 @@ async function runAgenticReviewer(
 		// answer; one in-session nudge recovers it with the context intact.
 		if (!signal.aborted && !(session.getLastAssistantText() ?? "").includes("[")) {
 			await prompt("Your final message must be ONLY the JSON array described in the system prompt. Output it now.");
+		}
+		// A quick "no findings" usually means the reviewer stopped looking, not
+		// that the change is clean: one nudge back to its plan and the brief.
+		const work = session.getSessionStats().toolCalls - progressState.calls;
+		if (extras.minToolCalls && !signal.aborted && work < extras.minToolCalls && isEmptyFindingsReply(session.getLastAssistantText() ?? "")) {
+			onEvent?.({ type: "multi_review_nudge", toolCalls: work } as unknown as AgentSessionEvent);
+			const plan = progressState.plan.length
+				? ` Your plan was: ${progressState.plan.map((p, i) => `(${i + 1}) ${p}`).join("; ")}. You reported finishing ${progressState.done} of ${progressState.plan.length}.`
+				: "";
+			const before = session.getLastAssistantText() ?? "";
+			try {
+				await prompt(
+					`You concluded there are no findings after only ${work} tool call${work === 1 ? "" : "s"}, which is too little to rule out problems in this change.${plan} ` +
+						"Before concluding, use your tools to trace the changed functions' callers and the tests that cover them, check each focus area and requirement in the brief, and use git blame/log on the touched lines. " +
+						"Then output the JSON array again: [] only if you still find nothing.",
+				);
+				if (!signal.aborted && !(session.getLastAssistantText() ?? "").includes("[")) {
+					await prompt("Your final message must be ONLY the JSON array described in the system prompt. Output it now.");
+				}
+			} catch {
+				// Timed out mid-nudge: fall through to the fallback below.
+			}
+			// The nudge only adds; a timeout or a non-answer during it must not
+			// cost the reviewer the valid [] it already gave.
+			const after = session.getLastAssistantText() ?? "";
+			if (signal.aborted || !after.includes("[")) {
+				const stats = session.getSessionStats();
+				return {
+					text: before,
+					stopReason: "stop",
+					usage: { input: stats.tokens.input, output: stats.tokens.output, total: stats.tokens.total, cost: stats.cost },
+					toolCalls: stats.toolCalls,
+					durationMs: Date.now() - started,
+				};
+			}
 		}
 		const stats = session.getSessionStats();
 		const last = [...session.messages].reverse().find((m) => (m as { role?: string }).role === "assistant") as
@@ -1914,6 +2462,12 @@ export interface ReviewerRunOptions {
 	/** Live per-session trace the lead can watch (progress.json, trace.jsonl). */
 	trace?: ReviewTrace;
 	tracePhase?: ReviewerActivity["phase"];
+	/** Sandbox is usable: verifiers get the `run` tool. */
+	sandbox?: boolean;
+	sandboxHomeDirs?: string[];
+	sandboxExtras?: SandboxExtras;
+	/** Review phase only: see AgenticExtras.minToolCalls. */
+	minToolCalls?: number;
 }
 
 async function runReviewer(
@@ -1929,8 +2483,20 @@ async function runReviewer(
 ): Promise<Omit<ReviewerRunResult, "formattedSpec" | "spec" | "thinking" | "clamped">> {
 	const signal = withTimeout(abortSignal, runOpts.timeoutMs);
 	const tracer = runOpts.trace?.start(formatReviewerSpec(reviewerSpec), runOpts.tracePhase ?? "review", runOpts.cwd ?? ctx.cwd);
+	const verifying = runOpts.tracePhase === "verify";
+	const canRun = verifying && Boolean(runOpts.sandbox);
 	const call = runOpts.useTools
-		? await runAgenticReviewer(ctx, model, reviewerSpec.thinking, systemPrompt + REVIEWER_TOOLS_ADDENDUM, userPrompt, signal, runOpts.cwd, tracer?.onEvent)
+		? await runAgenticReviewer(
+			ctx, model, reviewerSpec.thinking,
+			systemPrompt + REVIEWER_TOOLS_ADDENDUM + (canRun ? VERIFIER_RUN_ADDENDUM : ""),
+			userPrompt, signal, runOpts.cwd ?? ctx.cwd, tracer?.onEvent,
+			{
+				runDir: canRun ? runOpts.cwd ?? ctx.cwd : undefined,
+				sandboxHomeDirs: runOpts.sandboxHomeDirs,
+				sandboxExtras: runOpts.sandboxExtras,
+				minToolCalls: verifying ? undefined : runOpts.minToolCalls,
+			},
+		)
 		: await callModel(ctx, model, systemPrompt, userPrompt, {
 			thinking: reviewerSpec.thinking,
 			temperature,
@@ -2101,6 +2667,8 @@ const MIN_PHASE_MS = 45_000;
 const GROUPING_RESERVE_MS = 30_000;
 const VERIFY_RESERVE_MS = 150_000;
 const FINAL_RESERVE_MS = 20_000;
+/** What checks leave the reviewers under a deadline: tool-using reviews typically take 2–5 minutes. */
+const REVIEW_RESERVE_MS = 180_000;
 const STRAGGLER_GRACE_FACTOR = 1.0;
 /**
  * Stragglers are never cut before this much total time. Reviewer times vary
@@ -2840,7 +3408,8 @@ async function runVerification(
 	progress?: MultiReviewProgressReporter,
 ): Promise<{ failures: string[] }> {
 	// Every reviewer can verify — including ones whose own review failed:
-	// having raised nothing, they're the most independent checkers.
+	// having raised nothing, they're the most independent checkers. `rows`
+	// also carries the verify-only models, after the reviewers.
 	const pool = rows.map((r) => r.rs.spec);
 	const assignments = [...assignVerifiers(groups, pool, cfg.verifiersPerFinding)];
 	const byId = new Map(groups.map((g) => [g.id, g]));
@@ -3101,7 +3670,7 @@ export function synthesizeLeadView(
 		lines.push("");
 	}
 	if (groups.length === 0) lines.push(`No findings from ${ok.length} reviewer${ok.length === 1 ? "" : "s"}.`, "");
-	lines.push(...warningLines(target));
+	lines.push(...checkLines(target), ...warningLines(target));
 	return lines.join("\n");
 }
 
@@ -3225,6 +3794,7 @@ function synthesizeNoFindingsMarkdown(target: ReviewTarget, reviewerRuns: Review
 		lines.push("");
 		lines.push("Note: failed reviewers are excluded from the no-findings assessment.");
 	}
+	if (target.checkResults?.length) lines.push("", ...checkLines(target));
 	if (target.warnings.length > 0) lines.push("", ...warningLines(target));
 	return lines.join("\n");
 }
@@ -3271,7 +3841,7 @@ function synthesizeMarkdownFromGroups(
 			lines.push("");
 		}
 	}
-	lines.push(...warningLines(target));
+	lines.push(...checkLines(target), ...warningLines(target));
 	lines.push("## Reviewers");
 	for (const r of reviewerRuns) {
 		const status = r.ok
@@ -3811,6 +4381,7 @@ export function buildHandoffPrompt(
 		lines.push("   - `requirements`: only if the user stated explicit acceptance criteria.");
 	}
 	lines.push("   - `context_files`: up to 8 repo paths reviewers should read in full beyond the diff — callers, types/interfaces, tests that pin the behaviour. Skip files the diff already shows whole.");
+	lines.push("   - `checks`: up to 4 fast commands that type-check or run the tests covering the change. They run once in a sandbox (repo read-only, no network) before the review and every reviewer sees the output. Pick commands that finish in well under 2 minutes and don't write into the repo; never the full suite. Changed C/C++ files are compile-checked automatically.");
 	lines.push(`   - \`focus\`: risk AREAS only (e.g. "API-key handling across agents", "config-file merge lifecycle", "test isolation"), never hypotheses ("does X compile?", "is Y null when Z?")${focus ? `, plus the user's request: "${focus}"` : ""}.`);
 	lines.push("   - `suspicions`: your specific hypotheses about possible bugs, one per item. They are NOT shown to the reviewers; they're checked against what reviewers find independently (and cross-checked by verifiers when verify is on), so you learn which of your suspicions others reached on their own.");
 	if (parsed.kind === "pr") lines.push(`   - \`pr_number\`: ${parsed.number}`);
@@ -3928,9 +4499,11 @@ async function runMultiReviewFromArgs(
 	// for this run only; --quick swaps in the fast pool.
 	const usingTransientReviewers = transientReviewers !== null && transientReviewers.length > 0;
 	const poolName = usingTransientReviewers ? "transient" : flags.quick ? "quickReviewers" : "reviewers";
+	// verifyOnly wins over reviewers: a model listed in both only verifies.
+	const verifyOnlyIds = new Set(cfg.verifyOnly.map((raw) => parseReviewerSpec(raw)?.spec));
 	const effectiveReviewerSpecs: string[] = usingTransientReviewers
 		? transientReviewers
-		: flags.quick ? cfg.quickReviewers : cfg.reviewers;
+		: flags.quick ? cfg.quickReviewers : cfg.reviewers.filter((raw) => !verifyOnlyIds.has(parseReviewerSpec(raw)?.spec));
 	if (usingTransientReviewers && transientReviewers === TRANSIENT_REVIEWERS) TRANSIENT_REVIEWERS = null;
 	if (effectiveReviewerSpecs.length === 0) {
 		return {
@@ -4044,7 +4617,13 @@ async function runMultiReviewFromArgs(
 		const judge = agentLead ? null : resolveJudge(ctx, cfg);
 		if (!agentLead && !judge) target.warnings.push(`judge ${cfg.judge} not in registry; showing deterministic synthesis`);
 		const resolvedRows = resolved.map((r) => ({ rs: r.rs, model: r.model, clamped: r.clamped }));
-		const result = await runReviewPipeline(ctx, cfg, flags, target, resolvedRows, runOpts, judge, agentLead, signal, progress, runOptions.deadlineMs,
+		// Verification runs only with --verify or PR comments. Quick runs have
+		// no tools, so verify-only models (picked for tool use) sit out.
+		const verifies = !flags.quick && (flags.verify || prCommentOpts !== undefined);
+		const verifyOnly = verifies ? await resolveReviewerPoolStructured(ctx, cfg.verifyOnly) : { entries: [], missing: [] };
+		if (verifyOnly.missing.length > 0) target.warnings.push(`verifyOnly models not in registry, skipped: ${verifyOnly.missing.join(", ")}`);
+		const verifierRows = verifyOnly.entries.map((r) => ({ rs: r.rs, model: r.model, clamped: r.clamped }));
+		const result = await runReviewPipeline(ctx, cfg, flags, target, resolvedRows, verifierRows, runOpts, judge, agentLead, signal, progress, runOptions.deadlineMs,
 			[runOptions.detailHint, `Reviewer trace (tool calls, thinking and replies per session): ${trace.tracePath}`].filter(Boolean).join("\n"), prReport);
 		progress.finish("done");
 		return result;
@@ -4072,6 +4651,7 @@ async function runReviewPipeline(
 	flags: ReviewFlags,
 	target: ReviewTarget,
 	rows: Array<{ rs: ReviewerSpec; model: Model; clamped: boolean }>,
+	verifierRows: Array<{ rs: ReviewerSpec; model: Model; clamped: boolean }>,
 	runOpts: ReviewerRunOptions,
 	judge: Model | null,
 	agentLead: boolean,
@@ -4082,13 +4662,44 @@ async function runReviewPipeline(
 	prReport?: PrCommentsReport,
 ): Promise<MultiReviewRunResult> {
 	const label = describeFlags(flags);
-	const userPrompt = buildReviewUserPrompt(target);
 	// With a deadline (headless callers inside a capped shell), each phase's
 	// timeout shrinks to fit, keeping a reserve for the phases after it.
 	const fit = (opts: ReviewerRunOptions, reserveMs: number): ReviewerRunOptions =>
 		deadlineMs === undefined
 			? opts
 			: { ...opts, timeoutMs: Math.max(MIN_PHASE_MS, Math.min(opts.timeoutMs, deadlineMs - Date.now() - reserveMs)) };
+	// Code only runs sandboxed, and never in quick runs (no tools there). The
+	// probe runs only when something would execute: checks or verification.
+	const mayExecute = (target.brief?.checks.length ?? 0) > 0 || flags.verify || (prReport?.claims.length ?? 0) > 0 ||
+		(cfg.autoChecks && target.files.some((f) => CXX_FILE.test(f.path)));
+	const sandboxReason = !cfg.sandbox
+		? "sandbox is off in multi-review.json"
+		: flags.quick || !runOpts.useTools
+			? "quick runs don't execute code"
+			: mayExecute ? await sandboxUnavailable(signal) : "nothing to execute";
+	throwIfAborted(signal);
+	const checks = [...(target.brief?.checks ?? [])];
+	let sandboxExtras: SandboxExtras = {};
+	if (cfg.autoChecks && !sandboxReason && !checks.some((c) => c.includes("mr-cxx-check"))) {
+		const auto = cxxAutoCheck(target.files.map((f) => f.path), runOpts.cwd ?? ctx.cwd, ctx.cwd, target.warnings);
+		if (auto) {
+			checks.unshift(auto.command);
+			sandboxExtras = auto.extras;
+		}
+	}
+	if (checks.length > 0 && sandboxReason) {
+		target.warnings.push(`checks not run: ${sandboxReason}`);
+	} else if (checks.length > 0) {
+		const reserve = REVIEW_RESERVE_MS + GROUPING_RESERVE_MS + (flags.verify ? VERIFY_RESERVE_MS : 0) + FINAL_RESERVE_MS;
+		const budget = Math.min(cfg.checkTimeoutSec * 1000, deadlineMs === undefined ? Number.POSITIVE_INFINITY : deadlineMs - Date.now() - reserve);
+		target.checkResults = await runChecks(runOpts.cwd ?? ctx.cwd, checks, budget, cfg.sandboxHomeDirs, sandboxExtras, signal, (i, command) =>
+			progress.update({ phase: `check ${i + 1}/${checks.length}: ${command.length > 60 ? `${command.slice(0, 59)}…` : command}` }));
+		throwIfAborted(signal);
+		if (target.checkResults.some((r) => r.timedOut || r.skipped)) {
+			target.warnings.push(`some checks hit the ${cfg.checkTimeoutSec}s check budget; brief faster checks (type-check, one target, targeted tests)`);
+		}
+	}
+	const userPrompt = buildReviewUserPrompt(target);
 	progress.update({ phase: `fanning out to ${rows.length} reviewers (cap ${cfg.concurrency})`, done: 0, total: rows.length });
 	const runs = await runAllReviewers(
 		rows,
@@ -4126,7 +4737,10 @@ async function runReviewPipeline(
 	if (toVerify.length > 0 && verifyTimeLeft < MIN_PHASE_MS) {
 		target.warnings.push(`verification skipped: only ${Math.max(0, Math.round(verifyTimeLeft / 1000))}s left of the run's time budget`);
 	} else if (toVerify.length > 0) {
-		const { failures } = await runVerification(ctx, cfg, rows, toVerify, userPrompt, fit(runOpts, FINAL_RESERVE_MS), signal, progress);
+		// One row per model: a duplicate would count as two independent verifiers.
+		const verifierPool = [...rows, ...verifierRows].filter((r, i, all) => all.findIndex((o) => o.rs.spec === r.rs.spec) === i);
+		if (sandboxReason && cfg.sandbox && !flags.quick && runOpts.useTools) target.warnings.push(`verifiers can't execute code: ${sandboxReason}`);
+		const { failures } = await runVerification(ctx, cfg, verifierPool, toVerify, userPrompt, { ...fit(runOpts, FINAL_RESERVE_MS), sandbox: sandboxReason === null, sandboxExtras }, signal, progress);
 		for (const f of failures) target.warnings.push(`verifier failed (its claims stay unverified): ${f}`);
 		suspicionGroups.forEach((g, i) => {
 			suspicions[i].verifications = g.verifications;
@@ -4202,6 +4816,7 @@ export interface ReviewRequest {
 	requirements?: string[];
 	suspicions?: string[];
 	context_files?: string[];
+	checks?: string[];
 	focus?: string;
 	scope?: "diff" | "area";
 	pr_number?: number;
@@ -4245,6 +4860,7 @@ async function runAgentLedReview(
 			requirements: params.requirements,
 			suspicions: params.suspicions,
 			contextFiles: params.context_files,
+			checks: params.checks,
 		},
 		focus: params.scope === "area" ? undefined : focus,
 		flags: { verify: params.verify, quick: params.quick },
@@ -4284,7 +4900,7 @@ export function parseReviewRequest(raw: unknown): ReviewRequest | { error: strin
 		// A list of focus areas is a harmless shape slip; join instead of failing the run.
 		if (Array.isArray(o.focus) && o.focus.every((x) => typeof x === "string")) o.focus = (o.focus as string[]).join("; ");
 		str("intent"); str("spec_path"); str("focus");
-		strs("requirements"); strs("suspicions"); strs("context_files");
+		strs("requirements"); strs("suspicions"); strs("context_files"); strs("checks");
 		bool("verify"); bool("quick"); bool("pr_comments"); bool("include_nits"); bool("include_resolved");
 		if (o.scope !== undefined) {
 			if (o.scope !== "diff" && o.scope !== "area") throw new Error(`"scope" must be "diff" or "area"`);
@@ -4565,6 +5181,7 @@ export default function (pi: ExtensionAPI) {
 			"`intent`: goals plus facts reviewers can't find in the repo (external API behaviour, constraints, out-of-scope items) — not a narration of the implementation. With a spec, pass spec_path and list its checkable requirements.",
 			"`focus`: risk areas only, never hypotheses. Put your specific bug hypotheses in `suspicions`; they are hidden from reviewers and checked against what they find on their own.",
 			"`context_files` are repo paths reviewers should read in full (callers, types, tests) — not files already whole in the diff.",
+			"`checks` are up to 4 fast commands (type-check, targeted tests) run once in a sandbox (repo read-only, no network) before the review; reviewers see their output. C/C++ changes are compile-checked automatically.",
 			"Set verify=true for high-stakes changes (independent cross-check of every finding); quick=true for small diffs or a cheap first look.",
 			"For a PR that already has review comments (CodeRabbit, collaborators), set pr_comments=true to triage them: each is verified and you report valid/invalid per comment plus new issues, and draft replies to a local file. Never post to GitHub.",
 			"After results return, follow the lead-judgment instructions in the result. Do not apply fixes unless asked.",
@@ -4590,6 +5207,10 @@ export default function (pi: ExtensionAPI) {
 			context_files: Type.Optional(Type.Array(Type.String(), {
 				description: "Repo-relative paths reviewers should see in full beyond the diff (callers, types, tests). Max 12.",
 				maxItems: 12,
+			})),
+			checks: Type.Optional(Type.Array(Type.String(), {
+				description: "Up to 4 fast shell commands that type-check or run the tests covering the change (e.g. \"npx tsc --noEmit\", \"python3 -m pytest -q -p no:cacheprovider tests/test_x.py\"). They run once, before the review, on the reviewed code in a sandbox (repo read-only, writable $TMPDIR, no network; 120s total by default), and reviewers see their output. Commands that write into the repo (in-tree builds) or download dependencies fail there. Changed C/C++ files get a compile + cppcheck check automatically. Never the full test suite.",
+				maxItems: 4,
 			})),
 			scope: Type.Optional(StringEnum(["diff", "area"] as const, {
 				description:

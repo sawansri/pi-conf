@@ -16,6 +16,18 @@
   repo where `git fetch origin pull/<N>/head:pr-<N>` is reachable without
   GH-aware tooling.
 - For free-text focus input: nothing extra — that's the fallback shape.
+- Optional, to let reviews execute code (checks, the verifiers' `run` tool,
+  the C/C++ compile check): [nono](https://nono.sh) on PATH or in
+  `~/.local/bin`, and a kernel with Landlock (5.13+; 6.7+ to block TCP):
+
+  ```bash
+  curl -fsSL https://nono.sh/install.sh -o /tmp/nono-install.sh   # read it first
+  NONO_INSTALL_DIR=~/.local/bin sh /tmp/nono-install.sh
+  grep -q landlock /sys/kernel/security/lsm && echo landlock ok
+  ```
+
+  The C/C++ check also wants a `compile_commands.json` (CMake:
+  `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`) and, optionally, `cppcheck`.
 
 The extension makes **no** changes to `~/.pi/agent/models.json` (per the
 design constraint).
@@ -59,8 +71,7 @@ cat > ~/.pi/agent/multi-review.json << 'EOF'
   "reviewers": [
     "amd-gateway-anthropic/Claude-Sonnet-5.5@high",
     "amd-gateway/gpt-6.1-sol@high",
-    "amd-gateway/gpt-6-luna@high",
-    "amd-gateway/gemini-4-argon@medium"
+    "amd-gateway/gpt-6-luna@high"
   ],
   "judge": "amd-gateway-anthropic/Claude-Opus-5.5",
   "judgeThinking": "high",
@@ -68,13 +79,18 @@ cat > ~/.pi/agent/multi-review.json << 'EOF'
   "temperature": 0.2,
   "verify": false,
   "verifiersPerFinding": 2,
+  "verifyOnly": ["amd-gateway/gemini-4-argon@medium"],
   "quickReviewers": [
     "amd-gateway/gpt-6-luna@low",
     "amd-gateway-anthropic/Claude-Haiku-5.5",
     "amd-gateway/gemini-3.8-flash@low"
   ],
   "reviewerTools": true,
-  "reviewerTimeoutSec": 420
+  "reviewerTimeoutSec": 420,
+  "sandbox": true,
+  "checkTimeoutSec": 120,
+  "autoChecks": true,
+  "minReviewToolCalls": 10
 }
 EOF
 ```
@@ -210,7 +226,7 @@ follows it.
 
 The status footer shows the loaded pool on session start:
 ```
-multi-review · pool: 4 (amd-gateway-anthropic/Claude-Sonnet-5.5@high, amd-gateway/gpt-6.1-sol@high, amd-gateway/gpt-6-luna@high, amd-gateway/gemini-4-argon@medium)
+multi-review · pool: 3 (amd-gateway-anthropic/Claude-Sonnet-5.5@high, amd-gateway/gpt-6.1-sol@high, amd-gateway/gpt-6-luna@high)
 ```
 
 Per-run status updates flow through the same status key and a temporary
@@ -233,6 +249,9 @@ via tool updates so the pending tool row changes as reviewers complete.
 |---------|-----------|
 | `no reviewers configured` | Add `multi-review.json` per step 2 |
 | A reviewer shows `timed out after 420s` or `cut as straggler` | Straggler: the rest of the pool finished long before it (often a degraded endpoint; check the gateway status page). Timeout: raise `reviewerTimeoutSec` or lower that reviewer's `@level` (higher levels didn't improve results in testing) |
+| `checks not run: nono is not installed` / `verifiers can't execute code` | Install nono (Prereqs), or set `"sandbox": false` to silence it |
+| `C/C++ files changed but no compile_commands.json` | Configure with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON` (it is looked for at the repo root, `build*/`, `build*/*/`, `out/*/`) |
+| A check fails with "Permission denied" | The repo is read-only in the sandbox; brief checks that don't write into it (type-checks, tests that write to `$TMPDIR`) |
 | `cannot read spec …` | `--spec` paths are relative to pi's cwd; the run refuses to continue without the spec rather than silently dropping it |
 | An issue shows `unanimous` instead of ✓/✗ | Every reviewer raised it, so nobody independent was left to verify it; the lead agent checks those itself |
 | `none of the configured reviewers resolved` | Confirm each spec is rule-typed in `~/.pi/agent/models.json` AND has its API key wired (`/login` or env var); the extension never adds models itself |

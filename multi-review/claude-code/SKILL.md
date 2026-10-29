@@ -1,6 +1,6 @@
 ---
 name: multi-review
-description: Multi-model code review through pi's multi-review extension. Reviewers from other model families (Sonnet 5.5, gpt-6.1-sol, gpt-6-luna, Gemini 4 Argon), each with read-only repo access, review the current change, a PR, or a spec implementation in parallel. You write the brief, act as lead reviewer on their findings, and, if asked, fix the issues test-first and confirm the fixes with a re-review. Also verifies a PR's existing review comments (CodeRabbit, other bots, collaborators): which are real, which are wrong, and what they missed, with draft replies (never posted). Use when the user asks for a multi-model review, a second opinion from other models, a check of an implementation against a spec, whether CodeRabbit's or reviewers' PR comments are valid or real, or to fix and confirm review findings.
+description: Multi-model code review through pi's multi-review extension. Reviewers from other model families (Sonnet 5.5, gpt-6.1-sol, gpt-6-luna; Gemini 4 Argon as a verifier), each with read-only repo access, review the current change, a PR, or a spec implementation in parallel. You write the brief, act as lead reviewer on their findings, and, if asked, fix the issues test-first and confirm the fixes with a re-review. Also verifies a PR's existing review comments (CodeRabbit, other bots, collaborators): which are real, which are wrong, and what they missed, with draft replies (never posted). Use when the user asks for a multi-model review, a second opinion from other models, a check of an implementation against a spec, whether CodeRabbit's or reviewers' PR comments are valid or real, or to fix and confirm review findings.
 argument-hint: "[--spec=path] [--verify] [--quick] [#PR [--pr-comments [--nits] [--resolved]] | area to review]"
 allowed-tools: Bash(pi -p *) Bash(mkdir *) Bash(git diff *) Bash(git log *) Bash(git show *) Bash(git status *) Bash(git merge-base *) Bash(git rev-parse *) Bash(gh pr view *) Bash(gh pr diff *) Read Write
 ---
@@ -41,6 +41,7 @@ Write a JSON file (e.g. `/tmp/multi-review/<timestamp>/brief.json`; create the d
   "spec_path": "agent-roadmap.md",
   "requirements": ["1.1: per-model entries include contextWindow from recipe_options.ctx_size", "…"],
   "context_files": ["src/cpp/cli/pi_profile.cpp", "test/cpp/test_pi_profile.cpp"],
+  "checks": ["python3 -m pytest -q -p no:cacheprovider test/test_pi_profile_cli.py"],
   "focus": "API-key handling across agents; mcp.json merge lifecycle; CLI flag parsing; test isolation and CI wiring",
   "suspicions": ["--no-mcp may not set the optional to false with the vendored CLI11", "…"],
   "verify": true
@@ -53,6 +54,7 @@ Write a JSON file (e.g. `/tmp/multi-review/<timestamp>/brief.json`; create the d
 | `spec_path` | The spec path exactly as the user gave it: repo-relative or absolute (don't rewrite an absolute path; the spec may live outside the repo). Its text goes to reviewers verbatim. |
 | `requirements` | With a spec: every concrete, checkable requirement, one per item, including the edge cases and error behaviour it pins down. Without one: only explicit acceptance criteria. |
 | `context_files` | Up to 8 repo paths reviewers should read in full beyond the diff: callers, types/interfaces, tests that pin the behaviour. |
+| `checks` | Up to 4 fast commands that type-check or run the tests covering the change, finishing well under 2 minutes in total. They run once before the review in a sandbox where the repo is read-only and there is no network, so skip in-tree builds and anything that downloads. Changed C/C++ files get a compile + cppcheck check automatically when a `compile_commands.json` exists; don't add one yourself. Never the full suite. |
 | `focus` | Risk AREAS only ("API-key handling across agents", "config-file merge lifecycle"), never hypotheses ("does X compile?"). |
 | `suspicions` | Your specific bug hypotheses, one per item. Hidden from reviewers. They're matched against what reviewers find independently, and with `verify` they're cross-checked. |
 | `scope` | `"area"` only when there is no change to review and `focus` describes the area; otherwise omit it. |
@@ -126,4 +128,4 @@ Don't edit until asked. Then work through `verdict.md`:
 
 ## Prerequisites
 
-pi must be on PATH, with the multi-review extension installed (`~/.pi/agent/extensions/multi-review`) and its reviewer models configured. Setup is described in `install.md` in the pi-conf repo.
+pi must be on PATH, with the multi-review extension installed (`~/.pi/agent/extensions/multi-review`) and its reviewer models configured. nono (https://nono.sh) is optional: without it checks don't run and verifiers can't execute code; the result's Warnings say so. Setup is described in `install.md` in the pi-conf repo.

@@ -35,7 +35,7 @@ judge model writes the synthesis.
 |---------|-----|
 | Slash command | `/multi-review [--spec=path] [--verify] [--quick] [--direct] [PR-number [--pr-comments [--nits] [--resolved]] \| free-text focus]` |
 | Slash command | `/multi-review-pick`: open the multi-select TUI picker to choose reviewer models from your registry (optionally saved to `multi-review.json`) |
-| LLM-callable tool | `multi_review({intent?, spec_path?, requirements?, suspicions?, context_files?, focus?, scope?, pr_number?, verify?, quick?, pr_comments?, include_nits?, include_resolved?})`. The agent can call it on its own too |
+| LLM-callable tool | `multi_review({intent?, spec_path?, requirements?, suspicions?, context_files?, checks?, focus?, scope?, pr_number?, verify?, quick?, pr_comments?, include_nits?, include_resolved?})`. The agent can call it on its own too |
 
 Tool parameters:
 
@@ -45,6 +45,7 @@ Tool parameters:
 | `spec_path` | Repo-relative spec/design doc, passed to reviewers verbatim as the source of truth (60k char cap). |
 | `requirements` | Checkable requirements, one per item. Reviewers report unmet ones as category `spec`. |
 | `context_files` | Up to 12 paths reviewers get in full (callers, types, tests). |
+| `checks` | Up to 4 fast shell commands (type-check, targeted tests) run once in the sandbox before the fan-out; every reviewer and verifier sees the output. See [Executing code](#executing-code-tools-checks-and-the-sandbox). |
 | `focus` | Risk **areas** ("config-file merge lifecycle"), never hypotheses. A hint layered on the diff; it never replaces the diff. |
 | `suspicions` | The lead's own bug hypotheses (≤ 20). **Never shown to reviewers.** They're matched against what reviewers find independently and, with `verify`, cross-checked by verifiers. |
 | `scope` | `diff` (default: working tree vs default branch, or the PR) or `area` (no diff; review what `focus` describes). |
@@ -148,6 +149,77 @@ that nobody raised is either wrong (s2 above: both verifiers refuted it,
 and the lead dismissed its own hypothesis) or a shared blind spot, and the
 verifier evidence or the lead's own reading decides which.
 
+## Executing code: tools, checks and the sandbox
+
+Reviewers read; verifiers can also run things. Everything that executes
+model- or lead-chosen code runs under [nono](https://nono.sh), a Landlock
+sandbox (no root, no user namespaces, ~0.15s per call).
+
+| Who | Tools |
+|-----|-------|
+| Reviewers | `read`, `grep`, `find`, `ls`, `git`, `progress` |
+| Verifiers | the same, plus `run` (when the sandbox works) |
+
+- **`git`** runs `log`, `show`, `blame`, or `diff` in the reviewed checkout,
+  so reviewers can see why touched code is the way it is and whether a
+  change reverts an earlier fix. Options that write files, read files from
+  outside the repo, or run configured programs are refused, including git's
+  abbreviated forms (`--cont` for `--contents`) and `-O<file>`. Paths
+  outside the repo are refused too, since they'd switch `git diff` into
+  no-index mode.
+- **`run`** (verifiers only) runs a bash script to settle a claim by
+  execution: a targeted test, compiling the touched files, or a repro.
+  For C/C++, verifiers are told to compile repros with
+  `-fsanitize=address,undefined`.
+- **Checks** run once before the fan-out, inside `checkTimeoutSec` (120s)
+  in total: the brief's `checks`, plus, with `autoChecks`, a built-in one
+  per language. Their output goes into every reviewer's prompt and into the
+  lead's `result.md`. Under a headless deadline they leave reviewers at
+  least 3 minutes.
+- **C/C++ auto check** (`tools/mr-cxx-check`, on PATH in the sandbox):
+  when the change touches C/C++ files and a `compile_commands.json` exists,
+  it re-runs each changed file's own compile command with `-fsyntax-only
+  -Wall -Wextra`, compiles up to 3 files that include each changed header,
+  and runs cppcheck on the changed sources. No build system is involved,
+  so CMake re-configures (and their network needs) never happen; it takes
+  about a second per file. Warnings are kept only when they point into a
+  changed file; errors are kept wherever they are. PR worktrees borrow the
+  main checkout's compile database with paths remapped onto the worktree.
+  gcc's `-fanalyzer` was tried and dropped: 85s per file on lemonade, with
+  only false positives from the standard library.
+- **No web access.** Reviewers are told to read a dependency's source on
+  disk (node_modules, vendored directories, system headers) rather than
+  assume its behaviour.
+- **Effort floor.** A reviewer that answers `[]` after fewer than
+  `minReviewToolCalls` (10) tool calls is nudged once to work through its
+  plan, the brief's focus areas, and git history first. If the nudge times
+  out or rambles, its earlier `[]` stands.
+
+What the sandbox allows:
+
+- The repository (and a worktree's main `.git`) is **read-only**. The only
+  writable place is a fresh scratch directory per call, which is also
+  `$HOME` and `$TMPDIR` and is deleted afterwards. Commands that write into
+  the repo, like in-tree builds, fail with "permission denied".
+- **Readable:** system directories (`/usr`, `/etc`, `/opt`), the
+  extension's `tools/`, and `sandboxHomeDirs` (toolchains such as `~/.nvm`;
+  `~/.cargo` only for `bin/`, `registry/` and `git/`, since it holds
+  `credentials.toml`). Nothing else in `$HOME` is readable, so credentials
+  like `~/.pi/agent/auth.json` can't be printed back to a model. `/tmp` is
+  not writable (PR worktrees and other runs' traces live there).
+- **Network:** TCP is blocked. DNS lookups are not: Landlock filters TCP
+  only, and the network namespaces that would close that need the
+  unprivileged user namespaces AppArmor blocks on Ubuntu.
+- **Limits:** 8G memory and 4096 processes per call, in a cgroup of its
+  own. On timeout or abort the run gets SIGTERM, then the cgroup is killed,
+  which takes children that `setsid` away too.
+
+Without nono, or with `"sandbox": false`, checks are skipped with a warning
+and verifiers have no `run` tool; everything else works as before.
+
+Note that pi's own `read` tool, which every reviewer has, is not sandboxed:
+it can read any file your user can.
+
 ## Using it from other harnesses (Claude Code, scripts, CI)
 
 The review engine runs headless, so any harness that can run a shell
@@ -225,10 +297,10 @@ The modes used to mix three separate choices: breadth (which reviewers),
 depth (a second checking round), and who writes the verdict. Now each is
 its own option:
 
-| Option | What it does | When | Cost / time (5-reviewer pool) |
+| Option | What it does | When | Cost / time (3-reviewer pool) |
 |--------|-------------|------|------------------------------|
-| *(default)* | Sonnet 5.5 + gpt-6.1-sol + gpt-6-luna + Gemini 4 Argon@medium with read-only tools → grouping → the main agent judges | Most reviews | ~1× · ~2–3 min on a 700-line diff |
-| `--verify` | Adds a cross-check round: each issue goes to `verifiersPerFinding` (2) reviewers **who did not raise it**. With tools, they reply confirmed / refuted / uncertain plus code evidence | High-stakes changes; when false positives are expensive | ~1.5–2× |
+| *(default)* | Sonnet 5.5 + gpt-6.1-sol + gpt-6-luna with read-only tools → grouping → the main agent judges | Most reviews | ~1× · ~2–3 min on a 700-line diff |
+| `--verify` | Adds a cross-check round: each issue goes to `verifiersPerFinding` (2) reviewers **who did not raise it**, or to `verifyOnly` models (Gemini 4 Argon@medium). With tools, they reply confirmed / refuted / uncertain plus code evidence | High-stakes changes; when false positives are expensive | ~1.5–2× |
 | `--quick` | `quickReviewers` pool (gpt-6-luna@low, Haiku 5.5, Gemini Flash@low), single completions, no tools | Small diffs, a cheap first look | ~0.2× · 10–50s |
 | `--direct` | No agent hand-off: the configured judge writes the synthesis (print/RPC modes always do this) | Scripting, or when you don't want the agent involved | +1 judge call |
 
@@ -301,7 +373,8 @@ extglob — documented limitation.
 4. **Parallel fan-out** — capped by `multi-review.concurrency` (max 16).
    With `reviewerTools: true` (default) each reviewer is a nested pi agent
    (`createAgentSession`, in-memory, no extensions/skills/context files)
-   with `read`/`grep`/`find`/`ls` only, so it can trace callers and tests
+   with `read`/`grep`/`find`/`ls`/`git` only (verifiers also get the
+   sandboxed `run`; see [Executing code](#executing-code-tools-checks-and-the-sandbox)), so it can trace callers and tests
    instead of guessing from hunks. Otherwise it's a single
    `ctx.modelRegistry.streamSimple()` call. Both paths use registry auth
    (literal keys and custom headers in `models.json`). Each reviewer gets
@@ -411,6 +484,9 @@ Findings:
   overlap least with theirs. On a narrow area review it took ~350s at
   `@high` (past the straggler cutoff) and ~270s at `@medium`, where it
   confirmed the main findings and added one no other reviewer raised.
+  Over the next real reviews it returned 0 findings every time (one run
+  timed out), while its verifier verdicts cited concrete code, so it moved
+  to `verifyOnly`: it verifies but no longer reviews.
 - **DeepSeek V4.1 Flash** (the gateway's pre-1017 checkpoint) works with
   tools and thinking but was too slow to review: cut as a straggler at
   `@high`, timed out at 900s at `@max` after ~200k characters of reasoning.
@@ -444,8 +520,7 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
   "reviewers": [
     "amd-gateway-anthropic/Claude-Sonnet-5.5@high",
     "amd-gateway/gpt-6.1-sol@high",
-    "amd-gateway/gpt-6-luna@high",
-    "amd-gateway/gemini-4-argon@medium"
+    "amd-gateway/gpt-6-luna@high"
   ],
   "judge": "amd-gateway-anthropic/Claude-Opus-5.5",
   "judgeThinking": "high",
@@ -453,6 +528,7 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
   "temperature": 0.2,
   "verify": false,
   "verifiersPerFinding": 2,
+  "verifyOnly": ["amd-gateway/gemini-4-argon@medium"],
   "quickReviewers": [
     "amd-gateway/gpt-6-luna@low",
     "amd-gateway-anthropic/Claude-Haiku-5.5",
@@ -460,11 +536,22 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
   ],
   "reviewerTools": true,
   "reviewerTimeoutSec": 420,
-  "dedupeModel": "amd-gateway-anthropic/Claude-Opus-5.5@low"
+  "dedupeModel": "amd-gateway-anthropic/Claude-Opus-5.5@low",
+  "sandbox": true,
+  "checkTimeoutSec": 120,
+  "autoChecks": true,
+  "minReviewToolCalls": 10,
+  "sandboxHomeDirs": [".nvm", ".cargo/bin", ".cargo/registry", ".cargo/git", ".rustup", ".pyenv", ".bun", ".deno", ".volta", "go", ".local/bin", ".local/lib"]
 }
 ```
 
 `reviewerTools: false` makes reviewers single completions (faster, diff-only).
+`sandbox`, `checkTimeoutSec`, `autoChecks`, `minReviewToolCalls` and
+`sandboxHomeDirs` are described under
+[Executing code](#executing-code-tools-checks-and-the-sandbox).
+`verifyOnly` models skip the review and only join the `--verify` (and
+`--pr-comments`) verification round; a model listed in both `reviewers` and
+`verifyOnly` only verifies. Quick runs leave them out.
 `dedupeModel: "lexical"` skips the grouping call.
 
 This file stays optional — if absent, the extension warns on `/multi-review`
@@ -516,8 +603,9 @@ expose per-row level controls is tracked as future polish.
   registry has API keys for.
 - **Sub-process sharding.** Reviewers run in-process (nested agent
   sessions or registry calls), not as spawned `pi` subprocesses.
-- **Write access for reviewers.** Nested reviewer agents get read-only
-  tools only, with no bash.
+- **Write access for reviewers.** Reviewers get read-only tools and no
+  shell; only verifiers get `run`, and only inside the sandbox, where the
+  repo is read-only.
 - **Full model configuration UI.** The picker selects reviewer models only.
   Per-reviewer thinking levels and judge choice are still edited directly in
   `multi-review.json`.

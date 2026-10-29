@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""Static checks on changed C/C++ files, for multi-review's sandbox.
+
+    mr-cxx-check [-p BUILD_DIR] FILE...
+
+Recompiles each changed source with its own flags from compile_commands.json
+plus -fsyntax-only -Wall -Wextra (no build system involved, so no CMake
+re-configure and no network), compiles a few includers of each changed
+header, and runs cppcheck on the changed sources when it is installed.
+Warnings are kept only when they point into a changed file; errors are kept
+wherever they are. Exit status 1 when anything was reported.
+
+PR worktrees have no build directory of their own: MR_CXX_DB points at the
+main checkout's compile_commands.json and MR_CXX_REMAP=FROM=TO rewrites its
+source paths onto the worktree (paths inside the build directory stay put).
+"""
+import argparse
+import concurrent.futures
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+SOURCE_EXT = (".c", ".cc", ".cpp", ".cxx", ".c++")
+HEADER_EXT = (".h", ".hh", ".hpp", ".hxx", ".h++", ".inl", ".ipp")
+INCLUDERS_PER_HEADER = 3
+TU_TIMEOUT_SEC = 120
+CONTEXT = re.compile(r"^(In file included from |\s+from |[^:\s][^:]*: (In|At) )")
+DIAG = re.compile(r"^(?P<path>[^:\s][^:]*):(?P<line>\d+):(?:\d+:)? (?P<kind>error|warning|fatal error): ")
+
+
+def find_db(root, build_dir):
+    if build_dir:
+        return os.path.join(os.path.abspath(build_dir), "compile_commands.json")
+    if os.environ.get("MR_CXX_DB"):
+        return os.environ["MR_CXX_DB"]
+    candidates = [os.path.join(root, "compile_commands.json")]
+    candidates += sorted(glob.glob(os.path.join(root, "build*", "compile_commands.json")))
+    candidates += sorted(glob.glob(os.path.join(root, "out", "*", "compile_commands.json")))
+    candidates += sorted(glob.glob(os.path.join(root, "build*", "*", "compile_commands.json")))
+    return next((c for c in candidates if os.path.isfile(c)), None)
+
+
+def remapper(db_path):
+    spec = os.environ.get("MR_CXX_REMAP", "")
+    if "=" not in spec:
+        return lambda p: p
+    src, dst = spec.split("=", 1)
+    src, dst = src.rstrip("/"), dst.rstrip("/")
+    build = os.path.dirname(db_path)
+
+    def remap(text):
+        # Token-wise, so -I/main/src becomes -I/worktree/src but /main/build/... stays.
+        def one(tok):
+            for prefix in ("", "-I", "-isystem", "-iquote", "-include"):
+                if tok.startswith(prefix + src) and not tok.startswith(prefix + build):
+                    rest = tok[len(prefix) + len(src):]
+                    if rest == "" or rest.startswith("/"):
+                        return prefix + dst + rest
+            return tok
+        return one(text)
+
+    return remap
+
+
+PATH_FLAGS = ("-I", "-isystem", "-iquote", "-idirafter", "-include")
+
+
+def absolutize(args, directory):
+    """Include paths made absolute, so a remap can move them onto the worktree."""
+    out, take_next = [], False
+    for a in args:
+        if take_next:
+            out.append(os.path.normpath(os.path.join(directory, a)))
+            take_next = False
+            continue
+        if a in PATH_FLAGS:
+            take_next = True
+            out.append(a)
+            continue
+        flag = next((f for f in PATH_FLAGS if a.startswith(f) and len(a) > len(f)), None)
+        out.append(flag + os.path.normpath(os.path.join(directory, a[len(flag):])) if flag else a)
+    return out
+
+
+def load_entries(db_path):
+    remap = remapper(db_path)
+    entries = []
+    for e in json.load(open(db_path)):
+        args = e.get("arguments") or shlex.split(e["command"])
+        directory = e["directory"]
+        file = os.path.normpath(os.path.join(directory, e["file"]))
+        # The source argument is often relative to the build directory; pin it so the remap moves it too.
+        args = [file if not a.startswith("-") and os.path.normpath(os.path.join(directory, a)) == file else a for a in args]
+        entries.append({"directory": directory, "file": remap(file), "args": [remap(a) for a in absolutize(args, directory)]})
+    return entries
+
+
+def remapped_db(entries, db_path):
+    """compile_commands.json with the remapped paths, for cppcheck; the original when nothing moved."""
+    if "=" not in os.environ.get("MR_CXX_REMAP", ""):
+        return db_path
+    fd, out = tempfile.mkstemp(prefix="mr-cxx-db-", suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump([{"directory": e["directory"], "file": e["file"], "arguments": e["args"]} for e in entries], f)
+    return out
+
+
+def syntax_command(args):
+    """The TU's own compile command minus its outputs (object, depfile), checking syntax only."""
+    out, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-o", "-MF", "-MT", "-MQ"):
+            i += 2
+            continue
+        if a in ("-c", "-MD", "-MMD") or any(a.startswith(p) and len(a) > len(p) for p in ("-o", "-MF", "-MT", "-MQ")):
+            i += 1
+            continue
+        out.append(a)
+        i += 1
+    return out + ["-fsyntax-only", "-Wall", "-Wextra", "-fdiagnostics-color=never"]
+
+
+def compile_tu(entry):
+    try:
+        r = subprocess.run(syntax_command(entry["args"]), cwd=entry["directory"], capture_output=True, text=True, timeout=TU_TIMEOUT_SEC)
+        return entry, r.returncode, r.stderr
+    except subprocess.TimeoutExpired:
+        return entry, None, f"timed out after {TU_TIMEOUT_SEC}s"
+    except OSError as err:
+        return entry, None, str(err)
+
+
+def keep_diagnostics(stderr, directory, changed):
+    """Diagnostic blocks (first line plus its notes/context) in changed files, plus every error."""
+    kept, block, keep, context = [], [], False, []
+    for line in stderr.splitlines():
+        m = DIAG.match(line)
+        if m:
+            if keep:
+                kept.extend(block)
+            path = os.path.normpath(os.path.join(directory, m.group("path")))
+            keep = "error" in m.group("kind") or path in changed
+            # "In file included from" / "In function" lines precede the diagnostic they belong to.
+            block, context = context + [line], []
+        elif CONTEXT.match(line):
+            context.append(line)
+        else:
+            block.append(line)
+    if keep:
+        kept.extend(block)
+    return kept
+
+
+def includers(header, entries, limit):
+    """TUs that include `header`: the #include path must be a path suffix of it, not just the same basename."""
+    name = os.path.basename(header)
+    pattern = re.compile(r'^\s*#\s*include\s*[<"]([^>"]*\b' + re.escape(name) + r')[>"]', re.M)
+    found = []
+    for e in entries:
+        try:
+            text = open(e["file"], errors="replace").read()
+        except OSError:
+            continue
+        for inc in pattern.findall(text):
+            inc = os.path.normpath(inc)
+            if header.endswith(os.sep + inc) or os.path.normpath(os.path.join(os.path.dirname(e["file"]), inc)) == header:
+                found.append(e)
+                break
+        if len(found) >= limit:
+            break
+    return found
+
+
+def run_cppcheck(sources, db_path, changed):
+    if not shutil.which("cppcheck") or not sources:
+        return None
+    lines, unchecked = [], []
+    for src in sources:
+        r = subprocess.run(
+            ["cppcheck", f"--project={db_path}", f"--file-filter={src}", "--enable=warning,performance,portability",
+             "--inline-suppr", "--quiet", "--template={file}:{line}: {severity}: {message} [{id}]"],
+            capture_output=True, text=True, timeout=TU_TIMEOUT_SEC,
+        )
+        out = [l for l in (r.stdout + r.stderr).splitlines() if l.strip()]
+        # Never let "matched nothing" read as "clean".
+        if any("could not find any files matching" in l for l in out):
+            unchecked.append(src)
+            continue
+        lines += out
+    # Like the compiler output: only what lands in changed files, once each
+    # (every includer of a header repeats its issues).
+    kept = []
+    for l in lines:
+        m = re.match(r"^([^:]+):\d+:", l)
+        if m and os.path.normpath(m.group(1)) in changed and l not in kept:
+            kept.append(l)
+    return kept, unchecked
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-p", dest="build_dir", help="directory holding compile_commands.json")
+    ap.add_argument("files", nargs="+")
+    opts = ap.parse_args()
+    root = os.getcwd()
+    changed = {os.path.normpath(os.path.join(root, f)) for f in opts.files}
+    changed = {f for f in changed if f.endswith(SOURCE_EXT + HEADER_EXT)}
+    if not changed:
+        print("mr-cxx-check: no C/C++ files among the arguments")
+        return 0
+    db_path = find_db(root, opts.build_dir)
+    if not db_path or not os.path.isfile(db_path):
+        print("mr-cxx-check: no compile_commands.json found (configure with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON, or pass -p BUILD_DIR)")
+        return 2
+    entries = load_entries(db_path)
+    by_file = {e["file"]: e for e in entries}
+    tus, notes = {}, []
+    for f in sorted(changed):
+        if not os.path.exists(f):
+            continue
+        if f.endswith(SOURCE_EXT):
+            if f in by_file:
+                tus[f] = by_file[f]
+            else:
+                notes.append(f"{os.path.relpath(f, root)}: not in compile_commands.json (not built in this configuration)")
+        else:
+            inc = includers(f, entries, INCLUDERS_PER_HEADER)
+            if not inc:
+                notes.append(f"{os.path.relpath(f, root)}: no translation unit in compile_commands.json includes it")
+            for e in inc:
+                tus.setdefault(e["file"], e)
+    reported = 0
+    workers = min(8, os.cpu_count() or 2)
+    with concurrent.futures.ThreadPoolExecutor(workers) as pool:
+        for entry, code, stderr in pool.map(compile_tu, tus.values()):
+            rel = os.path.relpath(entry["file"], root)
+            if code is None:
+                print(f"== {rel}: could not compile: {stderr}")
+                reported += 1
+                continue
+            kept = keep_diagnostics(stderr, entry["directory"], changed)
+            if code != 0 and not kept:
+                kept = stderr.splitlines()[-30:]
+            print(f"== {rel}: {'compile errors' if code else 'compiles'}" + (f", {sum(1 for l in kept if DIAG.match(l))} diagnostic(s) in changed files" if kept else ", clean"))
+            if kept:
+                print("\n".join(kept))
+                reported += 1
+    cpp = run_cppcheck(sorted(f for f in tus if f in changed), remapped_db(entries, db_path), changed)
+    if cpp is None:
+        print("== cppcheck: not installed or no changed sources")
+    else:
+        issues, unchecked = cpp
+        print(f"== cppcheck: {len(issues)} issue(s)" + (f"; NOT checked: {', '.join(os.path.relpath(u, root) for u in unchecked)}" if unchecked else ""))
+        if issues:
+            print("\n".join(issues))
+            reported += 1
+    for n in notes:
+        print(f"note: {n}")
+    return 1 if reported else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
