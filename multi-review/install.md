@@ -54,8 +54,11 @@ Or copy a snapshot:
 
 ```bash
 mkdir -p ~/.pi/agent/extensions/multi-review
-cp ~/Projects/pi-conf/multi-review/extension/index.ts ~/.pi/agent/extensions/multi-review/index.ts
+cp -r ~/Projects/pi-conf/multi-review/extension/. ~/.pi/agent/extensions/multi-review/
 ```
+
+(The whole directory: `index.ts` registers the extension and imports the
+modules in `src/`; `tools/` holds the scripts the sandbox runs.)
 
 Project-local instead: use `.pi/extensions/multi-review` in the repo. Pi
 loads any subdirectory that contains an `index.ts`. Restart pi or run
