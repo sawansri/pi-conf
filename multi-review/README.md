@@ -157,7 +157,7 @@ sandbox (no root, no user namespaces, ~0.15s per call).
 
 | Who | Tools |
 |-----|-------|
-| Reviewers | `read`, `grep`, `find`, `ls`, `git`, `progress` |
+| Reviewers | `read`, `grep`, `find`, `ls`, `git`, `progress`, and `xref` for C/C++ changes |
 | Verifiers | the same, plus `run` (when the sandbox works) |
 
 - **`git`** runs `log`, `show`, `blame`, or `diff` in the reviewed checkout,
@@ -178,15 +178,39 @@ sandbox (no root, no user namespaces, ~0.15s per call).
   least 3 minutes.
 - **C/C++ auto check** (`tools/mr-cxx-check`, on PATH in the sandbox):
   when the change touches C/C++ files and a `compile_commands.json` exists,
-  it re-runs each changed file's own compile command with `-fsyntax-only
-  -Wall -Wextra`, compiles up to 3 files that include each changed header,
-  and runs cppcheck on the changed sources. No build system is involved,
-  so CMake re-configures (and their network needs) never happen; it takes
-  about a second per file. Warnings are kept only when they point into a
-  changed file; errors are kept wherever they are. PR worktrees borrow the
-  main checkout's compile database with paths remapped onto the worktree.
-  gcc's `-fanalyzer` was tried and dropped: 85s per file on lemonade, with
-  only false positives from the standard library.
+  it analyzes the changed files and up to 3 files including each changed
+  header. No build system is involved, so CMake re-configures (and their
+  network needs) never happen. Everything is reported only on **changed
+  lines** (from the review's diff, passed as `MR_CXX_DIFF`; by hand, `git
+  diff HEAD`), so old warnings in a touched file stay out; compile errors
+  are reported wherever they are. PR worktrees borrow the main checkout's
+  compile database with paths remapped onto the worktree.
+
+  | Pass | What it adds | Cost on lemonade |
+  |------|--------------|------------------|
+  | gcc, the file's own flags + `-fsyntax-only -Wall -Wextra -Wduplicated-cond -Wduplicated-branches -Wlogical-op -Wshadow=local` | compile errors, front-end warnings | ~1s per file |
+  | clang-tidy: `bugprone-*`, `performance-*`, `concurrency-mt-unsafe`, a few `misc-*`, cognitive complexity > 25 (a repo's own `.clang-tidy` wins) | use-after-move, dangling handles, unchecked optionals, needless copies, int overflow before widening, empty catches | ~2s per file |
+  | cppcheck `warning,performance,portability` | missing returns, provable null dereferences | <1s |
+  | lizard, for each function the diff touches | complexity, NLOC and parameters before → after, flagged over CCN 15 / 6 params / 100 NLOC or CCN +5 (informational, never fails the check) | milliseconds |
+
+  Tried and left out: clang-tidy's path-sensitive `clang-analyzer-*`
+  (5–10× the time per file, no extra findings on lemonade), gcc
+  `-fanalyzer` (85s per file, only false positives in C++), optimizer-only
+  gcc warnings like `-Wnull-dereference` (silent under `-fsyntax-only`),
+  flawfinder (nothing in modern C++), semgrep (experimental C++, rules need
+  login), Infer (unmaintained).
+- **`xref`** (C/C++ changes, when clangd is installed): definition,
+  references, callers and callees of a symbol on a given `file:line`, or a
+  project-wide symbol search, from a sandboxed clangd shared by every
+  session in the run. It starts when the review does, so its index builds
+  while checks and reviewers run. clangd's background index persists in
+  `~/.local/share/multi-review/clangd-index/<repo>/` (next to a copy of the
+  compile database; nothing is written into the repo): about 50s cold on
+  lemonade, about 3s on later runs, which re-index only what changed. The
+  change's own files are opened up front, so callers it adds show up even
+  though the index predates them; answers given while the index is still
+  building say so. PR worktrees use the main checkout's index, with paths
+  mapped back onto the worktree.
 - **No web access.** Reviewers are told to read a dependency's source on
   disk (node_modules, vendored directories, system headers) rather than
   assume its behaviour.

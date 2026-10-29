@@ -26,8 +26,17 @@
   grep -q landlock /sys/kernel/security/lsm && echo landlock ok
   ```
 
-  The C/C++ check also wants a `compile_commands.json` (CMake:
-  `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`) and, optionally, `cppcheck`.
+  The C/C++ check and `xref` also want a `compile_commands.json` (CMake:
+  `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`), and the analysis tools, installed
+  without root into `~/.local/share/multi-review/venv` (clang-tidy, lizard
+  and clangd from PyPI, ~600MB):
+
+  ```bash
+  ~/.pi/agent/extensions/multi-review/tools/install-cxx-analysis
+  ```
+
+  `cppcheck` is used when it's on PATH. Each missing tool is skipped with a
+  note in the check output.
 
 The extension makes **no** changes to `~/.pi/agent/models.json` (per the
 design constraint).
