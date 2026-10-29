@@ -10,6 +10,11 @@ compiles a few includers of each changed header, and runs clang-tidy and
 cppcheck on the changed sources when they are installed (install-cxx-analysis
 puts clang-tidy in ~/.local/share/multi-review/venv).
 
+For every function the diff touches, lizard reports cyclomatic complexity,
+size and parameter count before -> after, flagging functions over the
+thresholds or whose complexity jumped (informational: it never fails the
+check).
+
 Warnings are kept only on changed lines: the lines the unified diff in
 --diff (or $MR_CXX_DIFF) adds or touches, or, without one, `git diff HEAD`.
 A file the diff doesn't cover is checked whole. Errors are kept wherever
@@ -173,13 +178,88 @@ def parse_diff(text, top):
     return lines
 
 
-def changed_lines(top, files):
+def diff_text(top, files):
     """The diff to filter by: --diff/$MR_CXX_DIFF, else the working tree against HEAD."""
     path = os.environ.get("MR_CXX_DIFF")
     if path and os.path.isfile(path):
-        return parse_diff(open(path, errors="replace").read(), top)
+        return open(path, errors="replace").read()
     r = subprocess.run(["git", "diff", "HEAD", "--", *files], cwd=top, capture_output=True, text=True)
-    return parse_diff(r.stdout, top) if r.returncode == 0 else {}
+    return r.stdout if r.returncode == 0 else ""
+
+
+def old_source(path, new_text, diff, top):
+    """The file before the diff, by applying its hunks in reverse; None if they don't match the file."""
+    hunks, cur, in_file = [], None, False
+    for l in diff.splitlines():
+        if l.startswith("+++ "):
+            p = l[4:].split("\t")[0]
+            in_file = p != "/dev/null" and os.path.normpath(os.path.join(top, p[2:] if p.startswith("b/") else p)) == path
+            cur = None
+        elif not in_file or l.startswith(("--- ", "diff ", "index ")):
+            continue
+        elif l.startswith("@@"):
+            m = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))?", l)
+            cur = {"start": int(m.group(1)), "new": [], "old": []}
+            hunks.append(cur)
+        elif cur is not None and l[:1] in ("+", "-", " ", ""):
+            text = l[1:]
+            if l[:1] != "-":
+                cur["new"].append(text)
+            if l[:1] != "+":
+                cur["old"].append(text)
+    if not hunks:
+        return None
+    lines = new_text.split("\n")
+    for h in reversed(hunks):
+        # A hunk adding nothing (pure deletion) is anchored after its start line.
+        at = h["start"] if not h["new"] else h["start"] - 1
+        if lines[at:at + len(h["new"])] != h["new"]:
+            return None
+        lines[at:at + len(h["new"])] = h["old"]
+    return "\n".join(lines)
+
+
+# A touched function is flagged above these, or when its complexity rose by CCN_JUMP.
+CCN_MAX, PARAMS_MAX, NLOC_MAX, CCN_JUMP = 15, 6, 100, 5
+
+
+def complexity_report(changed, lines, diff, top, root):
+    """Before -> after metrics for the functions the diff touches; None when lizard is missing."""
+    try:
+        import lizard
+    except ImportError:
+        return None
+    rows = []
+    for path in sorted(changed):
+        touched = lines.get(path)
+        if not touched or not os.path.exists(path):
+            continue
+        new_text = open(path, errors="replace").read()
+        after = lizard.analyze_file.analyze_source_code(path, new_text).function_list
+        old_text = old_source(path, new_text, diff, top)
+        before = {f.long_name: f for f in lizard.analyze_file.analyze_source_code(path, old_text).function_list} if old_text is not None else {}
+        for f in after:
+            if not any(f.start_line <= n <= f.end_line for n in touched):
+                continue
+            b = before.get(f.long_name)
+            flags = []
+            if f.cyclomatic_complexity > CCN_MAX:
+                flags.append(f"CCN>{CCN_MAX}")
+            if f.parameter_count > PARAMS_MAX:
+                flags.append(f"params>{PARAMS_MAX}")
+            if f.nloc > NLOC_MAX:
+                flags.append(f"NLOC>{NLOC_MAX}")
+            if b and f.cyclomatic_complexity - b.cyclomatic_complexity >= CCN_JUMP:
+                flags.append(f"CCN +{f.cyclomatic_complexity - b.cyclomatic_complexity}")
+            arrow = lambda old, new: f"{old}->{new}" if b is not None and old != new else str(new)
+            metrics = (f"CCN {arrow(b and b.cyclomatic_complexity, f.cyclomatic_complexity)}, "
+                       f"NLOC {arrow(b and b.nloc, f.nloc)}, params {arrow(b and b.parameter_count, f.parameter_count)}")
+            status = "new" if old_text is not None and b is None else ""
+            rows.append((bool(flags), f.cyclomatic_complexity,
+                         f"{'!' if flags else ' '} {os.path.relpath(path, root)}:{f.start_line} {f.name}: {metrics}"
+                         + (f" ({status})" if status else "") + (f"  [{', '.join(flags)}]" if flags else "")))
+    rows.sort(key=lambda r: (not r[0], -r[1]))
+    return [r[2] for r in rows], sum(1 for r in rows if r[0])
 
 
 def on_changed_line(path, line, changed, lines):
@@ -341,7 +421,8 @@ def main():
         return 2
     entries = load_entries(db_path)
     top = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=root, capture_output=True, text=True).stdout.strip() or root
-    lines = changed_lines(top, sorted(changed))
+    diff = diff_text(top, sorted(changed))
+    lines = parse_diff(diff, top)
     by_file = {e["file"]: e for e in entries}
     tus, notes = {}, []
     for f in sorted(changed):
@@ -395,6 +476,13 @@ def main():
         if issues:
             print("\n".join(issues))
             reported += 1
+    cx = complexity_report(changed, lines, diff, top, root)
+    if cx is None:
+        print("== complexity: lizard not installed (run install-cxx-analysis)")
+    elif cx[0]:
+        rows, flagged = cx
+        print(f"== complexity (lizard) of the {len(rows)} function(s) the diff touches; {flagged} flagged (! = over CCN {CCN_MAX} / params {PARAMS_MAX} / NLOC {NLOC_MAX}, or CCN up {CCN_JUMP}+):")
+        print("\n".join(rows[:25]) + (f"\n  …{len(rows) - 25} more" if len(rows) > 25 else ""))
     for n in notes:
         print(f"note: {n}")
     return 1 if reported else 0
