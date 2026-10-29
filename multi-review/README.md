@@ -171,8 +171,8 @@ sandbox (no root, no user namespaces, ~0.15s per call).
   execution: a targeted test, compiling the touched files, or a repro.
   For C/C++, verifiers are told to compile repros with
   `-fsanitize=address,undefined`.
-- **Checks** run once before the fan-out, inside `checkTimeoutSec` (120s)
-  in total: the brief's `checks`, plus, with `autoChecks`, a built-in one
+- **Checks** run once before the fan-out, all at the same time (each in
+  its own sandbox), inside `checkTimeoutSec` (120s): the brief's `checks`, plus, with `autoChecks`, a built-in one
   per language. Their output goes into every reviewer's prompt and into the
   lead's `result.md`. Under a headless deadline they leave reviewers at
   least 3 minutes.
@@ -186,7 +186,10 @@ sandbox (no root, no user namespaces, ~0.15s per call).
   are reported wherever they are. PR worktrees borrow the main checkout's
   compile database with paths remapped onto the worktree.
 
-  | Pass | What it adds | Cost on lemonade |
+  All passes run at once on one worker pool sized to the machine (PR 4002's
+  8 files: 9.3s sequential → 4.5s).
+
+  | Pass | What it adds | Cost on lemonade (CPU) |
   |------|--------------|------------------|
   | gcc, the file's own flags + `-fsyntax-only -Wall -Wextra -Wduplicated-cond -Wduplicated-branches -Wlogical-op -Wshadow=local` | compile errors, front-end warnings | ~1s per file |
   | clang-tidy: `bugprone-*`, `performance-*`, `concurrency-mt-unsafe`, a few `misc-*`, cognitive complexity > 25 (a repo's own `.clang-tidy` wins) | use-after-move, dangling handles, unchecked optionals, needless copies, int overflow before widening, empty catches | ~2s per file |
@@ -205,8 +208,9 @@ sandbox (no root, no user namespaces, ~0.15s per call).
   session in the run. It starts when the review does, so its index builds
   while checks and reviewers run. clangd's background index persists in
   `~/.local/share/multi-review/clangd-index/<repo>/` (next to a copy of the
-  compile database; nothing is written into the repo): about 50s cold on
-  lemonade, about 3s on later runs, which re-index only what changed. The
+  compile database; nothing is written into the repo): about 20s cold on
+  lemonade (half the machine's cores), about 3s on later runs, which
+  re-index only what changed. The
   change's own files are opened up front, so callers it adds show up even
   though the index predates them; answers given while the index is still
   building say so. PR worktrees use the main checkout's index, with paths

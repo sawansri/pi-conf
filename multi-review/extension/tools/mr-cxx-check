@@ -312,17 +312,26 @@ def includers(header, entries, limit):
     return found
 
 
-def run_cppcheck(sources, db_path, changed, lines):
+def start_cppcheck(pool, sources, db_path, changed, lines):
+    """Queue cppcheck per source on `pool`; returns a function collecting the result, or None when not installed."""
     if not shutil.which("cppcheck") or not sources:
         return None
-    found, unchecked = [], []
-    for src in sources:
+
+    def one(src):
         r = subprocess.run(
             ["cppcheck", f"--project={db_path}", f"--file-filter={src}", "--enable=warning,performance,portability",
              "--inline-suppr", "--quiet", "--template={file}:{line}: {severity}: {message} [{id}]"],
             capture_output=True, text=True, timeout=TU_TIMEOUT_SEC,
         )
-        out = [l for l in (r.stdout + r.stderr).splitlines() if l.strip()]
+        return src, [l for l in (r.stdout + r.stderr).splitlines() if l.strip()]
+
+    futures = [pool.submit(one, src) for src in sources]
+    return lambda: collect_cppcheck([f.result() for f in futures], changed, lines)
+
+
+def collect_cppcheck(results, changed, lines):
+    found, unchecked = [], []
+    for src, out in results:
         # Never let "matched nothing" read as "clean".
         if any("could not find any files matching" in l for l in out):
             unchecked.append(src)
@@ -361,8 +370,9 @@ TIDY_CHECKS = ",".join([
 TIDY_CONFIG = "{CheckOptions: {readability-function-cognitive-complexity.Threshold: 25, readability-function-cognitive-complexity.DescribeBasicIncrements: false}}"
 
 
-def run_clang_tidy(tus, db_path, changed, lines, top):
-    """clang-tidy on each TU, reporting only on changed lines (headers included); None when not installed."""
+def start_clang_tidy(pool, tus, db_path, changed, lines, top):
+    """Queue clang-tidy per TU on `pool`, reporting only on changed lines (headers
+    included); returns a function collecting the result, or None when not installed."""
     tidy = shutil.which("clang-tidy")
     if not tidy or not tus:
         return None
@@ -389,16 +399,20 @@ def run_clang_tidy(tus, db_path, changed, lines, top):
         except subprocess.TimeoutExpired:
             return entry, f"{entry['file']}:1:1: error: clang-tidy timed out after {TU_TIMEOUT_SEC}s"
 
-    kept, parse_errors = [], 0
-    with concurrent.futures.ThreadPoolExecutor(min(8, os.cpu_count() or 2)) as pool:
-        for entry, out in pool.map(one, tus):
+    futures = [pool.submit(one, entry) for entry in tus]
+
+    def collect():
+        kept, parse_errors = [], 0
+        for entry, out in (f.result() for f in futures):
             # Errors here are clang failing on gcc-specific code or flags, not
             # findings; count them so a partial analysis doesn't read as clean.
             parse_errors += sum(1 for l in out.splitlines() if DIAG.match(l) and "error" in DIAG.match(l).group("kind"))
             for l in keep_diagnostics(out, entry["directory"], changed, lines, warnings_only=True):
                 if not (DIAG.match(l) and l in kept):
                     kept.append(l)
-    return kept, parse_errors, own
+        return kept, parse_errors, own
+
+    return collect
 
 
 def main():
@@ -440,9 +454,15 @@ def main():
             for e in inc:
                 tus.setdefault(e["file"], e)
     reported = 0
-    workers = min(8, os.cpu_count() or 2)
-    with concurrent.futures.ThreadPoolExecutor(workers) as pool:
-        for entry, code, stderr in pool.map(compile_tu, tus.values()):
+    # Every pass is independent: queue all of it on one pool sized to the
+    # machine, slowest work (clang-tidy) first, and print in a fixed order.
+    db_for_tools = remapped_db(entries, db_path)
+    with concurrent.futures.ThreadPoolExecutor(max(2, min(32, os.cpu_count() or 2))) as pool:
+        tidy = start_clang_tidy(pool, list(tus.values()), db_for_tools, changed, lines, top)
+        compiles = [pool.submit(compile_tu, e) for e in tus.values()]
+        cpp = start_cppcheck(pool, sorted(f for f in tus if f in changed), db_for_tools, changed, lines)
+        cx = pool.submit(complexity_report, changed, lines, diff, top, root)
+        for entry, code, stderr in (f.result() for f in compiles):
             rel = os.path.relpath(entry["file"], root)
             if code is None:
                 print(f"== {rel}: could not compile: {stderr}")
@@ -455,28 +475,25 @@ def main():
             if kept:
                 print("\n".join(kept))
                 reported += 1
-    db_for_tools = remapped_db(entries, db_path)
-    tidy = run_clang_tidy(list(tus.values()), db_for_tools, changed, lines, top)
-    if tidy is None:
-        print("== clang-tidy: not installed (run install-cxx-analysis)")
-    else:
-        found, parse_errors, own = tidy
-        warnings = sum(1 for l in found if DIAG.match(l))
-        print(f"== clang-tidy{' (repo .clang-tidy)' if own else ''}: {warnings} warning(s) on changed lines"
-              + (f"; {parse_errors} clang parse error(s), so some code went unanalyzed" if parse_errors else ""))
-        if found:
-            print("\n".join(found))
-            reported += 1
-    cpp = run_cppcheck(sorted(f for f in tus if f in changed), db_for_tools, changed, lines)
-    if cpp is None:
-        print("== cppcheck: not installed or no changed sources")
-    else:
-        issues, unchecked = cpp
-        print(f"== cppcheck: {len(issues)} issue(s)" + (f"; NOT checked: {', '.join(os.path.relpath(u, root) for u in unchecked)}" if unchecked else ""))
-        if issues:
-            print("\n".join(issues))
-            reported += 1
-    cx = complexity_report(changed, lines, diff, top, root)
+        if tidy is None:
+            print("== clang-tidy: not installed (run install-cxx-analysis)")
+        else:
+            found, parse_errors, own = tidy()
+            warnings = sum(1 for l in found if DIAG.match(l))
+            print(f"== clang-tidy{' (repo .clang-tidy)' if own else ''}: {warnings} warning(s) on changed lines"
+                  + (f"; {parse_errors} clang parse error(s), so some code went unanalyzed" if parse_errors else ""))
+            if found:
+                print("\n".join(found))
+                reported += 1
+        if cpp is None:
+            print("== cppcheck: not installed or no changed sources")
+        else:
+            issues, unchecked = cpp()
+            print(f"== cppcheck: {len(issues)} issue(s)" + (f"; NOT checked: {', '.join(os.path.relpath(u, root) for u in unchecked)}" if unchecked else ""))
+            if issues:
+                print("\n".join(issues))
+                reported += 1
+        cx = cx.result()
     if cx is None:
         print("== complexity: lizard not installed (run install-cxx-analysis)")
     elif cx[0]:

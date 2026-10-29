@@ -2245,7 +2245,8 @@ export class XrefService {
 		this.ready ??= (async () => {
 			const argv = [
 				CLANGD_BIN, `--compile-commands-dir=${this.indexDir}`, "--background-index", "--enable-config=false",
-				"--limit-references=1000", "--limit-results=200", "--log=error", "-j=4",
+				// Index with half the machine: reviewers and checks run alongside.
+				"--limit-references=1000", "--limit-results=200", "--log=error", `-j=${Math.max(4, Math.floor(os.cpus().length / 2))}`,
 			];
 			const inv = sandboxInvocation(this.top, argv, this.homeDirs, { readPaths: this.readPaths, writePaths: [this.indexDir] });
 			this.scratch = inv.scratch;
@@ -2484,31 +2485,25 @@ export interface CheckResult extends CommandResult {
 }
 
 /**
- * Run the brief's checks once, in order, inside `budgetMs` in total, so every
- * reviewer and verifier reads the same build/type-check/test output instead
- * of guessing whether the change compiles.
+ * Run the brief's checks once, all at the same time, inside `budgetMs`, so
+ * every reviewer and verifier reads the same build/type-check/test output
+ * instead of guessing whether the change compiles. Each runs in its own
+ * sandbox with its own scratch directory; results keep the checks' order.
  */
-async function runChecks(
+export async function runChecks(
 	dir: string,
 	checks: string[],
 	budgetMs: number,
 	homeDirs: string[],
 	extras: SandboxExtras,
 	signal: AbortSignal | undefined,
-	onStart: (i: number, command: string) => void,
+	onStart: (command: string) => void,
 ): Promise<CheckResult[]> {
-	const deadline = Date.now() + budgetMs;
-	const results: CheckResult[] = [];
-	for (const [i, command] of checks.entries()) {
-		const left = deadline - Date.now();
-		if (left < 5_000 || signal?.aborted) {
-			results.push({ command, exitCode: null, output: "", timedOut: false, durationMs: 0, skipped: "check time budget spent" });
-			continue;
-		}
-		onStart(i, command);
-		results.push({ command, ...(await runInSandbox(dir, command, left, homeDirs, signal, extras)) });
+	if (budgetMs < 5_000 || signal?.aborted) {
+		return checks.map((command) => ({ command, exitCode: null, output: "", timedOut: false, durationMs: 0, skipped: "check time budget spent" }));
 	}
-	return results;
+	onStart(checks.length === 1 ? checks[0] : `${checks.length} checks in parallel`);
+	return Promise.all(checks.map(async (command) => ({ command, ...(await runInSandbox(dir, command, budgetMs, homeDirs, signal, extras)) })));
 }
 
 const CXX_FILE = /\.(c|cc|cpp|cxx|c\+\+|h|hh|hpp|hxx|h\+\+|inl|ipp)$/i;
@@ -5047,8 +5042,8 @@ async function runReviewPipeline(
 	} else if (checks.length > 0) {
 		const reserve = REVIEW_RESERVE_MS + GROUPING_RESERVE_MS + (flags.verify ? VERIFY_RESERVE_MS : 0) + FINAL_RESERVE_MS;
 		const budget = Math.min(cfg.checkTimeoutSec * 1000, deadlineMs === undefined ? Number.POSITIVE_INFINITY : deadlineMs - Date.now() - reserve);
-		target.checkResults = await runChecks(runOpts.cwd ?? ctx.cwd, checks, budget, cfg.sandboxHomeDirs, sandboxExtras, signal, (i, command) =>
-			progress.update({ phase: `check ${i + 1}/${checks.length}: ${command.length > 60 ? `${command.slice(0, 59)}…` : command}` }));
+		target.checkResults = await runChecks(runOpts.cwd ?? ctx.cwd, checks, budget, cfg.sandboxHomeDirs, sandboxExtras, signal, (what) =>
+			progress.update({ phase: `checks: ${what.length > 60 ? `${what.slice(0, 59)}…` : what}` }));
 		throwIfAborted(signal);
 		if (target.checkResults.some((r) => r.timedOut || r.skipped)) {
 			target.warnings.push(`some checks hit the ${cfg.checkTimeoutSec}s check budget; brief faster checks (type-check, one target, targeted tests)`);
