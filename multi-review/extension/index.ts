@@ -2023,7 +2023,10 @@ export async function runInSandbox(
 	const read = [...SANDBOX_HOST_DIRS, ...homeDirs.map((rel) => path.join(home, rel)), SANDBOX_TOOLS_DIR, ...(extras.readPaths ?? [])];
 	// Worktrees (PR checkouts) keep their git objects in the main repo.
 	if (commonDir && !isInside(commonDir, top)) read.push(commonDir);
-	for (const p of read) if (fs.existsSync(p)) args.push("--read", p);
+	for (const p of read) {
+		const st = fs.statSync(p, { throwIfNoEntry: false });
+		if (st) args.push(st.isDirectory() ? "--read" : "--read-file", p);
+	}
 	const env: Record<string, string> = {
 		PATH: `${SANDBOX_TOOLS_DIR}:${process.env.PATH ?? "/usr/bin:/bin"}`,
 		HOME: scratch,
@@ -2227,22 +2230,43 @@ export function cxxAutoCheck(
 	reviewDir: string,
 	localDir: string,
 	warnings: string[],
+	diffText = "",
 ): { command: string; extras: SandboxExtras } | undefined {
 	const reviewTop = gitRoots(reviewDir).top;
 	const cxx = files.filter((f) => CXX_FILE.test(f) && fs.existsSync(path.join(reviewTop, f)));
 	if (cxx.length === 0) return undefined;
 	const command = `cd ${shellQuote(reviewTop)} && mr-cxx-check ${cxx.slice(0, 40).map(shellQuote).join(" ")}`;
-	if (findCompileDb(reviewTop)) return { command, extras: {} };
+	// The review's own diff decides which lines count as changed, for this
+	// check and for verifiers who rerun it (MR_CXX_DIFF).
+	const diffExtras: SandboxExtras = diffText ? { readPaths: [writeDiffFile(diffText)] } : {};
+	if (diffExtras.readPaths) diffExtras.env = { MR_CXX_DIFF: diffExtras.readPaths[0] };
+	if (findCompileDb(reviewTop)) return { command, extras: diffExtras };
 	const localTop = gitRoots(localDir).top;
 	const db = localTop !== reviewTop ? findCompileDb(localTop) : undefined;
 	if (db) {
 		return {
 			command,
-			extras: { readPaths: [path.dirname(db)], env: { MR_CXX_DB: db, MR_CXX_REMAP: `${localTop}=${reviewTop}` } },
+			extras: {
+				readPaths: [path.dirname(db), ...(diffExtras.readPaths ?? [])],
+				env: { MR_CXX_DB: db, MR_CXX_REMAP: `${localTop}=${reviewTop}`, ...diffExtras.env },
+			},
 		};
 	}
 	warnings.push("C/C++ files changed but no compile_commands.json was found, so they weren't compile-checked (configure with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON)");
 	return undefined;
+}
+
+/** The diff as a file the sandbox can read; files from runs over a day old are pruned. */
+function writeDiffFile(diffText: string): string {
+	const dir = path.join(SANDBOX_STATE_DIR, "diffs");
+	fs.mkdirSync(dir, { recursive: true });
+	for (const name of fs.readdirSync(dir)) {
+		const p = path.join(dir, name);
+		if (Date.now() - fs.statSync(p).mtimeMs > 86_400_000) fs.rmSync(p, { force: true });
+	}
+	const file = path.join(dir, `${process.pid}-${Date.now()}.diff`);
+	fs.writeFileSync(file, diffText);
+	return file;
 }
 
 function checkStatus(r: CheckResult): string {
@@ -4681,7 +4705,7 @@ async function runReviewPipeline(
 	const checks = [...(target.brief?.checks ?? [])];
 	let sandboxExtras: SandboxExtras = {};
 	if (cfg.autoChecks && !sandboxReason && !checks.some((c) => c.includes("mr-cxx-check"))) {
-		const auto = cxxAutoCheck(target.files.map((f) => f.path), runOpts.cwd ?? ctx.cwd, ctx.cwd, target.warnings);
+		const auto = cxxAutoCheck(target.files.map((f) => f.path), runOpts.cwd ?? ctx.cwd, ctx.cwd, target.warnings, target.diffText);
 		if (auto) {
 			checks.unshift(auto.command);
 			sandboxExtras = auto.extras;

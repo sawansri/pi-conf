@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """Static checks on changed C/C++ files, for multi-review's sandbox.
 
-    mr-cxx-check [-p BUILD_DIR] FILE...
+    mr-cxx-check [-p BUILD_DIR] [--diff FILE] FILE...
 
 Recompiles each changed source with its own flags from compile_commands.json
-plus -fsyntax-only -Wall -Wextra (no build system involved, so no CMake
-re-configure and no network), compiles a few includers of each changed
-header, and runs cppcheck on the changed sources when it is installed.
-Warnings are kept only when they point into a changed file; errors are kept
-wherever they are. Exit status 1 when anything was reported.
+plus -fsyntax-only -Wall -Wextra and a few low-noise bug-finding warnings
+(no build system involved, so no CMake re-configure and no network),
+compiles a few includers of each changed header, and runs cppcheck on the
+changed sources when it is installed.
+
+Warnings are kept only on changed lines: the lines the unified diff in
+--diff (or $MR_CXX_DIFF) adds or touches, or, without one, `git diff HEAD`.
+A file the diff doesn't cover is checked whole. Errors are kept wherever
+they are. Exit status 1 when anything was reported.
 
 PR worktrees have no build directory of their own: MR_CXX_DB points at the
 main checkout's compile_commands.json and MR_CXX_REMAP=FROM=TO rewrites its
@@ -29,6 +33,9 @@ import tempfile
 SOURCE_EXT = (".c", ".cc", ".cpp", ".cxx", ".c++")
 HEADER_EXT = (".h", ".hh", ".hpp", ".hxx", ".h++", ".inl", ".ipp")
 INCLUDERS_PER_HEADER = 3
+# Beyond -Wall -Wextra: front-end warnings that find real bugs with little
+# noise. (-Wnull-dereference and friends need the optimizer; useless here.)
+EXTRA_WARNINGS = ["-Wduplicated-cond", "-Wduplicated-branches", "-Wlogical-op", "-Wshadow=local"]
 TU_TIMEOUT_SEC = 120
 CONTEXT = re.compile(r"^(In file included from |\s+from |[^:\s][^:]*: (In|At) )")
 DIAG = re.compile(r"^(?P<path>[^:\s][^:]*):(?P<line>\d+):(?:\d+:)? (?P<kind>error|warning|fatal error): ")
@@ -124,7 +131,10 @@ def syntax_command(args):
             continue
         out.append(a)
         i += 1
-    return out + ["-fsyntax-only", "-Wall", "-Wextra", "-fdiagnostics-color=never"]
+    gcc = os.path.basename(out[0]) if out else ""
+    # gcc-only flags; clang-based drivers would reject them.
+    extra = EXTRA_WARNINGS if "clang" not in gcc else ["-Wshadow"]
+    return out + ["-fsyntax-only", "-Wall", "-Wextra", *extra, "-fdiagnostics-color=never"]
 
 
 def compile_tu(entry):
@@ -137,8 +147,50 @@ def compile_tu(entry):
         return entry, None, str(err)
 
 
-def keep_diagnostics(stderr, directory, changed):
-    """Diagnostic blocks (first line plus its notes/context) in changed files, plus every error."""
+def parse_diff(text, top):
+    """{absolute path: set of new-side line numbers the diff adds or deletes next to}."""
+    lines, path, new = {}, None, 0
+    for l in text.splitlines():
+        if l.startswith("+++ "):
+            p = l[4:].split("\t")[0]
+            path = None if p == "/dev/null" else os.path.normpath(os.path.join(top, p[2:] if p.startswith("b/") else p))
+            if path:
+                lines.setdefault(path, set())
+        elif l.startswith("@@"):
+            m = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)", l)
+            new = int(m.group(1)) if m else 0
+        elif path is None or l.startswith(("--- ", "diff ", "index ")):
+            continue
+        elif l.startswith("+"):
+            lines[path].add(new)
+            new += 1
+        elif l.startswith("-"):
+            # A deletion touches the lines on either side of where it was.
+            lines[path].update({max(new - 1, 1), new})
+        elif l.startswith(" "):
+            new += 1
+    return lines
+
+
+def changed_lines(top, files):
+    """The diff to filter by: --diff/$MR_CXX_DIFF, else the working tree against HEAD."""
+    path = os.environ.get("MR_CXX_DIFF")
+    if path and os.path.isfile(path):
+        return parse_diff(open(path, errors="replace").read(), top)
+    r = subprocess.run(["git", "diff", "HEAD", "--", *files], cwd=top, capture_output=True, text=True)
+    return parse_diff(r.stdout, top) if r.returncode == 0 else {}
+
+
+def on_changed_line(path, line, changed, lines):
+    """In a changed file and, when the diff covers that file, on a line it touched."""
+    if path not in changed:
+        return False
+    touched = lines.get(path)
+    return touched is None or line in touched
+
+
+def keep_diagnostics(stderr, directory, changed, lines):
+    """Diagnostic blocks (first line plus its notes/context) on changed lines, plus every error."""
     kept, block, keep, context = [], [], False, []
     for line in stderr.splitlines():
         m = DIAG.match(line)
@@ -146,7 +198,7 @@ def keep_diagnostics(stderr, directory, changed):
             if keep:
                 kept.extend(block)
             path = os.path.normpath(os.path.join(directory, m.group("path")))
-            keep = "error" in m.group("kind") or path in changed
+            keep = "error" in m.group("kind") or on_changed_line(path, int(m.group("line")), changed, lines)
             # "In file included from" / "In function" lines precede the diagnostic they belong to.
             block, context = context + [line], []
         elif CONTEXT.match(line):
@@ -178,10 +230,10 @@ def includers(header, entries, limit):
     return found
 
 
-def run_cppcheck(sources, db_path, changed):
+def run_cppcheck(sources, db_path, changed, lines):
     if not shutil.which("cppcheck") or not sources:
         return None
-    lines, unchecked = [], []
+    found, unchecked = [], []
     for src in sources:
         r = subprocess.run(
             ["cppcheck", f"--project={db_path}", f"--file-filter={src}", "--enable=warning,performance,portability",
@@ -193,13 +245,13 @@ def run_cppcheck(sources, db_path, changed):
         if any("could not find any files matching" in l for l in out):
             unchecked.append(src)
             continue
-        lines += out
+        found += out
     # Like the compiler output: only what lands in changed files, once each
     # (every includer of a header repeats its issues).
     kept = []
-    for l in lines:
-        m = re.match(r"^([^:]+):\d+:", l)
-        if m and os.path.normpath(m.group(1)) in changed and l not in kept:
+    for l in found:
+        m = re.match(r"^([^:]+):(\d+):", l)
+        if m and on_changed_line(os.path.normpath(m.group(1)), int(m.group(2)), changed, lines) and l not in kept:
             kept.append(l)
     return kept, unchecked
 
@@ -207,9 +259,12 @@ def run_cppcheck(sources, db_path, changed):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-p", dest="build_dir", help="directory holding compile_commands.json")
+    ap.add_argument("--diff", help="unified diff whose added lines are the ones to report on")
     ap.add_argument("files", nargs="+")
     opts = ap.parse_args()
     root = os.getcwd()
+    if opts.diff:
+        os.environ["MR_CXX_DIFF"] = os.path.abspath(opts.diff)
     changed = {os.path.normpath(os.path.join(root, f)) for f in opts.files}
     changed = {f for f in changed if f.endswith(SOURCE_EXT + HEADER_EXT)}
     if not changed:
@@ -220,6 +275,8 @@ def main():
         print("mr-cxx-check: no compile_commands.json found (configure with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON, or pass -p BUILD_DIR)")
         return 2
     entries = load_entries(db_path)
+    top = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=root, capture_output=True, text=True).stdout.strip() or root
+    lines = changed_lines(top, sorted(changed))
     by_file = {e["file"]: e for e in entries}
     tus, notes = {}, []
     for f in sorted(changed):
@@ -245,14 +302,14 @@ def main():
                 print(f"== {rel}: could not compile: {stderr}")
                 reported += 1
                 continue
-            kept = keep_diagnostics(stderr, entry["directory"], changed)
+            kept = keep_diagnostics(stderr, entry["directory"], changed, lines)
             if code != 0 and not kept:
                 kept = stderr.splitlines()[-30:]
-            print(f"== {rel}: {'compile errors' if code else 'compiles'}" + (f", {sum(1 for l in kept if DIAG.match(l))} diagnostic(s) in changed files" if kept else ", clean"))
+            print(f"== {rel}: {'compile errors' if code else 'compiles'}" + (f", {sum(1 for l in kept if DIAG.match(l))} diagnostic(s) on changed lines" if kept else ", clean"))
             if kept:
                 print("\n".join(kept))
                 reported += 1
-    cpp = run_cppcheck(sorted(f for f in tus if f in changed), remapped_db(entries, db_path), changed)
+    cpp = run_cppcheck(sorted(f for f in tus if f in changed), remapped_db(entries, db_path), changed, lines)
     if cpp is None:
         print("== cppcheck: not installed or no changed sources")
     else:
