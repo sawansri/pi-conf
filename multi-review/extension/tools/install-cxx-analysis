@@ -1,42 +1,17 @@
 #!/usr/bin/env bash
-# Install the C/C++ analysis tools multi-review uses, without root:
-#   - a venv with clang-tidy and lizard (PyPI wheels)
-#   - clangd + clangd-indexer from the same clangd release (index files are
-#     tied to the clangd version that reads them)
-# into ${MR_TOOLS_HOME:-~/.local/share/multi-review}. Re-running upgrades.
-#
-#   install-cxx-analysis [CLANGD_VERSION]      (default: latest release)
+# Install the C/C++ analysis tools multi-review uses, without root, into a
+# venv at ${MR_TOOLS_HOME:-~/.local/share/multi-review}/venv (PyPI wheels):
+#   clang-tidy  bug-finding checks on changed lines (mr-cxx-check)
+#   lizard      complexity of the functions a change touches (mr-cxx-check)
+#   clangd      the reviewers' xref tool; its index lives next to the venv
+# Re-running upgrades them.
 set -euo pipefail
 
 home="${MR_TOOLS_HOME:-$HOME/.local/share/multi-review}"
 mkdir -p "$home"
-
-echo "== venv: clang-tidy, lizard"
 python3 -m venv "$home/venv"
-"$home/venv/bin/pip" install -q --upgrade pip clang-tidy lizard
-"$home/venv/bin/clang-tidy" --version | head -2 | tail -1
-"$home/venv/bin/lizard" --version
-
-echo "== clangd + clangd-indexer"
-version="${1:-$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/clangd/clangd/releases/latest | sed 's#.*/##')}"
-tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
-for asset in "clangd-linux-$version.zip" "clangd_indexing_tools-linux-$version.zip"; do
-	curl -fsSL "https://github.com/clangd/clangd/releases/download/$version/$asset" -o "$tmp/$asset"
-	python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "$tmp/$asset" "$tmp/x"
-done
-rm -rf "$home/clangd"
-mkdir -p "$home/clangd"
-# Both zips unpack to clangd_<version>/{bin,lib}.
-cp -r "$tmp/x/clangd_$version/." "$home/clangd/"
-chmod +x "$home/clangd/bin/"*
-"$home/clangd/bin/clangd" --version | head -1
-ls "$home/clangd/bin/clangd-indexer" >/dev/null
-
-cat <<EOF
-
-Installed into $home. Build a project index (used by the reviewers' xref tool)
-from the repo you review, after configuring with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON:
-
-  $(dirname "$0")/mr-cxx-index            # in the repo; rerun when it gets stale
-EOF
+"$home/venv/bin/pip" install -q --upgrade pip clang-tidy lizard clangd
+"$home/venv/bin/clang-tidy" --version | grep -i version
+"$home/venv/bin/clangd" --version | head -1
+echo "lizard $("$home/venv/bin/lizard" --version)"
+echo "installed into $home/venv"
