@@ -22,8 +22,8 @@ findings, lead-judgment buckets).
 4. The tool result (rendered as a collapsible review panel) goes back to
    the agent with lead-judgment instructions. The agent verifies the
    findings and replies with **Intent · Reviewers · Spec conformance ·
-   Act On · Consider · Noted · Dismissed · Agreement Map**. It does not
-   apply fixes unless you ask.
+   Act On · Side effects · Consider · Noted · Dismissed · Agreement
+   Map**. It does not apply fixes unless you ask.
 
 `--direct` (and print/RPC modes, which have no agent turn to hand off to)
 skips the agent: the extension runs the pipeline itself and an external
@@ -199,9 +199,9 @@ The flow:
 3. It runs `/multi-review-run` in the background (Bash, `run_in_background`),
    waits for the completion notification, and reads `result.md`.
 4. It delivers the lead verdict: Intent · Reviewers · Spec conformance ·
-   Act On · Consider · Noted · Dismissed · Agreement Map. It also saves
+   Act On · Side effects · Consider · Noted · Dismissed · Agreement Map. It also saves
    the verdict as `verdict.md`, a checklist where each Act On item has a
-   repro, a test and a fix.
+   repro, a test, a fix, and the fix's side effects.
 5. **If you ask it to fix**, it works from `verdict.md`, not the raw
    review:
    - for each item: write the failing test from the repro → see it fail →
@@ -360,13 +360,16 @@ extglob — documented limitation.
    pstack-style instructions:
    every Act On item gets a Repro and the Test that will prove the fix,
    verify single-reviewer findings before Act On, aim for ≤ 5 Act On items,
+   list each fix's side effects (behavior, API, caller, compatibility
+   and performance changes beyond the fix itself),
    give a reason for each dismissal, and add a spec conformance table when a
    spec was given. The tool result renders with the review panel
    (`Ctrl+O` expands per-reviewer comments).
 
    **Direct mode judge** — a single call on the configured judge at
    `judgeThinking`. It sees the groups, the diff, and the brief, and marks
-   each finding confirmed / plausible / false positive. The output lands as
+   each finding confirmed / plausible / false positive, then lists the
+   side effects of fixing each real one. The output lands as
    a `multi-review` custom message.
 
 ## Model choice

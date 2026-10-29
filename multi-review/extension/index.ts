@@ -2927,7 +2927,10 @@ For each finding, in the order provided, write:
 
 When reviewers frame the same finding differently, say so in the take — do not silently pick one.
 
-After the findings, if any models errored or produced unparseable output, add a final '## Coverage' section listing missing reviewers.
+## Side effects
+For each confirmed or plausible finding, list what its fix would change besides fixing the issue: behavior or output changes, API/signature or config changes, callers or tests that will need updating, compatibility, performance, and error-handling changes. Write "none" for a fix with no side effects. Skip false positives.
+
+After the side effects, if any models errored or produced unparseable output, add a final '## Coverage' section listing missing reviewers.
 
 Rules:
 - Keep every finding in the output (mark false positives, never delete them). Do not invent new findings.
@@ -3852,6 +3855,8 @@ function leadJudgmentInstructions(hasSpec: boolean, prNumber?: number): string {
 	lines.push(
 		"### Act On",
 		"Real issues that would block a PR, numbered. Each: what, where (file:line), which models raised it, why it matters, **Repro** (the concrete trigger → observed vs expected; take the reviewer's and correct it if needed), **Test** (the failing test that will prove the fix), and the fix. Aim for ≤5; more means you aren't filtering hard enough.",
+		"### Side effects",
+		"For each Act On fix: what changes besides fixing the issue — behavior or output changes, API/signature or config changes, callers or tests that will need updating, compatibility, performance, and error-handling changes. Check the call sites; don't guess. Write \"none\" for a fix with no side effects, rather than leaving it out.",
 		"### Consider",
 		"Legitimate but debatable now — state the tradeoff.",
 		"### Noted",

@@ -80,7 +80,7 @@ Read `<dir>/result.md`. It is the compact lead view. Each issue has one canonica
 - weigh verification evidence rather than votes;
 - say which of your suspicions held up.
 
-Reply in its format: Intent · Reviewers · (Spec conformance) · Act On · Consider · Noted · Dismissed · Agreement Map. Every Act On item gets a **Repro** and a **Test**.
+Reply in its format: Intent · Reviewers · (Spec conformance) · Act On · Side effects · Consider · Noted · Dismissed · Agreement Map. Every Act On item gets a **Repro** and a **Test**. **Side effects** lists, for each Act On fix, everything it changes besides fixing the issue: behavior or output changes, API or config changes, callers and tests that need updating, compatibility, and performance. Check the call sites to find them, and write "none" for a fix with no side effects.
 
 If you need a reviewer's exact wording, `result.json` → `details.groups[].members` has the verbatim per-reviewer text (look issues up by id).
 
@@ -95,6 +95,7 @@ Review: <dir>/result.md
   - Repro: <trigger → observed vs expected>
   - Test: <test file / name and what it asserts>
   - Fix: <approach>
+  - Side effects: <what else the fix changes, or "none">
 ## Consider / Noted / Dismissed
 <one line each>
 ```
