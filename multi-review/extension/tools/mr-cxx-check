@@ -6,8 +6,9 @@
 Recompiles each changed source with its own flags from compile_commands.json
 plus -fsyntax-only -Wall -Wextra and a few low-noise bug-finding warnings
 (no build system involved, so no CMake re-configure and no network),
-compiles a few includers of each changed header, and runs cppcheck on the
-changed sources when it is installed.
+compiles a few includers of each changed header, and runs clang-tidy and
+cppcheck on the changed sources when they are installed (install-cxx-analysis
+puts clang-tidy in ~/.local/share/multi-review/venv).
 
 Warnings are kept only on changed lines: the lines the unified diff in
 --diff (or $MR_CXX_DIFF) adds or touches, or, without one, `git diff HEAD`.
@@ -109,11 +110,11 @@ def load_entries(db_path):
 
 
 def remapped_db(entries, db_path):
-    """compile_commands.json with the remapped paths, for cppcheck; the original when nothing moved."""
+    """compile_commands.json with the remapped paths, for cppcheck and clang-tidy; the original when nothing moved."""
     if "=" not in os.environ.get("MR_CXX_REMAP", ""):
         return db_path
-    fd, out = tempfile.mkstemp(prefix="mr-cxx-db-", suffix=".json")
-    with os.fdopen(fd, "w") as f:
+    out = os.path.join(tempfile.mkdtemp(prefix="mr-cxx-db-"), "compile_commands.json")
+    with open(out, "w") as f:
         json.dump([{"directory": e["directory"], "file": e["file"], "arguments": e["args"]} for e in entries], f)
     return out
 
@@ -189,7 +190,7 @@ def on_changed_line(path, line, changed, lines):
     return touched is None or line in touched
 
 
-def keep_diagnostics(stderr, directory, changed, lines):
+def keep_diagnostics(stderr, directory, changed, lines, warnings_only=False):
     """Diagnostic blocks (first line plus its notes/context) on changed lines, plus every error."""
     kept, block, keep, context = [], [], False, []
     for line in stderr.splitlines():
@@ -198,7 +199,8 @@ def keep_diagnostics(stderr, directory, changed, lines):
             if keep:
                 kept.extend(block)
             path = os.path.normpath(os.path.join(directory, m.group("path")))
-            keep = "error" in m.group("kind") or on_changed_line(path, int(m.group("line")), changed, lines)
+            is_error = "error" in m.group("kind")
+            keep = (is_error and not warnings_only) or (not is_error and on_changed_line(path, int(m.group("line")), changed, lines))
             # "In file included from" / "In function" lines precede the diagnostic they belong to.
             block, context = context + [line], []
         elif CONTEXT.match(line):
@@ -256,6 +258,69 @@ def run_cppcheck(sources, db_path, changed, lines):
     return kept, unchecked
 
 
+# Bug-finding checks with a low false-positive rate on real code, named
+# explicitly (wildcards pull in style checks). clang-analyzer-* is left out:
+# 5-10x the time per file and, on lemonade, no extra findings.
+TIDY_CHECKS = ",".join([
+    "-*",
+    "bugprone-*",
+    "-bugprone-easily-swappable-parameters",
+    "-bugprone-narrowing-conversions",
+    "-bugprone-branch-clone",
+    "-bugprone-exception-escape",
+    "performance-*",
+    "-performance-avoid-endl",
+    "-performance-enum-size",
+    "concurrency-mt-unsafe",
+    "misc-redundant-expression",
+    "misc-throw-by-value-catch-by-reference",
+    "misc-unconventional-assign-operator",
+    "misc-misplaced-const",
+    "readability-function-cognitive-complexity",
+])
+TIDY_CONFIG = "{CheckOptions: {readability-function-cognitive-complexity.Threshold: 25, readability-function-cognitive-complexity.DescribeBasicIncrements: false}}"
+
+
+def run_clang_tidy(tus, db_path, changed, lines, top):
+    """clang-tidy on each TU, reporting only on changed lines (headers included); None when not installed."""
+    tidy = shutil.which("clang-tidy")
+    if not tidy or not tus:
+        return None
+    line_filter = []
+    for f in sorted(changed):
+        touched = lines.get(f)
+        if touched is None:
+            line_filter.append({"name": f})
+        elif touched:
+            line_filter.append({"name": f, "lines": [[n, n] for n in sorted(touched)]})
+    headers = [f for f in changed if f.endswith(HEADER_EXT)]
+    header_filter = "|".join(re.escape(h) for h in headers) or "^$"
+    # A repo's own .clang-tidy wins over our list.
+    own = os.path.exists(os.path.join(top, ".clang-tidy"))
+    base = [tidy, "-p", os.path.dirname(db_path), "--quiet", f"--line-filter={json.dumps(line_filter)}",
+            f"--header-filter={header_filter}", "--extra-arg=-Wno-unknown-warning-option"]
+    if not own:
+        base += [f"--checks={TIDY_CHECKS}", f"--config={TIDY_CONFIG}"]
+
+    def one(entry):
+        try:
+            r = subprocess.run(base + [entry["file"]], capture_output=True, text=True, timeout=TU_TIMEOUT_SEC)
+            return entry, r.stdout
+        except subprocess.TimeoutExpired:
+            return entry, f"{entry['file']}:1:1: error: clang-tidy timed out after {TU_TIMEOUT_SEC}s"
+
+    kept, parse_errors = [], 0
+    with concurrent.futures.ThreadPoolExecutor(min(8, os.cpu_count() or 2)) as pool:
+        for entry, out in pool.map(one, tus):
+            # Errors here are clang failing on gcc-specific code or flags, not
+            # findings; count them so a partial analysis doesn't read as clean.
+            parse_errors += sum(1 for l in out.splitlines() if DIAG.match(l) and "error" in DIAG.match(l).group("kind"))
+            for l in keep_diagnostics(out, entry["directory"], changed, lines, warnings_only=True):
+                if not (DIAG.match(l) and l in kept):
+                    kept.append(l)
+    return kept, parse_errors, own
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-p", dest="build_dir", help="directory holding compile_commands.json")
@@ -309,7 +374,19 @@ def main():
             if kept:
                 print("\n".join(kept))
                 reported += 1
-    cpp = run_cppcheck(sorted(f for f in tus if f in changed), remapped_db(entries, db_path), changed, lines)
+    db_for_tools = remapped_db(entries, db_path)
+    tidy = run_clang_tidy(list(tus.values()), db_for_tools, changed, lines, top)
+    if tidy is None:
+        print("== clang-tidy: not installed (run install-cxx-analysis)")
+    else:
+        found, parse_errors, own = tidy
+        warnings = sum(1 for l in found if DIAG.match(l))
+        print(f"== clang-tidy{' (repo .clang-tidy)' if own else ''}: {warnings} warning(s) on changed lines"
+              + (f"; {parse_errors} clang parse error(s), so some code went unanalyzed" if parse_errors else ""))
+        if found:
+            print("\n".join(found))
+            reported += 1
+    cpp = run_cppcheck(sorted(f for f in tus if f in changed), db_for_tools, changed, lines)
     if cpp is None:
         print("== cppcheck: not installed or no changed sources")
     else:

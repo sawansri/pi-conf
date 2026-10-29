@@ -1944,6 +1944,9 @@ export function formatCommandResult(r: CommandResult, head = 2_000, tail = 10_00
 const SANDBOX_STATE_DIR = path.join(os.homedir(), ".cache", "multi-review");
 /** Helper scripts shipped with the extension (mr-cxx-check), on PATH inside the sandbox. */
 const SANDBOX_TOOLS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "tools");
+/** Analysis tools from tools/install-cxx-analysis (clang-tidy, lizard, clangd), readable and on PATH in the sandbox. */
+const ANALYSIS_TOOLS_HOME = process.env.MR_TOOLS_HOME ?? path.join(os.homedir(), ".local", "share", "multi-review");
+const ANALYSIS_TOOLS_PATH = [path.join(ANALYSIS_TOOLS_HOME, "venv", "bin"), path.join(ANALYSIS_TOOLS_HOME, "clangd", "bin")];
 /** Host directories every toolchain needs, readable in the sandbox. */
 const SANDBOX_HOST_DIRS = ["/usr", "/etc", "/opt", "/snap", "/nix"];
 /**
@@ -2020,7 +2023,7 @@ export async function runInSandbox(
 		"--block-net", "--memory", "8G", "--max-processes", "4096",
 		"--allow", scratch, "--allow-file", "/dev/null", "--read", top, "--workdir", dir,
 	];
-	const read = [...SANDBOX_HOST_DIRS, ...homeDirs.map((rel) => path.join(home, rel)), SANDBOX_TOOLS_DIR, ...(extras.readPaths ?? [])];
+	const read = [...SANDBOX_HOST_DIRS, ...homeDirs.map((rel) => path.join(home, rel)), SANDBOX_TOOLS_DIR, ANALYSIS_TOOLS_HOME, ...(extras.readPaths ?? [])];
 	// Worktrees (PR checkouts) keep their git objects in the main repo.
 	if (commonDir && !isInside(commonDir, top)) read.push(commonDir);
 	for (const p of read) {
@@ -2028,7 +2031,7 @@ export async function runInSandbox(
 		if (st) args.push(st.isDirectory() ? "--read" : "--read-file", p);
 	}
 	const env: Record<string, string> = {
-		PATH: `${SANDBOX_TOOLS_DIR}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+		PATH: [SANDBOX_TOOLS_DIR, ...ANALYSIS_TOOLS_PATH, process.env.PATH ?? "/usr/bin:/bin"].join(":"),
 		HOME: scratch,
 		LANG: process.env.LANG ?? "C.UTF-8",
 		TERM: "dumb",
