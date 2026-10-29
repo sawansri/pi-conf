@@ -104,6 +104,12 @@ export interface MultiReviewConfig {
 	 * calls excluded) is nudged once to keep looking. 0 disables.
 	 */
 	minReviewToolCalls: number;
+	/** Reviewers and verifiers may search the web (sparingly; see web-search.ts). */
+	webSearch: boolean;
+	/** Answers web searches for models without native search (an anthropic-messages model). */
+	webSearchProxyModel: string;
+	/** Model APIs that search natively on this gateway; other models use the proxy. */
+	webSearchNativeApis: string[];
 	/**
 	 * Model (`provider/id[@level]`) that groups findings into issues; defaults
 	 * to the judge at low thinking. "lexical" skips the model call.
@@ -173,6 +179,9 @@ export const DEFAULTS: MultiReviewConfig = {
 	sandboxHomeDirs: [".nvm", ".cargo/bin", ".cargo/registry", ".cargo/git", ".rustup", ".pyenv", ".bun", ".deno", ".volta", "go", ".local/bin", ".local/lib"],
 	autoChecks: true,
 	minReviewToolCalls: 10,
+	webSearch: true,
+	webSearchProxyModel: "amd-gateway-anthropic/Claude-Haiku-5.5",
+	webSearchNativeApis: ["anthropic-messages"],
 };
 
 export function reviewerRunOptions(cfg: MultiReviewConfig): ReviewerRunOptions {
@@ -236,6 +245,9 @@ export function loadConfig(): MultiReviewConfig {
 		}
 		if (typeof parsed.sandbox === "boolean") cachedConfig.sandbox = parsed.sandbox;
 		if (typeof parsed.autoChecks === "boolean") cachedConfig.autoChecks = parsed.autoChecks;
+		if (typeof parsed.webSearch === "boolean") cachedConfig.webSearch = parsed.webSearch;
+		if (typeof parsed.webSearchProxyModel === "string" && parsed.webSearchProxyModel.includes("/")) cachedConfig.webSearchProxyModel = parsed.webSearchProxyModel;
+		if (Array.isArray(parsed.webSearchNativeApis)) cachedConfig.webSearchNativeApis = parsed.webSearchNativeApis.filter((x: unknown): x is string => typeof x === "string");
 		if (typeof parsed.checkTimeoutSec === "number" && parsed.checkTimeoutSec >= 10 && parsed.checkTimeoutSec <= 1800) {
 			cachedConfig.checkTimeoutSec = Math.floor(parsed.checkTimeoutSec);
 		}

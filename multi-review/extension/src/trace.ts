@@ -3,6 +3,7 @@ import * as path from "node:path";
 import type { AgentSessionEvent } from "@mariozechner/pi-coding-agent";
 import { GIT_TOOL, RUN_TOOL } from "./agent-tools.ts";
 import { shortSpec } from "./progress.ts";
+import { WEB_SEARCH_TOOL } from "./web-search.ts";
 import { XREF_TOOL } from "./xref.ts";
 
 // ---------- live reviewer trace ----------
@@ -106,9 +107,15 @@ export class ReviewTrace {
 					if (plan.length > 0) a.plan = plan;
 					if (typeof args.done === "string") a.done.push(args.done);
 					this.append(a, { kind: "progress", plan: args.plan, done: args.done });
+				} else if ((event as { type: string }).type === "multi_review_web_search") {
+					// Native (server-side) searches never pass through pi's tool events.
+					const query = (event as unknown as { query: string }).query;
+					a.toolCalls++;
+					a.lastTool = `web_search ${query.length > 50 ? `${query.slice(0, 49)}…` : query}`;
+					this.append(a, { kind: "tool", tool: "web_search", native: true, args: { query } });
 				} else if ((event as { type: string }).type === "multi_review_nudge") {
 					this.append(a, { kind: "nudge", toolCalls: (event as unknown as { toolCalls: number }).toolCalls });
-				} else if (event.type === "tool_execution_end" && (event.toolName === GIT_TOOL || event.toolName === RUN_TOOL || event.toolName === XREF_TOOL)) {
+				} else if (event.type === "tool_execution_end" && (event.toolName === GIT_TOOL || event.toolName === RUN_TOOL || event.toolName === XREF_TOOL || event.toolName === WEB_SEARCH_TOOL)) {
 					// Executed commands are evidence; keep the head of what they returned.
 					const content = ((event.result as { content?: Array<{ type: string; text?: string }> } | undefined)?.content ?? []);
 					const text = content.filter((c) => c.type === "text").map((c) => c.text ?? "").join("");

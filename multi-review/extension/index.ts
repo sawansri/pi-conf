@@ -39,6 +39,7 @@
  *   sandbox     nono (Landlock) sandbox: runInSandbox, sandboxInvocation, probe
  *   checks      brief/auto checks (mr-cxx-check), check output for prompts and results
  *   xref        clangd navigation service and tool
+ *   web-search  web search for reviewers: native where the gateway serves it, else proxied
  *   grouping    clustering findings into issues (model, lexical fallback), suspicions
  *   verify      verification round: assignment, verifier prompt, verdicts
  *   pr-comments fetching and classifying a PR's existing review comments

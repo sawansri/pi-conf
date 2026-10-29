@@ -8,7 +8,7 @@ import { CXX_FILE, cxxAutoCheck, runChecks } from "./checks.ts";
 import { type Model, type ModelSpec, type MultiReviewConfig, type ReviewFlags, type ReviewerSpec, describeFlags, loadConfig, parseReviewerSpec, reviewerRunOptions } from "./config.ts";
 import { type HiddenClaim, type SuspicionResult, groupFindings } from "./grouping.ts";
 import { type JudgeResult, runJudge } from "./judge.ts";
-import { describeResolved, resolveJudge, resolveReviewerPoolStructured } from "./models.ts";
+import { describeResolved, findModel, resolveJudge, resolveReviewerPoolStructured } from "./models.ts";
 import { type PrCommentsReport, classifyPrComments, fetchPrComments } from "./pr-comments.ts";
 import { type MultiReviewProgressReporter, type ToolUpdateFn, createProgressReporter, formatReviewerProgressLine, shortSpec } from "./progress.ts";
 import { DIFF_BUDGET_CHARS, REVIEWER_SYSTEM_PROMPT, buildReviewUserPrompt } from "./prompts.ts";
@@ -304,6 +304,13 @@ async function runReviewPipeline(
 			runOpts = { ...runOpts, xref };
 			runOpts.cleanups?.push(() => xref.dispose());
 		}
+	}
+	if (cfg.webSearch && runOpts.useTools) {
+		// The proxy serves models without native search; it must search natively itself.
+		const proxy = findModel(ctx, cfg.webSearchProxyModel as ModelSpec);
+		const proxyModel = proxy && proxy.api === "anthropic-messages" ? proxy : undefined;
+		if (!proxyModel) target.warnings.push(`webSearchProxyModel ${cfg.webSearchProxyModel} is missing or not an anthropic-messages model; only natively searching models can search`);
+		runOpts = { ...runOpts, webSearch: { proxyModel, nativeApis: new Set(cfg.webSearchNativeApis) } };
 	}
 	const checks = [...(target.brief?.checks ?? [])];
 	let sandboxExtras: SandboxExtras = {};

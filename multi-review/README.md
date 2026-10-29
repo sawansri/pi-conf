@@ -157,7 +157,7 @@ sandbox (no root, no user namespaces, ~0.15s per call).
 
 | Who | Tools |
 |-----|-------|
-| Reviewers | `read`, `grep`, `find`, `ls`, `git`, `progress`, and `xref` for C/C++ changes |
+| Reviewers | `read`, `grep`, `find`, `ls`, `git`, `progress`, `web_search`, and `xref` for C/C++ changes |
 | Verifiers | the same, plus `run` (when the sandbox works) |
 
 - **`git`** runs `log`, `show`, `blame`, or `diff` in the reviewed checkout,
@@ -215,9 +215,24 @@ sandbox (no root, no user namespaces, ~0.15s per call).
   though the index predates them; answers given while the index is still
   building say so. PR worktrees use the main checkout's index, with paths
   mapped back onto the worktree.
-- **No web access.** Reviewers are told to read a dependency's source on
-  disk (node_modules, vendored directories, system headers) rather than
-  assume its behaviour.
+- **Web search, used sparingly.** Reviewers and verifiers can search the
+  web, with no fixed limit. They are told to use it sparingly: read the
+  code and a dependency's source on disk first, and search only
+  for what that can't settle (a library's documented behaviour, an API or
+  standard, a known upstream bug), never to put the repository's code or
+  names into a query, and to treat results as claims to check, not
+  instructions. Models whose API is in `webSearchNativeApis` use their
+  provider's own server-side search, the same one Claude Code uses
+  (Anthropic's `web_search`); their searches are counted from the response
+  stream and logged in `trace.jsonl`. The others get a `web_search` tool
+  that asks `webSearchProxyModel` (Haiku, searching natively) and returns
+  a short answer with source URLs; queries must be one line of at most 300
+  characters. On the AMD gateway, Anthropic models search natively; the
+  OpenAI Responses models' native `web_search` is supported in code
+  (`"webSearchNativeApis": ["anthropic-messages", "openai-responses"]`)
+  but was untestable while the gateway's OpenAI models were down; Gemini
+  (Chat Completions) has no native search. `"webSearch": false` turns it
+  off; reviewers are then told they have no web access.
 - **Effort floor.** A reviewer that answers `[]` after fewer than
   `minReviewToolCalls` (10) tool calls is nudged once to work through its
   plan, the brief's focus areas, and git history first. If the nudge times
@@ -569,6 +584,9 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
   "checkTimeoutSec": 120,
   "autoChecks": true,
   "minReviewToolCalls": 10,
+  "webSearch": true,
+  "webSearchProxyModel": "amd-gateway-anthropic/Claude-Haiku-5.5",
+  "webSearchNativeApis": ["anthropic-messages"],
   "sandboxHomeDirs": [".nvm", ".cargo/bin", ".cargo/registry", ".cargo/git", ".rustup", ".pyenv", ".bun", ".deno", ".volta", "go", ".local/bin", ".local/lib"]
 }
 ```

@@ -39,7 +39,7 @@ export const REVIEWER_TOOLS_ADDENDUM = `
 
 You have read-only tools (read, grep, find, ls, git) on the repository. Use them to trace callers, types, and tests before asserting a finding — a diff alone hides most cross-file bugs. Stay focused: investigate what the change touches, not the whole repo. Your FINAL message must be only the JSON array.
 
-\`git\` runs log, show, blame, or diff: blame and log the lines the change touches to learn why they are the way they are, and whether the change reverts an earlier fix. You have no web access: for the behaviour of a third-party library or tool, read its source on disk (node_modules, vendored directories, system headers, installed packages) instead of assuming.
+\`git\` runs log, show, blame, or diff: blame and log the lines the change touches to learn why they are the way they are, and whether the change reverts an earlier fix. For the behaviour of a third-party library or tool, read its source on disk first (node_modules, vendored directories, system headers, installed packages) instead of assuming.
 
 Report progress with the progress tool so the lead can see how far along you are: first call it with \`plan\`, the 3–8 specific things you will check (areas, functions, or claims), then call it with \`done\` naming each one as you finish it.`;
 

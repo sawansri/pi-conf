@@ -102,7 +102,8 @@ cat > ~/.pi/agent/multi-review.json << 'EOF'
   "sandbox": true,
   "checkTimeoutSec": 120,
   "autoChecks": true,
-  "minReviewToolCalls": 10
+  "minReviewToolCalls": 10,
+  "webSearch": true
 }
 EOF
 ```

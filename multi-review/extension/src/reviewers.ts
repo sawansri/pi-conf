@@ -8,6 +8,7 @@ import { REVIEWER_TOOLS_ADDENDUM, VERIFIER_RUN_ADDENDUM, XREF_ADDENDUM } from ".
 import type { SandboxExtras } from "./sandbox.ts";
 import { ReviewTrace, type ReviewerActivity } from "./trace.ts";
 import { abortable, withTimeout } from "./util.ts";
+import { type WebSearchOptions, NO_WEB_ADDENDUM, createWebSearchTool, installNativeWebSearch, searchesNatively, webSearchAddendum, webSearchAvailable } from "./web-search.ts";
 import { XrefService, createXrefTool } from "./xref.ts";
 
 /** A bare `[]` (optionally fenced): the reviewer says there's nothing to report. */
@@ -21,6 +22,7 @@ export interface AgenticExtras {
 	sandboxHomeDirs?: string[];
 	sandboxExtras?: SandboxExtras;
 	xref?: XrefService;
+	webSearch?: WebSearchOptions;
 	/** Nudge once when the reply is [] after fewer non-progress tool calls than this. */
 	minToolCalls?: number;
 }
@@ -44,12 +46,16 @@ async function runAgenticReviewer(
 ): Promise<ModelCallResult> {
 	const started = Date.now();
 	const progressState = { plan: [] as string[], done: 0, calls: 0 };
-	const customTools: Array<ReturnType<typeof createProgressTool> | ReturnType<typeof createGitTool> | ReturnType<typeof createRunTool> | ReturnType<typeof createXrefTool>> = [
+	const customTools: Array<ReturnType<typeof createProgressTool> | ReturnType<typeof createGitTool> | ReturnType<typeof createRunTool> | ReturnType<typeof createXrefTool> | ReturnType<typeof createWebSearchTool>> = [
 		createProgressTool(progressState),
 		createGitTool(cwd),
 	];
 	if (extras.runDir) customTools.push(createRunTool(extras.runDir, extras.sandboxHomeDirs ?? [], extras.sandboxExtras));
 	if (extras.xref) customTools.push(createXrefTool(extras.xref));
+	// Native search where the gateway serves it for this model's API, else the proxied tool.
+	const ws = extras.webSearch;
+	const nativeSearch = searchesNatively(model, ws);
+	if (ws?.proxyModel && !nativeSearch) customTools.push(createWebSearchTool(ctx, ws.proxyModel));
 	const settingsManager = SettingsManager.inMemory({});
 	const resourceLoader = new DefaultResourceLoader({
 		cwd,
@@ -73,6 +79,7 @@ async function runAgenticReviewer(
 		settingsManager,
 		sessionManager: SessionManager.inMemory(cwd),
 	});
+	if (nativeSearch) installNativeWebSearch(session, onEvent);
 	const onAbort = () => void session.abort();
 	signal.addEventListener("abort", onAbort, { once: true });
 	const unsubscribe = onEvent ? session.subscribe(onEvent) : undefined;
@@ -168,6 +175,8 @@ export interface ReviewerRunOptions {
 	sandboxExtras?: SandboxExtras;
 	/** clangd navigation for C/C++ reviews, shared by every session in the run. */
 	xref?: XrefService;
+	/** Web search for reviewer and verifier sessions; unset means none. */
+	webSearch?: WebSearchOptions;
 	/** Run when the review ends (the caller's finally), e.g. stopping clangd. */
 	cleanups?: Array<() => void>;
 	/** Review phase only: see AgenticExtras.minToolCalls. */
@@ -192,13 +201,15 @@ export async function runReviewer(
 	const call = runOpts.useTools
 		? await runAgenticReviewer(
 			ctx, model, reviewerSpec.thinking,
-			systemPrompt + REVIEWER_TOOLS_ADDENDUM + (runOpts.xref ? XREF_ADDENDUM : "") + (canRun ? VERIFIER_RUN_ADDENDUM : ""),
+			systemPrompt + REVIEWER_TOOLS_ADDENDUM + (runOpts.xref ? XREF_ADDENDUM : "") + (canRun ? VERIFIER_RUN_ADDENDUM : "") +
+				(webSearchAvailable(model, runOpts.webSearch) ? webSearchAddendum() : NO_WEB_ADDENDUM),
 			userPrompt, signal, runOpts.cwd ?? ctx.cwd, tracer?.onEvent,
 			{
 				runDir: canRun ? runOpts.cwd ?? ctx.cwd : undefined,
 				sandboxHomeDirs: runOpts.sandboxHomeDirs,
 				sandboxExtras: runOpts.sandboxExtras,
 				xref: runOpts.xref,
+				webSearch: runOpts.webSearch,
 				minToolCalls: verifying ? undefined : runOpts.minToolCalls,
 			},
 		)
