@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentSessionEvent } from "@mariozechner/pi-coding-agent";
 import { GIT_TOOL, RUN_TOOL } from "./agent-tools.ts";
-import { shortSpec } from "./progress.ts";
+import { type RunSnapshot, shortSpec } from "./progress.ts";
 import { WEB_SEARCH_TOOL } from "./web-search.ts";
 import { XREF_TOOL } from "./xref.ts";
 
@@ -72,7 +72,8 @@ function formatActivityLine(a: ReviewerActivity, now: number): string {
  * Live view of every reviewer/verifier session, so the lead can watch a run
  * instead of waiting on it blind. Writes to `dir`:
  *  - progress.json: per-session snapshot (turns, tool calls, streamed
- *    thinking/text size, last tool), rewritten at most every ACTIVITY_REFRESH_MS;
+ *    thinking/text size, last tool), plus the progress widget's state (`run`)
+ *    and its activity lines, rewritten at most every ACTIVITY_REFRESH_MS;
  *  - trace.jsonl: each tool call and each completed assistant message
  *    (thinking and text in full), appended as they happen.
  * Running sessions also feed the progress widget / tool updates.
@@ -83,6 +84,7 @@ export class ReviewTrace {
 	private readonly sessions: ReviewerActivity[] = [];
 	private lastRefresh = 0;
 	private refreshTimer: ReturnType<typeof setTimeout> | undefined;
+	private run: RunSnapshot | undefined;
 
 	constructor(readonly dir: string, private readonly onActivity?: (lines: string[]) => void) {
 		fs.mkdirSync(dir, { recursive: true });
@@ -147,6 +149,13 @@ export class ReviewTrace {
 		};
 	}
 
+	/** The progress widget's state; a finished run is written at once. */
+	setRun(run: RunSnapshot): void {
+		this.run = run;
+		if (run.finished) this.refresh();
+		else this.schedule();
+	}
+
 	/** Stop the pending refresh; leaves the files for the lead to read. */
 	close(): void {
 		if (this.refreshTimer) clearTimeout(this.refreshTimer);
@@ -176,15 +185,18 @@ export class ReviewTrace {
 	private refresh(): void {
 		this.lastRefresh = Date.now();
 		const now = Date.now();
+		const activity = this.sessions.filter((a) => a.state === "running").map((a) => formatActivityLine(a, now));
 		try {
 			fs.writeFileSync(this.progressPath, JSON.stringify({
 				updatedAt: new Date(now).toISOString(),
 				trace: this.tracePath,
+				run: this.run,
+				activity,
 				sessions: this.sessions.map((a) => ({ ...a, elapsedSec: Math.round(((a.finishedAt ?? now) - a.startedAt) / 1000) })),
 			}, null, 2) + "\n");
 		} catch {
 			/* tracing must never fail a review */
 		}
-		this.onActivity?.(this.sessions.filter((a) => a.state === "running").map((a) => formatActivityLine(a, now)));
+		this.onActivity?.(activity);
 	}
 }

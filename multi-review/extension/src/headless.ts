@@ -132,6 +132,32 @@ export function parseReviewRequest(raw: unknown): ReviewRequest | { error: strin
  */
 const HEADLESS_DEFAULT_MAX_SECONDS = 540;
 
+/**
+ * One file per headless run, `<pid>.json` = `{pid, cwd, progress, startedAt}`,
+ * so a watcher (the Claude Code mod) finds the run's progress.json without
+ * parsing the command that started it (shell variables, `cd`, pipes).
+ */
+export const RUNS_DIR = path.join(os.homedir(), ".cache", "multi-review", "runs");
+const RUN_ENTRY_TTL_MS = 60 * 60_000;
+
+function announceRun(progressPath: string, cwd: string): void {
+	const now = Date.now();
+	try {
+		fs.mkdirSync(RUNS_DIR, { recursive: true });
+		fs.writeFileSync(path.join(RUNS_DIR, `${process.pid}.json`), JSON.stringify({ pid: process.pid, cwd, progress: progressPath, startedAt: now }) + "\n");
+		for (const name of fs.readdirSync(RUNS_DIR)) {
+			const file = path.join(RUNS_DIR, name);
+			try {
+				if (now - fs.statSync(file).mtimeMs > RUN_ENTRY_TTL_MS) fs.rmSync(file, { force: true });
+			} catch {
+				/* another run pruned it first */
+			}
+		}
+	} catch {
+		/* watching is optional; never fail a review over it */
+	}
+}
+
 export async function runHeadless(pi: ExtensionAPI, args: string, ctx: ExtensionContext): Promise<void> {
 	process.env.MULTI_REVIEW_DEBUG ||= "1";
 	const started = Date.now();
@@ -161,6 +187,7 @@ export async function runHeadless(pi: ExtensionAPI, args: string, ctx: Extension
 	// The trace sits next to the result so the caller can watch the run live.
 	const traceDir = path.dirname(outPath);
 	console.error(`TRACE ${path.join(traceDir, "progress.json")} ${path.join(traceDir, "trace.jsonl")}`);
+	announceRun(path.join(traceDir, "progress.json"), ctx.cwd);
 	let out: Awaited<ReturnType<typeof runAgentLedReview>>;
 	try {
 		out = await runAgentLedReview(

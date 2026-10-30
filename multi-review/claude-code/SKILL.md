@@ -68,6 +68,7 @@ Write a JSON file (e.g. `/tmp/multi-review/<timestamp>/brief.json`; create the d
 pi -p "/multi-review-run --brief=<brief.json> --out=<dir>/result.json" < /dev/null
 ```
 
+- Write the command exactly in this form, with literal absolute paths (e.g. `/tmp/multi-review/20261030-1215/brief.json`): no shell variables or `$(...)`, nothing chained before it (no `cd …;`, no assignments), and nothing after `< /dev/null` (no `2>&1 | tail`). That form matches the pre-approved `Bash(pi -p *)` rule, keeps pi's stderr progress visible, and lets the `multi-review-status` mod show the run live above the prompt. The review's scope comes from the working directory: if the shell isn't at the repo root, `cd` there in a separate Bash call first.
 - Run it in the **foreground** with the Bash tool's maximum timeout (`timeout: 600000`). It typically takes 1–5 minutes. Don't use `run_in_background`: non-interactive sessions end before it finishes.
 - The run fits itself into `--max-seconds` (default 540, inside the 10-minute Bash cap). It shrinks reviewer timeouts, and when time runs short it skips verification with a warning instead of overrunning. Any such warning is in the result's Warnings section; mention it to the user.
 - `< /dev/null` is required: `pi -p` waits for stdin to close before it starts.

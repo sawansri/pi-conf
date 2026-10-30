@@ -22,8 +22,23 @@ interface MultiReviewProgressPatch {
 	latest?: string;
 }
 
+/** The widget's state, mirrored into progress.json for watchers outside pi (the Claude Code mod). */
+export interface RunSnapshot {
+	mode: string;
+	phase: string;
+	done?: number;
+	total?: number;
+	latest?: string;
+	/** The last few `latest` lines, oldest first. */
+	events: string[];
+	startedAt: number;
+	finished: boolean;
+}
+
 export interface MultiReviewProgressReporter {
 	update(patch: MultiReviewProgressPatch): void;
+	/** Send every state change, and the current state now, to `sink`. */
+	mirror(sink: (run: RunSnapshot) => void): void;
 	/** One line per running reviewer session (from ReviewTrace). */
 	activity(lines: string[]): void;
 	finish(summary: string): void;
@@ -52,6 +67,12 @@ export function createProgressReporter(ctx: ExtensionContext, mode: string, onUp
 	let clearTimer: ReturnType<typeof setTimeout> | undefined;
 	let activity: string[] = [];
 	let lastActivityLog = 0;
+	let sink: ((run: RunSnapshot) => void) | undefined;
+	let finished = false;
+
+	function mirrorState(): void {
+		sink?.({ mode, phase: state.phase, done: state.done, total: state.total, latest: state.latest, events: events.slice(-3), startedAt, finished });
+	}
 
 	function renderLines(theme: { fg: (color: string, text: string) => string }, width: number): string[] {
 		const elapsed = `${Math.max(0, Math.round((Date.now() - startedAt) / 1000))}s`;
@@ -86,6 +107,7 @@ export function createProgressReporter(ctx: ExtensionContext, mode: string, onUp
 		setStatus(statusLine, ctx);
 		showWidget();
 		publishUpdate();
+		mirrorState();
 	}
 
 	function showWidget(): void {
@@ -110,6 +132,10 @@ export function createProgressReporter(ctx: ExtensionContext, mode: string, onUp
 			if (patch.latest) events.push(patch.latest);
 			publish();
 		},
+		mirror(fn: (run: RunSnapshot) => void): void {
+			sink = fn;
+			mirrorState();
+		},
 		activity(lines: string[]): void {
 			activity = lines;
 			// Print mode's only view: a heartbeat, not every throttled refresh.
@@ -123,6 +149,7 @@ export function createProgressReporter(ctx: ExtensionContext, mode: string, onUp
 		finish(summary: string): void {
 			state = { ...state, phase: summary, latest: undefined };
 			activity = [];
+			finished = true;
 			publish();
 			clearTimer = setTimeout(() => this.clear(), 4000);
 			clearTimer.unref?.();

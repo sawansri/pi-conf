@@ -164,6 +164,8 @@ export async function runMultiReviewFromArgs(
 		};
 		trace = new ReviewTrace(runOptions.traceDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "multi-review-")), (lines) => progress.activity(lines));
 		runOpts.trace = trace;
+		const runTrace = trace;
+		progress.mirror((run) => runTrace.setRun(run));
 		// PR reviews read the PR's actual code; brief files (spec, context) too,
 		// since the PR may add or change them.
 		if (target.kind === "pr" && target.pr) {
