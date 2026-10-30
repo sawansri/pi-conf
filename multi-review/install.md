@@ -75,6 +75,21 @@ ln -sfn ~/Projects/pi-conf/multi-review/claude-code ~/.claude/skills/multi-revie
 Then `/multi-review` in Claude Code (see README, "Using it from other
 harnesses"). It needs `pi` on PATH and the extension installed as above.
 
+To watch a run live in Claude Code (the same lines as pi's progress
+widget, in the band above the prompt), install the `multi-review-status`
+mod. It needs Claude Code 2.1.287 or later:
+
+```bash
+claude plugin marketplace add ~/Projects/pi-conf
+claude plugin install multi-review-status@pi-conf
+```
+
+An installed plugin is cached by version. After changing the mod, bump
+`version` in `claude-code-mod/.claude-plugin/plugin.json` and run
+`claude plugin update multi-review-status@pi-conf`. To try it for one
+session without installing, use
+`claude --plugin-dir ~/Projects/pi-conf/multi-review/claude-code-mod`.
+
 ## 2. (Optional) Drop a defaults file
 
 ```bash

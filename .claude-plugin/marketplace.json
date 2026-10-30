@@ -1,0 +1,12 @@
+{
+  "name": "pi-conf",
+  "owner": { "name": "Sawan Srivastava" },
+  "metadata": { "description": "Claude Code plugins for the pi-conf pi extensions" },
+  "plugins": [
+    {
+      "name": "multi-review-status",
+      "source": "./multi-review/claude-code-mod",
+      "description": "Shows a running multi-review live above the prompt in Claude Code, like pi's progress widget"
+    }
+  ]
+}

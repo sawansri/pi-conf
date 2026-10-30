@@ -288,7 +288,9 @@ pi -p "/multi-review-run --brief=brief.json --out=/tmp/mr/result.json" < /dev/nu
 - **Live trace** next to `result.json`: `progress.json` is a snapshot of
   every reviewer and verifier session (state, items checked out of its
   plan, turns, tool calls, streamed thinking/text size, last tool),
-  rewritten every 2s. Reviewers report the plan themselves through a
+  rewritten every 2s. It also carries the progress widget's state (`run`:
+  mode, phase, done/total, latest events, `finished`) and its per-reviewer
+  lines (`activity`), so other harnesses can draw the same widget. Reviewers report the plan themselves through a
   `progress` tool: the 3–8 things they'll check up front, then each one
   as it's done (Sonnet tends to finish before marking items).
   `trace.jsonl` logs each tool call and each assistant message (thinking
@@ -327,6 +329,29 @@ The flow:
 
    Reviewers hunt for regressions while verifiers check each old issue.
    Each item comes back fixed or still present.
+
+**Live progress.** The `multi-review-status` mod (`claude-code-mod/`, a
+Claude Code [mod](https://code.claude.com/docs/en/plugins/mods/overview))
+draws pi's progress widget in the band above the prompt while a run is
+going, and adds the phase after the spinner's word:
+
+```
+✶ Gusting · multi-review: reviewers running 2/3…
+multi-review · quick · reviewers running 2/3 ████████░░░░ · 27s
+latest: ✓ Claude-Haiku-5.5 (2/3) — 4 findings, 19.4s
+  ✓ gpt-6-luna@low (1/3) — 0 findings, 9.9s
+  ✓ Claude-Haiku-5.5 (2/3) — 4 findings, 19.4s
+  ⋯ gemini-3.8-flash@low review · 25s · 0 thinking · 0 text
+```
+
+It spots the Bash call to `/multi-review-run` and reads its
+`progress.json` once a second. It finds that file next to `--out` when
+`--out` is a plain absolute path, and otherwise through the entry each
+headless run writes to `~/.cache/multi-review/runs/<pid>.json` (so
+`--out=$D/result.json` after a `cd` still works). The band clears 4s after the run ends, as
+pi's widget does. That works for foreground and `run_in_background` runs.
+The VS Code extension has no band, so only the spinner text shows there.
+Install: see install.md. Tests: `claude plugin test` in `claude-code-mod/`.
 
 Claude Code becomes the lead with the implementation context, just as
 pi's main agent is inside pi. The skill pre-approves only `pi -p`,

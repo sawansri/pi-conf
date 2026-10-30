@@ -1,0 +1,6 @@
+{
+  "name": "multi-review-status",
+  "version": "0.1.1",
+  "description": "Shows a running multi-review (pi -p /multi-review-run) live above the prompt, like pi's progress widget",
+  "author": { "name": "Sawan Srivastava" }
+}
