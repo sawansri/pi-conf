@@ -2,12 +2,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { parseValueFlag } from "./args.ts";
+import { type ParsedReviewArgs, parseValueFlag } from "./args.ts";
 import { leadJudgmentInstructions } from "./lead.ts";
 import { TRANSIENT_REVIEWERS, runMultiReviewFromArgs } from "./pipeline.ts";
 import { normalizeAuthorFilter } from "./pr-comments.ts";
 import type { ToolUpdateFn } from "./progress.ts";
 import type { MultiReviewDetails } from "./render.ts";
+import { MAX_SOCRATIC_ROUNDS, socraticLeadInstructions } from "./socratic.ts";
 
 /**
  * Brief fields shared by the multi_review tool and the headless
@@ -31,6 +32,12 @@ export interface ReviewRequest {
 	comment_authors?: string[];
 	include_nits?: boolean;
 	include_resolved?: boolean;
+	/** Run a multi-round Socratic discussion on `topic` (or `focus`) instead of a defect-finding review. */
+	socratic?: boolean;
+	/** Topic or question for Socratic discussion. */
+	topic?: string;
+	/** Number of Socratic discussion rounds (default 2, max 5). */
+	rounds?: number;
 }
 
 /**
@@ -51,13 +58,31 @@ export async function runAgentLedReview(
 ): Promise<{ text: string; markdown: string; details: MultiReviewDetails } | { error: string }> {
 	const parts: string[] = [];
 	const focus = typeof params.focus === "string" ? params.focus.trim() : "";
+	const topic = typeof params.topic === "string" ? params.topic.trim() : "";
 	const authors = normalizeAuthorFilter(params.comment_authors);
 	const wantPrComments = Boolean(params.pr_comments || authors.length > 0);
-	if (wantPrComments && typeof params.pr_number !== "number") return { error: "multi_review: pr_comments / comment_authors needs pr_number" };
-	if (typeof params.pr_number === "number") parts.push(String(params.pr_number));
-	else if (params.scope === "area") {
+	if (wantPrComments && typeof params.pr_number !== "number") {
+		return { error: "multi_review: pr_comments / comment_authors needs pr_number" };
+	}
+	let targetOverride: ParsedReviewArgs | undefined;
+	if (typeof params.pr_number === "number") {
+		parts.push(String(params.pr_number));
+		targetOverride = { kind: "pr", number: params.pr_number, raw: topic || focus };
+	} else if (params.socratic) {
+		const effectiveTopic = topic || focus;
+		if (!effectiveTopic && params.scope === "area") {
+			return { error: "multi_review: socratic mode with scope='area' needs `topic` (or `focus`)." };
+		}
+		if (params.scope === "diff" || !effectiveTopic) {
+			targetOverride = { kind: "default" };
+		} else {
+			parts.push(effectiveTopic);
+			targetOverride = { kind: "text", value: effectiveTopic };
+		}
+	} else if (params.scope === "area") {
 		if (!focus) return { error: "multi_review: scope='area' needs `focus` describing the area to review." };
 		parts.push(focus);
+		targetOverride = { kind: "text", value: focus };
 	}
 	const result = await runMultiReviewFromArgs(pi, ctx, parts.join(" "), signal, TRANSIENT_REVIEWERS, onUpdate, {
 		agentLead: true,
@@ -69,7 +94,7 @@ export async function runAgentLedReview(
 			contextFiles: params.context_files,
 			checks: params.checks,
 		},
-		focus: params.scope === "area" ? undefined : focus,
+		focus: params.scope === "area" ? undefined : (focus || topic),
 		flags: { verify: params.verify, quick: params.quick },
 		deadlineMs,
 		detailHint,
@@ -77,11 +102,16 @@ export async function runAgentLedReview(
 		prComments: wantPrComments
 			? { includeNits: Boolean(params.include_nits), includeResolved: Boolean(params.include_resolved), authors: authors.length > 0 ? authors : undefined }
 			: undefined,
+		socratic: params.socratic ? { topic: topic || focus || undefined, rounds: params.rounds } : undefined,
+		targetOverride,
 	});
 	if (!result.injectMessage) return { error: result.notifyMessage };
 	const { content: markdown, details } = result.injectMessage;
 	const hasSpec = Boolean(params.spec_path || params.requirements?.length);
-	return { text: `${markdown}\n\n${leadJudgmentInstructions(hasSpec, details.prComments ? params.pr_number : undefined)}`, markdown, details };
+	const instructions = params.socratic
+		? socraticLeadInstructions(hasSpec)
+		: leadJudgmentInstructions(hasSpec, details.prComments ? params.pr_number : undefined);
+	return { text: `${markdown}\n\n${instructions}`, markdown, details };
 }
 
 /** Validate a brief file's JSON into a ReviewRequest; wrong-typed fields are errors, unknown keys ignored. */
@@ -108,15 +138,23 @@ export function parseReviewRequest(raw: unknown): ReviewRequest | { error: strin
 	try {
 		// A list of focus areas is a harmless shape slip; join instead of failing the run.
 		if (Array.isArray(o.focus) && o.focus.every((x) => typeof x === "string")) o.focus = (o.focus as string[]).join("; ");
+		// Accept author filter aliases (comment_authors, authors, author, comment_author) as string or string[].
 		const rawAuthors = o.comment_authors ?? o.authors ?? o.author ?? o.comment_author;
 		if (rawAuthors !== undefined) {
 			if (typeof rawAuthors === "string") o.comment_authors = [rawAuthors];
 			else if (Array.isArray(rawAuthors) && rawAuthors.every((x) => typeof x === "string")) o.comment_authors = rawAuthors;
 			else throw new Error(`"comment_authors" must be a string or array of strings`);
 		}
-		str("intent"); str("spec_path"); str("focus");
+		if (o.discuss !== undefined && o.socratic === undefined) {
+			if (typeof o.discuss !== "boolean") throw new Error(`"discuss" must be true or false`);
+			o.socratic = o.discuss;
+		}
+		if (typeof o.mode === "string" && ["socratic", "discuss"].includes(o.mode.toLowerCase()) && o.socratic === undefined) {
+			o.socratic = true;
+		}
+		str("intent"); str("spec_path"); str("focus"); str("topic");
 		strs("requirements"); strs("suspicions"); strs("context_files"); strs("checks"); strs("comment_authors");
-		bool("verify"); bool("quick"); bool("pr_comments"); bool("include_nits"); bool("include_resolved");
+		bool("verify"); bool("quick"); bool("pr_comments"); bool("include_nits"); bool("include_resolved"); bool("socratic");
 		if (o.scope !== undefined) {
 			if (o.scope !== "diff" && o.scope !== "area") throw new Error(`"scope" must be "diff" or "area"`);
 			req.scope = o.scope;
@@ -124,6 +162,13 @@ export function parseReviewRequest(raw: unknown): ReviewRequest | { error: strin
 		if (o.pr_number !== undefined) {
 			if (typeof o.pr_number !== "number" || !Number.isInteger(o.pr_number) || o.pr_number <= 0) throw new Error(`"pr_number" must be a positive integer`);
 			req.pr_number = o.pr_number;
+		}
+		if (o.rounds !== undefined) {
+			if (typeof o.rounds !== "number" || !Number.isInteger(o.rounds) || o.rounds < 1 || o.rounds > MAX_SOCRATIC_ROUNDS) {
+				throw new Error(`"rounds" must be an integer between 1 and ${MAX_SOCRATIC_ROUNDS}`);
+			}
+			req.rounds = o.rounds;
+			req.socratic ??= true;
 		}
 	} catch (err) {
 		return { error: err instanceof Error ? err.message : String(err) };
@@ -205,7 +250,9 @@ export async function runHeadless(pi: ExtensionAPI, args: string, ctx: Extension
 	try {
 		out = await runAgentLedReview(
 			pi, ctx, req, undefined, undefined, started + maxSeconds * 1000,
-			`Verbatim per-reviewer text, by issue id: ${outPath} → details.groups[].members`,
+			req.socratic
+				? `Full per-round Socratic transcript: ${outPath} → details.socratic.rounds`
+				: `Verbatim per-reviewer text, by issue id: ${outPath} → details.groups[].members`,
 			traceDir,
 		);
 	} catch (err) {

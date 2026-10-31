@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { parseAuthorFlags, parseBoolFlag, parseReviewArgs, parseReviewFlags, parseValueFlag } from "./args.ts";
+import { type ParsedReviewArgs, parseAuthorFlags, parseBoolFlag, parseReviewArgs, parseReviewFlags, parseSocraticFlags, parseValueFlag } from "./args.ts";
 import { type BriefInput, buildBrief, hasBriefInput, readSpecFile } from "./brief.ts";
 import { CXX_FILE, cxxAutoCheck, runChecks } from "./checks.ts";
 import { type Model, type ModelSpec, type MultiReviewConfig, type ReviewFlags, type ReviewerSpec, describeFlags, loadConfig, parseReviewerSpec, reviewerRunOptions } from "./config.ts";
@@ -15,6 +15,7 @@ import { DIFF_BUDGET_CHARS, REVIEWER_SYSTEM_PROMPT, buildReviewUserPrompt } from
 import type { MultiReviewDetails } from "./render.ts";
 import { type ReviewerRunOptions, allReviewersFailedResult, runAllReviewers, throwIfAborted } from "./reviewers.ts";
 import { type SandboxExtras, sandboxUnavailable } from "./sandbox.ts";
+import { DEFAULT_SOCRATIC_ROUNDS, MAX_SOCRATIC_ROUNDS, runSocraticDiscussion, runSocraticJudge, synthesizeSocraticLeadView } from "./socratic.ts";
 import { prClaimAsGroup, prCommentsMarkdown, suspicionAsGroup, suspicionMarkdown, synthesizeLeadView, synthesizeMarkdownFromGroups, synthesizeNoFindingsMarkdown } from "./synthesis.ts";
 import { type ReviewTarget, buildReviewTarget, exec, preparePrCheckout } from "./target.ts";
 import { ReviewTrace } from "./trace.ts";
@@ -85,13 +86,18 @@ export async function runMultiReviewFromArgs(
 		traceDir?: string;
 		/** Triage the PR's existing review comments (CodeRabbit, collaborators), optionally filtered by author. */
 		prComments?: { includeNits: boolean; includeResolved: boolean; authors?: string[] };
+		/** Run a multi-round Socratic discussion on a topic instead of a defect-finding review. */
+		socratic?: { topic?: string; rounds?: number };
+		/** Explicit target resolution from structured callers (tool / brief.json). */
+		targetOverride?: ParsedReviewArgs;
 	} = {},
 ): Promise<MultiReviewRunResult> {
 	const cfg = loadConfig();
 	const agentLead = runOptions.agentLead ?? false;
 	const parsedFlags = parseReviewFlags(rawArgs, { verify: cfg.verify, quick: false });
 	const flags: ReviewFlags = { ...parsedFlags.flags, ...stripUndefined(runOptions.flags ?? {}) };
-	const specFlag = parseValueFlag(parsedFlags.rest, "spec");
+	const socraticFlags = parseSocraticFlags(parsedFlags.rest);
+	const specFlag = parseValueFlag(socraticFlags.rest, "spec");
 	rawArgs = specFlag.rest;
 	const prCommentsFlag = parseBoolFlag(rawArgs, "pr-comments");
 	const nitsFlag = parseBoolFlag(prCommentsFlag.rest, "nits");
@@ -107,12 +113,17 @@ export async function runMultiReviewFromArgs(
 				: cfg.commentAuthors,
 	);
 	if (effectiveAuthors.length > 0) flags.authors = effectiveAuthors;
+	const isSocratic = Boolean(runOptions.socratic || socraticFlags.socratic);
+	const socraticRounds = Math.max(
+		1,
+		Math.min(MAX_SOCRATIC_ROUNDS, runOptions.socratic?.rounds ?? socraticFlags.rounds ?? DEFAULT_SOCRATIC_ROUNDS),
+	);
 	const prCommentOpts = runOptions.prComments
 		? { ...runOptions.prComments, authors: effectiveAuthors.length > 0 ? effectiveAuthors : undefined }
 		: (prCommentsFlag.present || cliAuthors.length > 0)
 			? { includeNits: nitsFlag.present, includeResolved: resolvedFlag.present, authors: effectiveAuthors.length > 0 ? effectiveAuthors : undefined }
 			: undefined;
-	let parsed = parseReviewArgs(rawArgs);
+	let parsed = runOptions.targetOverride ?? parseReviewArgs(rawArgs);
 	if (prCommentOpts && parsed.kind !== "pr") {
 		const ghPr = await exec(pi, "gh", ["pr", "view", "--json", "number"], ctx.cwd, 10_000);
 		let prNum = 0;
@@ -168,7 +179,7 @@ export async function runMultiReviewFromArgs(
 		};
 	}
 
-	const label = describeFlags(flags);
+	const label = isSocratic ? `socratic${flags.quick ? "+quick" : ""} (${socraticRounds}r)` : describeFlags(flags);
 	const progress = createProgressReporter(ctx, label, onUpdate);
 	let cleanupCheckout: (() => Promise<void>) | undefined;
 	let trace: ReviewTrace | undefined;
@@ -263,14 +274,31 @@ export async function runMultiReviewFromArgs(
 		const judge = agentLead ? null : resolveJudge(ctx, cfg);
 		if (!agentLead && !judge) target.warnings.push(`judge ${cfg.judge} not in registry; showing deterministic synthesis`);
 		const resolvedRows = resolved.map((r) => ({ rs: r.rs, model: r.model, clamped: r.clamped }));
+		const hintWithTrace = [runOptions.detailHint, `Reviewer trace (tool calls, thinking and replies per session): ${trace.tracePath}`].filter(Boolean).join("\n");
+		if (isSocratic) {
+			const topic = (
+				runOptions.socratic?.topic?.trim() ||
+				(parsed.kind === "text" ? parsed.value.trim() : parsed.kind === "pr" ? parsed.raw.trim() : "") ||
+				runOptions.focus?.trim() ||
+				target.brief?.intent?.trim() ||
+				(parsed.kind === "pr"
+					? `Examine the design, assumptions, and tradeoffs of PR #${parsed.number}`
+					: "Examine the design, assumptions, and tradeoffs of the current working-tree change")
+			);
+			const result = await runSocraticPipeline(
+				ctx, cfg, flags, target, resolvedRows, runOpts, judge, agentLead, signal, progress,
+				topic, socraticRounds, label, runOptions.deadlineMs, hintWithTrace, prReport,
+			);
+			progress.finish("done");
+			return result;
+		}
 		// Verification runs only with --verify or PR comments. Quick runs have
 		// no tools, so verify-only models (picked for tool use) sit out.
 		const verifies = !flags.quick && (flags.verify || prCommentOpts !== undefined);
 		const verifyOnly = verifies ? await resolveReviewerPoolStructured(ctx, cfg.verifyOnly) : { entries: [], missing: [] };
 		if (verifyOnly.missing.length > 0) target.warnings.push(`verifyOnly models not in registry, skipped: ${verifyOnly.missing.join(", ")}`);
 		const verifierRows = verifyOnly.entries.map((r) => ({ rs: r.rs, model: r.model, clamped: r.clamped }));
-		const result = await runReviewPipeline(ctx, cfg, flags, target, resolvedRows, verifierRows, runOpts, judge, agentLead, signal, progress, runOptions.deadlineMs,
-			[runOptions.detailHint, `Reviewer trace (tool calls, thinking and replies per session): ${trace.tracePath}`].filter(Boolean).join("\n"), prReport);
+		const result = await runReviewPipeline(ctx, cfg, flags, target, resolvedRows, verifierRows, runOpts, judge, agentLead, signal, progress, runOptions.deadlineMs, hintWithTrace, prReport);
 		progress.finish("done");
 		return result;
 	} catch (err) {
@@ -285,6 +313,173 @@ export async function runMultiReviewFromArgs(
 
 function stripUndefined<T extends object>(o: T): Partial<T> {
 	return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as Partial<T>;
+}
+
+/**
+ * Shared sandbox, clangd xref, web search, and check setup for both review
+ * and Socratic discussion runs.
+ */
+async function prepareExecutionTools(
+	ctx: ExtensionContext,
+	cfg: MultiReviewConfig,
+	flags: ReviewFlags,
+	target: ReviewTarget,
+	runOpts: ReviewerRunOptions,
+	mayExecute: boolean,
+	autoCheckDiff: boolean,
+	checkReserveMs: number,
+	signal: AbortSignal | undefined,
+	progress: MultiReviewProgressReporter,
+	deadlineMs?: number,
+): Promise<{ runOpts: ReviewerRunOptions; sandboxReason: string | null; sandboxExtras: SandboxExtras }> {
+	const allCandidatePaths = [
+		...target.files.map((f) => f.path),
+		...(target.brief?.contextFiles.map((f) => f.path) ?? []),
+	];
+	const needsSandbox = mayExecute || allCandidatePaths.some((p) => CXX_FILE.test(p));
+	const sandboxReason = !cfg.sandbox
+		? "sandbox is off in multi-review.json"
+		: flags.quick || !runOpts.useTools
+			? "quick runs don't execute code"
+			: needsSandbox ? await sandboxUnavailable(signal) : "nothing to execute";
+	throwIfAborted(signal);
+	if (!sandboxReason) {
+		const xref = createXrefService(allCandidatePaths, runOpts.cwd ?? ctx.cwd, ctx.cwd, cfg.sandboxHomeDirs);
+		if (xref) {
+			runOpts = { ...runOpts, xref };
+			runOpts.cleanups?.push(() => xref.dispose());
+		}
+	}
+	if (cfg.webSearch && runOpts.useTools) {
+		const proxy = findModel(ctx, cfg.webSearchProxyModel as ModelSpec);
+		const proxyModel = proxy && proxy.api === "anthropic-messages" ? proxy : undefined;
+		if (!proxyModel) target.warnings.push(`webSearchProxyModel ${cfg.webSearchProxyModel} is missing or not an anthropic-messages model; only natively searching models can search`);
+		runOpts = { ...runOpts, webSearch: { proxyModel, nativeApis: new Set(cfg.webSearchNativeApis) } };
+	}
+	const checks = [...(target.brief?.checks ?? [])];
+	let sandboxExtras: SandboxExtras = {};
+	if (autoCheckDiff && cfg.autoChecks && !sandboxReason && !checks.some((c) => c.includes("mr-cxx-check"))) {
+		const auto = cxxAutoCheck(target.files.map((f) => f.path), runOpts.cwd ?? ctx.cwd, ctx.cwd, target.warnings, target.diffText);
+		if (auto) {
+			checks.unshift(auto.command);
+			sandboxExtras = auto.extras;
+		}
+	}
+	if (checks.length > 0 && sandboxReason) {
+		target.warnings.push(`checks not run: ${sandboxReason}`);
+	} else if (checks.length > 0) {
+		const budget = Math.min(cfg.checkTimeoutSec * 1000, deadlineMs === undefined ? Number.POSITIVE_INFINITY : deadlineMs - Date.now() - checkReserveMs);
+		target.checkResults = await runChecks(runOpts.cwd ?? ctx.cwd, checks, budget, cfg.sandboxHomeDirs, sandboxExtras, signal, (what) =>
+			progress.update({ phase: `checks: ${what.length > 60 ? `${what.slice(0, 59)}…` : what}` }));
+		throwIfAborted(signal);
+		if (target.checkResults.some((r) => r.timedOut || r.skipped)) {
+			target.warnings.push(`some checks hit the ${cfg.checkTimeoutSec}s check budget; brief faster checks (type-check, one target, targeted tests)`);
+		}
+	}
+	return { runOpts, sandboxReason, sandboxExtras };
+}
+
+/**
+ * Multi-round Socratic discussion pipeline: models get the same tools as in
+ * review, form opening positions + Socratic questions in Round 1, and
+ * cross-examine each other in Round 2+.
+ */
+async function runSocraticPipeline(
+	ctx: ExtensionContext,
+	cfg: MultiReviewConfig,
+	flags: ReviewFlags,
+	target: ReviewTarget,
+	rows: Array<{ rs: ReviewerSpec; model: Model; clamped: boolean }>,
+	baseRunOpts: ReviewerRunOptions,
+	judge: Model | null,
+	agentLead: boolean,
+	signal: AbortSignal | undefined,
+	progress: MultiReviewProgressReporter,
+	topic: string,
+	totalRounds: number,
+	label: string,
+	deadlineMs?: number,
+	detailHint?: string,
+	prReport?: PrCommentsReport,
+): Promise<MultiReviewRunResult> {
+	const checkReserve = REVIEW_RESERVE_MS + FINAL_RESERVE_MS;
+	const prep = await prepareExecutionTools(
+		ctx, cfg, flags, target, baseRunOpts,
+		true, Boolean(target.diffText), checkReserve, signal, progress, deadlineMs,
+	);
+	const runOpts: ReviewerRunOptions = {
+		...prep.runOpts,
+		sandbox: prep.sandboxReason === null,
+		sandboxExtras: prep.sandboxExtras,
+	};
+	const fitRoundTimeoutMs = (remainingRounds: number): number => {
+		if (deadlineMs === undefined) return runOpts.timeoutMs;
+		const available = deadlineMs - Date.now() - FINAL_RESERVE_MS;
+		return Math.max(MIN_PHASE_MS, Math.min(runOpts.timeoutMs, Math.floor(available / Math.max(1, remainingRounds))));
+	};
+	const canStartNextRound = () => {
+		if (deadlineMs === undefined) return { ok: true, remainingSec: Number.POSITIVE_INFINITY };
+		const leftMs = deadlineMs - Date.now() - FINAL_RESERVE_MS;
+		return { ok: leftMs >= MIN_PHASE_MS, remainingSec: Math.max(0, Math.round(leftMs / 1000)) };
+	};
+
+	const out = await runSocraticDiscussion(
+		ctx, cfg, rows, target, topic, totalRounds, runOpts, signal, progress,
+		fitRoundTimeoutMs, canStartNextRound, prReport,
+	);
+	if ("failure" in out) return out.failure;
+	const { socratic } = out;
+
+	let markdown: string;
+	let judgeLabel = agentLead ? "(main agent)" : "(none)";
+	let judgeDurationMs = 0;
+	let judgeUsage: JudgeResult["usage"];
+	if (agentLead) {
+		markdown = synthesizeSocraticLeadView(target, socratic, `${label} · you moderate`, detailHint);
+	} else if (judge) {
+		progress.update({ phase: `synthesizing discussion (${shortSpec(cfg.judge)})`, done: undefined, total: undefined });
+		const jr = await runSocraticJudge(judge, socratic, target, ctx, signal, cfg.temperature, cfg.judgeThinking);
+		throwIfAborted(signal);
+		judgeLabel = cfg.judge;
+		judgeDurationMs = jr.durationMs;
+		judgeUsage = jr.usage;
+		markdown = jr.markdown.trim()
+			? jr.markdown
+			: `# Multi-Model Socratic Discussion (moderator returned nothing)\n\nModerator \`${cfg.judge}\` failed (${jr.errorMessage ?? `stopReason=${jr.stopReason}`}); transcript follows.\n\n` +
+				synthesizeSocraticLeadView(target, socratic, label, detailHint);
+	} else {
+		markdown = synthesizeSocraticLeadView(target, socratic, label, detailHint);
+	}
+	if (prReport) markdown += `\n\n${prCommentsMarkdown(prReport, []).join("\n")}`;
+
+	const r1 = socratic.rounds[0]?.entries ?? [];
+	const failedSpecs = rows
+		.filter((_, idx) => !socratic.rounds.some((r) => r.entries[idx]?.ok))
+		.map((r) => r.rs.spec);
+	const totalTools = socratic.rounds.reduce((s, r) => s + r.entries.reduce((rs, e) => rs + (e.toolCalls ?? 0), 0), 0);
+	const details: MultiReviewDetails = {
+		target,
+		groups: [],
+		reviewerSpecs: r1.map((e) => e.spec),
+		failedSpecs,
+		judge: judgeLabel,
+		judgeDurationMs,
+		judgeUsage,
+		consensusCount: 0,
+		totalFindings: 0,
+		prComments: prReport,
+		socratic,
+	};
+	return {
+		kind: "inject",
+		notifyMessage:
+			`multi-review · ${label} · done\n` +
+			`topic: ${topic.slice(0, 100)}${topic.length > 100 ? "…" : ""}\n` +
+			`participants: ${rows.length}   rounds: ${socratic.rounds.length}/${totalRounds}   tool calls: ${totalTools}` +
+			(target.warnings.length ? `\nwarnings: ${target.warnings.length} (see discussion)` : ""),
+		notifyLevel: "info",
+		injectMessage: { customType: "multi-review", content: markdown, details },
+	};
 }
 
 /**
@@ -317,50 +512,14 @@ async function runReviewPipeline(
 			: { ...opts, timeoutMs: Math.max(MIN_PHASE_MS, Math.min(opts.timeoutMs, deadlineMs - Date.now() - reserveMs)) };
 	// Code only runs sandboxed, and never in quick runs (no tools there). The
 	// probe runs only when something would execute: checks or verification.
-	const mayExecute = (target.brief?.checks.length ?? 0) > 0 || flags.verify || (prReport?.claims.length ?? 0) > 0 ||
-		target.files.some((f) => CXX_FILE.test(f.path));
-	const sandboxReason = !cfg.sandbox
-		? "sandbox is off in multi-review.json"
-		: flags.quick || !runOpts.useTools
-			? "quick runs don't execute code"
-			: mayExecute ? await sandboxUnavailable(signal) : "nothing to execute";
-	throwIfAborted(signal);
-	if (!sandboxReason) {
-		// Starts the index refresh now, in parallel with checks and reviewers.
-		const xref = createXrefService(target.files.map((f) => f.path), runOpts.cwd ?? ctx.cwd, ctx.cwd, cfg.sandboxHomeDirs);
-		if (xref) {
-			runOpts = { ...runOpts, xref };
-			runOpts.cleanups?.push(() => xref.dispose());
-		}
-	}
-	if (cfg.webSearch && runOpts.useTools) {
-		// The proxy serves models without native search; it must search natively itself.
-		const proxy = findModel(ctx, cfg.webSearchProxyModel as ModelSpec);
-		const proxyModel = proxy && proxy.api === "anthropic-messages" ? proxy : undefined;
-		if (!proxyModel) target.warnings.push(`webSearchProxyModel ${cfg.webSearchProxyModel} is missing or not an anthropic-messages model; only natively searching models can search`);
-		runOpts = { ...runOpts, webSearch: { proxyModel, nativeApis: new Set(cfg.webSearchNativeApis) } };
-	}
-	const checks = [...(target.brief?.checks ?? [])];
-	let sandboxExtras: SandboxExtras = {};
-	if (cfg.autoChecks && !sandboxReason && !checks.some((c) => c.includes("mr-cxx-check"))) {
-		const auto = cxxAutoCheck(target.files.map((f) => f.path), runOpts.cwd ?? ctx.cwd, ctx.cwd, target.warnings, target.diffText);
-		if (auto) {
-			checks.unshift(auto.command);
-			sandboxExtras = auto.extras;
-		}
-	}
-	if (checks.length > 0 && sandboxReason) {
-		target.warnings.push(`checks not run: ${sandboxReason}`);
-	} else if (checks.length > 0) {
-		const reserve = REVIEW_RESERVE_MS + GROUPING_RESERVE_MS + (flags.verify ? VERIFY_RESERVE_MS : 0) + FINAL_RESERVE_MS;
-		const budget = Math.min(cfg.checkTimeoutSec * 1000, deadlineMs === undefined ? Number.POSITIVE_INFINITY : deadlineMs - Date.now() - reserve);
-		target.checkResults = await runChecks(runOpts.cwd ?? ctx.cwd, checks, budget, cfg.sandboxHomeDirs, sandboxExtras, signal, (what) =>
-			progress.update({ phase: `checks: ${what.length > 60 ? `${what.slice(0, 59)}…` : what}` }));
-		throwIfAborted(signal);
-		if (target.checkResults.some((r) => r.timedOut || r.skipped)) {
-			target.warnings.push(`some checks hit the ${cfg.checkTimeoutSec}s check budget; brief faster checks (type-check, one target, targeted tests)`);
-		}
-	}
+	const mayExecute = (target.brief?.checks.length ?? 0) > 0 || flags.verify || (prReport?.claims.length ?? 0) > 0;
+	const checkReserve = REVIEW_RESERVE_MS + GROUPING_RESERVE_MS + (flags.verify ? VERIFY_RESERVE_MS : 0) + FINAL_RESERVE_MS;
+	const prep = await prepareExecutionTools(
+		ctx, cfg, flags, target, runOpts,
+		mayExecute, true, checkReserve, signal, progress, deadlineMs,
+	);
+	runOpts = prep.runOpts;
+	const { sandboxReason, sandboxExtras } = prep;
 	const userPrompt = buildReviewUserPrompt(target);
 	progress.update({ phase: `fanning out to ${rows.length} reviewers (cap ${cfg.concurrency})`, done: 0, total: rows.length });
 	const runs = await runAllReviewers(

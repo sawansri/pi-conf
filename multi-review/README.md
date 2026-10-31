@@ -33,22 +33,24 @@ judge model writes the synthesis.
 
 | Surface | How |
 |---------|-----|
-| Slash command | `/multi-review [--spec=path] [--verify] [--quick] [--direct] [PR-number [--pr-comments [--author=login[,login]] [--nits] [--resolved]] \| free-text focus]` |
+| Slash command | `/multi-review [--socratic [--rounds=2]] [--spec=path] [--verify] [--quick] [--direct] [PR-number [--pr-comments [--author=login[,login]] [--nits] [--resolved]] \| free-text focus/topic]` |
+| Slash command | `/socratic [--rounds=2] [--spec=path] [--quick] [--direct] <topic or question>`: shortcut for `/multi-review --socratic` |
 | Slash command | `/multi-review-pick`: open the multi-select TUI picker to choose reviewer models from your registry (optionally saved to `multi-review.json`) |
-| LLM-callable tool | `multi_review({intent?, spec_path?, requirements?, suspicions?, context_files?, checks?, focus?, scope?, pr_number?, verify?, quick?, pr_comments?, comment_authors?, include_nits?, include_resolved?})`. The agent can call it on its own too |
+| LLM-callable tool | `multi_review({socratic?, topic?, rounds?, intent?, spec_path?, requirements?, suspicions?, context_files?, checks?, focus?, scope?, pr_number?, verify?, quick?, pr_comments?, comment_authors?, include_nits?, include_resolved?})`. The agent can call it on its own too |
 
 Tool parameters:
 
 | Param | Meaning |
 |-------|---------|
+| `socratic`, `topic`, `rounds` | Run a multi-round Socratic discussion (`socratic: true`, default `rounds: 2`, max 5) on `topic` (or `focus`) instead of a defect-finding review. Participants keep their tool-enabled sessions across rounds (see [Socratic discussion](#socratic-discussion)). |
 | `intent` | What the change must accomplish, plus facts reviewers can't find in the repo (external API behaviour, constraints, out-of-scope items). Goals, not a narration of the implementation. Reviewers challenge the execution, not the intent. |
 | `spec_path` | Repo-relative spec/design doc, passed to reviewers verbatim as the source of truth (60k char cap). |
 | `requirements` | Checkable requirements, one per item. Reviewers report unmet ones as category `spec`. |
 | `context_files` | Up to 12 paths reviewers get in full (callers, types, tests). |
 | `checks` | Up to 4 fast shell commands (type-check, targeted tests) run once in the sandbox before the fan-out; every reviewer and verifier sees the output. See [Executing code](#executing-code-tools-checks-and-the-sandbox). |
 | `focus` | Risk **areas** ("config-file merge lifecycle"), never hypotheses. A hint layered on the diff; it never replaces the diff. |
-| `suspicions` | The lead's own bug hypotheses (≤ 20). **Never shown to reviewers.** They're matched against what reviewers find independently and, with `verify`, cross-checked by verifiers. |
-| `scope` | `diff` (default: working tree vs default branch, or the PR) or `area` (no diff; review what `focus` describes). |
+| `suspicions` | The lead's own bug hypotheses or devil's-advocate challenges (≤ 20). **Never shown in Round 1.** In review mode they're matched against independent findings and cross-checked with `verify`; in Socratic mode they're posed in Round 2 for every participant to test against the code. |
+| `scope` | `diff` (default for review: working tree vs default branch, or the PR) or `area` (default for Socratic with a topic: no diff; explore the codebase with tools). |
 | `pr_number` | As for the slash command. |
 | `verify`, `quick` | Same as `--verify` / `--quick`. |
 | `pr_comments`, `comment_authors`, `include_nits`, `include_resolved` | With `pr_number`: triage the PR's existing review comments, optionally filtered by `comment_authors` (see below). |
@@ -123,6 +125,34 @@ Example, on lemonade #3765 (a shared-HF-cache model-deletion fix):
 - **Human comments** (the shared-cache ownership debate, the UI warning
   question) came through as questions and preferences for the lead to
   answer.
+
+## Socratic discussion
+
+`/socratic <topic>` (or `/multi-review --socratic [--rounds=2] <topic>`, or
+`multi_review({ socratic: true, topic: "..." })`) runs a multi-round Socratic
+inquiry across the configured models. Every participant has the **same tools
+as during review** (`read`, `grep`, `find`, `ls`, `git`, `progress`,
+`web_search`, `xref` for C/C++, and sandboxed `run`), and keeps its in-memory
+agent session across rounds so files read in Round 1 stay in context during
+Round 2+.
+
+1. **Round 1 — Independent Opening Inquiry & Socratic Questions.** Each
+   model investigates the repository with its tools and states its
+   **Position**, **Evidence & Mechanics** (`file:line` and git history),
+   **Assumptions & Failure Modes**, and 2–4 falsifiable **Socratic
+   Questions** aimed at testing hidden assumptions.
+2. **Round 2+ — Blind Socratic Cross-Examination (elenchus).** Each model
+   sees its peers' previous-round arguments and questions de-identified as
+   `Participant A`, `Participant B`, `Participant C` (preventing brand bias
+   or sycophancy), plus any lead `suspicions` posed as challenges. Models
+   use their tools to verify peers' code citations, answer peers' questions,
+   refute flawed claims with `file:line` evidence, and explicitly concede
+   and revise when a peer exposes a gap in their Round 1 position.
+3. **Synthesis.** The full multi-round transcript returns to the lead agent
+   (or the configured judge under `--direct`), which synthesizes **Topic ·
+   Participants · Dialectic Progression · Surviving Conclusions · Refuted
+   Assumptions & Claims · Genuine Tradeoffs & Open Questions · Recommended
+   Next Steps**.
 
 ## Brief discipline: what reviewers are told
 

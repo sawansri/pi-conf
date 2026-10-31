@@ -60,6 +60,23 @@ export function parseAuthorFlags(rawArgs: string): { authors: string[]; rest: st
 	return { authors, rest };
 }
 
+/**
+ * Pull `--socratic` / `--discuss` and `--rounds=<n>` out of the args.
+ * `--rounds=<n>` implies `--socratic`.
+ */
+export function parseSocraticFlags(rawArgs: string): { socratic: boolean; rounds?: number; rest: string } {
+	const soc = parseBoolFlag(rawArgs, "socratic");
+	const disc = parseBoolFlag(soc.rest, "discuss");
+	const roundsFlag = parseValueFlag(disc.rest, "rounds");
+	const n = roundsFlag.value !== undefined ? Number(roundsFlag.value) : undefined;
+	const rounds = n !== undefined && Number.isFinite(n) && n >= 1 ? Math.min(5, Math.floor(n)) : undefined;
+	return {
+		socratic: soc.present || disc.present || rounds !== undefined,
+		rounds,
+		rest: roundsFlag.rest,
+	};
+}
+
 // ---------- scope resolution ----------
 
 /**
@@ -104,7 +121,9 @@ export function parseReviewArgs(raw: string): ParsedReviewArgs {
 }
 
 const ARG_COMPLETIONS: Array<{ token: string; label: string; description: string }> = [
-	{ token: "--spec=", label: "--spec=<path>", description: "review the implementation against a spec file" },
+	{ token: "--socratic", label: "--socratic", description: "multi-round Socratic discussion on a topic instead of a code review" },
+	{ token: "--rounds=", label: "--rounds=<2>", description: "with --socratic: number of discussion rounds (default 2)" },
+	{ token: "--spec=", label: "--spec=<path>", description: "review or discuss against a spec file" },
 	{ token: "--verify", label: "--verify", description: "cross-check each finding with reviewers who didn't raise it" },
 	{ token: "--quick", label: "--quick", description: "fast reviewer pool, no tools" },
 	{ token: "--direct", label: "--direct", description: "skip the main agent; external judge synthesizes" },

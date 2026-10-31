@@ -4,7 +4,7 @@ import { type Model, type ReviewerSpec, type ThinkingLevelAlias, formatReviewerS
 import { type ReviewerFinding, type ReviewerRunResult, parseReviewerJson } from "./findings.ts";
 import { type ModelCallResult, callModel } from "./models.ts";
 import type { MultiReviewRunResult } from "./pipeline.ts";
-import { REVIEWER_TOOLS_ADDENDUM, VERIFIER_RUN_ADDENDUM, XREF_ADDENDUM } from "./prompts.ts";
+import { REVIEWER_TOOLS_ADDENDUM, SOCRATIC_TOOLS_ADDENDUM, VERIFIER_RUN_ADDENDUM, XREF_ADDENDUM } from "./prompts.ts";
 import type { SandboxExtras } from "./sandbox.ts";
 import { ReviewTrace, type ReviewerActivity } from "./trace.ts";
 import { abortable, withTimeout } from "./util.ts";
@@ -25,6 +25,150 @@ export interface AgenticExtras {
 	webSearch?: WebSearchOptions;
 	/** Nudge once when the reply is [] after fewer non-progress tool calls than this. */
 	minToolCalls?: number;
+}
+
+export interface ReviewerSession {
+	promptTurn(
+		userPrompt: string,
+		signal: AbortSignal,
+		onEvent?: (event: AgentSessionEvent) => void,
+		nudgeIfEmptyPrompt?: string,
+	): Promise<ModelCallResult>;
+	dispose(): void;
+}
+
+function lastTurnAssistantText(turnMessages: readonly unknown[]): string {
+	for (let i = turnMessages.length - 1; i >= 0; i--) {
+		const m = turnMessages[i] as { role?: string; content?: Array<{ type?: string; text?: string }> } | undefined;
+		if (m?.role !== "assistant" || !Array.isArray(m.content)) continue;
+		const text = m.content.filter((c) => c.type === "text").map((c) => c.text ?? "").join("").trim();
+		if (text) return text;
+	}
+	return "";
+}
+
+/**
+ * Create a nested pi agent session with the review toolset (read, grep, find,
+ * ls, git, progress, plus xref, web_search, and sandboxed run when configured).
+ * Can be prompted across multiple turns (used by Socratic discussions so
+ * participants retain the files they read in Round 1 when cross-examining in
+ * Round 2).
+ */
+export async function createReviewerSession(
+	ctx: ExtensionContext,
+	model: Model,
+	thinking: ThinkingLevelAlias,
+	systemPrompt: string,
+	cwd: string = ctx.cwd,
+	extras: AgenticExtras = {},
+): Promise<ReviewerSession> {
+	const progressState = { plan: [] as string[], done: 0, calls: 0 };
+	const customTools: Array<ReturnType<typeof createProgressTool> | ReturnType<typeof createGitTool> | ReturnType<typeof createRunTool> | ReturnType<typeof createXrefTool> | ReturnType<typeof createWebSearchTool>> = [
+		createProgressTool(progressState),
+		createGitTool(cwd),
+	];
+	if (extras.runDir) customTools.push(createRunTool(extras.runDir, extras.sandboxHomeDirs ?? [], extras.sandboxExtras));
+	if (extras.xref) customTools.push(createXrefTool(extras.xref));
+	const ws = extras.webSearch;
+	const nativeSearch = searchesNatively(model, ws);
+	if (ws?.proxyModel && !nativeSearch) customTools.push(createWebSearchTool(ctx, ws.proxyModel));
+	const settingsManager = SettingsManager.inMemory({});
+	const resourceLoader = new DefaultResourceLoader({
+		cwd,
+		agentDir: getAgentDir(),
+		settingsManager,
+		noExtensions: true,
+		noSkills: true,
+		noPromptTemplates: true,
+		noThemes: true,
+		noContextFiles: true,
+		systemPrompt,
+	});
+	await resourceLoader.reload();
+	const { session } = await createAgentSession({
+		cwd,
+		model,
+		thinkingLevel: thinking,
+		tools: ["read", "grep", "find", "ls", ...customTools.map((t) => t.name)],
+		customTools,
+		resourceLoader,
+		settingsManager,
+		sessionManager: SessionManager.inMemory(cwd),
+	});
+	let activeOnEvent: ((event: AgentSessionEvent) => void) | undefined;
+	if (nativeSearch) installNativeWebSearch(session, (ev) => activeOnEvent?.(ev));
+
+	return {
+		async promptTurn(userPrompt, signal, onEvent, nudgeIfEmptyPrompt) {
+			const started = Date.now();
+			progressState.plan = [];
+			progressState.done = 0;
+			const statsBefore = session.getSessionStats();
+			const msgCountBefore = session.messages.length;
+			activeOnEvent = onEvent;
+			const onAbort = () => void session.abort();
+			signal.addEventListener("abort", onAbort, { once: true });
+			const unsubscribe = onEvent ? session.subscribe(onEvent) : undefined;
+			try {
+				if (signal.aborted) throw new Error("aborted before start");
+				const aborted = new Error("aborted");
+				const prompt = (text: string) => abortable(session.prompt(text), signal, () => { throw aborted; });
+				await prompt(userPrompt);
+				let text = lastTurnAssistantText(session.messages.slice(msgCountBefore));
+				if (!signal.aborted && !text.trim() && nudgeIfEmptyPrompt) {
+					await prompt(nudgeIfEmptyPrompt);
+					text = lastTurnAssistantText(session.messages.slice(msgCountBefore));
+				}
+				const statsAfter = session.getSessionStats();
+				const turnMessages = session.messages.slice(msgCountBefore);
+				const last = [...turnMessages].reverse().find((m) => (m as { role?: string }).role === "assistant") as
+					| { stopReason?: string; errorMessage?: string }
+					| undefined;
+				const stopReason = last?.stopReason ?? "stop";
+				let errorMessage: string | undefined;
+				if (signal.aborted) errorMessage = `aborted: ${String(signal.reason ?? "cancelled")}`;
+				else if (stopReason === "error" || stopReason === "aborted") errorMessage = `${stopReason}: ${last?.errorMessage ?? "(no message)"}`;
+				else if (!text.trim()) errorMessage = "empty response";
+				return {
+					text,
+					stopReason,
+					errorMessage,
+					usage: {
+						input: Math.max(0, statsAfter.tokens.input - statsBefore.tokens.input),
+						output: Math.max(0, statsAfter.tokens.output - statsBefore.tokens.output),
+						total: Math.max(0, statsAfter.tokens.total - statsBefore.tokens.total),
+						cost: Math.max(0, statsAfter.cost - statsBefore.cost),
+					},
+					toolCalls: Math.max(0, statsAfter.toolCalls - statsBefore.toolCalls),
+					durationMs: Date.now() - started,
+				};
+			} catch (err) {
+				return {
+					text: "",
+					stopReason: "error",
+					errorMessage: signal.aborted ? `aborted: ${String(signal.reason ?? "cancelled")}` : (err instanceof Error ? err.message : String(err)),
+					durationMs: Date.now() - started,
+				};
+			} finally {
+				activeOnEvent = undefined;
+				signal.removeEventListener("abort", onAbort);
+				unsubscribe?.();
+			}
+		},
+		dispose() {
+			session.dispose();
+		},
+	};
+}
+
+/** Tool instructions appended to the system prompt for tool-using sessions. */
+export function buildToolPromptAddendum(model: Model, runOpts: ReviewerRunOptions, canRun: boolean, socratic = false): string {
+	return (
+		(socratic ? SOCRATIC_TOOLS_ADDENDUM : REVIEWER_TOOLS_ADDENDUM) +
+		(runOpts.xref ? XREF_ADDENDUM : "") +
+		(canRun ? VERIFIER_RUN_ADDENDUM : "") +
+		(webSearchAvailable(model, runOpts.webSearch) ? webSearchAddendum() : NO_WEB_ADDENDUM)
+	);
 }
 
 /**
@@ -201,8 +345,7 @@ export async function runReviewer(
 	const call = runOpts.useTools
 		? await runAgenticReviewer(
 			ctx, model, reviewerSpec.thinking,
-			systemPrompt + REVIEWER_TOOLS_ADDENDUM + (runOpts.xref ? XREF_ADDENDUM : "") + (canRun ? VERIFIER_RUN_ADDENDUM : "") +
-				(webSearchAvailable(model, runOpts.webSearch) ? webSearchAddendum() : NO_WEB_ADDENDUM),
+			systemPrompt + buildToolPromptAddendum(model, runOpts, canRun, false),
 			userPrompt, signal, runOpts.cwd ?? ctx.cwd, tracer?.onEvent,
 			{
 				runDir: canRun ? runOpts.cwd ?? ctx.cwd : undefined,
@@ -376,15 +519,15 @@ export async function runAllReviewers(
 	return results;
 }
 
-const STRAGGLER_MIN_GRACE_MS = 45_000;
-const STRAGGLER_GRACE_FACTOR = 1.0;
+export const STRAGGLER_MIN_GRACE_MS = 45_000;
+export const STRAGGLER_GRACE_FACTOR = 1.0;
 /**
  * Stragglers are never cut before this much total time. Reviewer times vary
  * 2-5x between runs, so a deadline relative to a fast quorum alone cut
  * healthy main reviewers (Argon@medium ~270s, gpt-6.1-sol@high ~160s).
  * reviewerTimeoutSec still caps the wait.
  */
-const STRAGGLER_MIN_TOTAL_MS = 300_000;
+export const STRAGGLER_MIN_TOTAL_MS = 300_000;
 
 /** Successful answers needed before stragglers get a deadline; pools of ≤2 always wait for everyone. */
 export function stragglerQuorum(total: number): number {

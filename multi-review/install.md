@@ -221,6 +221,13 @@ file; nothing is posted:
 /multi-review #1234 --author=!bot
 ```
 
+Run a multi-round Socratic discussion on a topic (models get the same
+repo tools as during review):
+```
+/socratic how should we structure the sandbox lifecycle across sessions?
+/multi-review --socratic --rounds=3 is our token refresh path race-free?
+```
+
 Fast first look:
 ```
 /multi-review --quick

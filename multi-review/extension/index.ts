@@ -40,6 +40,7 @@
  *   checks      brief/auto checks (mr-cxx-check), check output for prompts and results
  *   xref        clangd navigation service and tool
  *   web-search  web search for reviewers: native where the gateway serves it, else proxied
+ *   socratic    multi-round Socratic discussion on a topic with review tools
  *   grouping    clustering findings into issues (model, lexical fallback), suspicions
  *   verify      verification round: assignment, verifier prompt, verdicts
  *   pr-comments fetching and classifying a PR's existing review comments
@@ -57,11 +58,11 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Text } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
-import { completeReviewArgs, parseAuthorFlags, parseBoolFlag, parseReviewArgs, parseReviewFlags, parseValueFlag } from "./src/args.ts";
+import { completeReviewArgs, parseAuthorFlags, parseBoolFlag, parseReviewArgs, parseReviewFlags, parseSocraticFlags, parseValueFlag } from "./src/args.ts";
 import { readSpecFile } from "./src/brief.ts";
 import { DEFAULTS, cacheConfigForFreshRead, loadConfig } from "./src/config.ts";
 import { runAgentLedReview, runHeadless } from "./src/headless.ts";
-import { buildHandoffPrompt } from "./src/lead.ts";
+import { buildHandoffPrompt, buildSocraticHandoffPrompt } from "./src/lead.ts";
 import { describePool } from "./src/models.ts";
 import { persistReviewerChoices, pickReviewersViaTUI } from "./src/picker.ts";
 import { runMultiReviewFromArgs, setTransientReviewers } from "./src/pipeline.ts";
@@ -126,7 +127,8 @@ export default function (pi: ExtensionAPI) {
 		args = direct.rest;
 		if (!direct.present && ctx.hasUI && ctx.model) {
 			const { flags, rest: afterFlags } = parseReviewFlags(args, { verify: cfg.verify, quick: false });
-			const { value: specPath, rest: afterSpec } = parseValueFlag(afterFlags, "spec");
+			const socraticFlags = parseSocraticFlags(afterFlags);
+			const { value: specPath, rest: afterSpec } = parseValueFlag(socraticFlags.rest, "spec");
 			const prC = parseBoolFlag(afterSpec, "pr-comments");
 			const nits = parseBoolFlag(prC.rest, "nits");
 			const resolvedThreads = parseBoolFlag(nits.rest, "resolved");
@@ -158,7 +160,9 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 			}
-			const prompt = buildHandoffPrompt(rest, flags, specPath, prComments);
+			const prompt = socraticFlags.socratic
+				? buildSocraticHandoffPrompt(rest, flags, specPath, socraticFlags.rounds, prComments)
+				: buildHandoffPrompt(rest, flags, specPath, prComments);
 			if (ctx.isIdle()) pi.sendUserMessage(prompt);
 			else pi.sendUserMessage(prompt, { deliverAs: "followUp" });
 			return;
@@ -173,9 +177,9 @@ export default function (pi: ExtensionAPI) {
 	// Slash command — surface-level UI entry point.
 	pi.registerCommand("multi-review", {
 		description:
-			"Fan-out code review across configured models. Usage: " +
-			"/multi-review [--spec=path] [--verify] [--quick] [--direct] [PR-number [--pr-comments [--author=login[,login]] [--nits] [--resolved]] | free-text focus]. " +
-			"The main agent drafts the reviewer brief from your args (and spec), then judges the results. " +
+			"Fan-out code review or Socratic discussion across configured models. Usage: " +
+			"/multi-review [--socratic [--rounds=2]] [--spec=path] [--verify] [--quick] [--direct] [PR-number [--pr-comments [--author=login[,login]] [--nits] [--resolved]] | free-text focus/topic]. " +
+			"The main agent drafts the brief from your args (and spec), then judges or synthesizes the results. " +
 			"--direct skips the agent and uses the configured judge.",
 		// Argument autocomplete hints the call shape so users don't have to
 		// remember to type '#' vs raw digits.
@@ -186,6 +190,17 @@ export default function (pi: ExtensionAPI) {
 			// hard-cancel mid-fan-out from here. The tool surface (next
 			// sibling) does pass signal — ctrl+c in tool context works.
 			await runWithOptionalPicker(args, ctx);
+		},
+	});
+
+	// Slash command — dedicated shortcut for Socratic discussions.
+	pi.registerCommand("socratic", {
+		description:
+			"Multi-model Socratic discussion on a topic with read-only repo tools. Usage: " +
+			"/socratic [--rounds=2] [--spec=path] [--quick] [--direct] <topic or question>.",
+		getArgumentCompletions: (prefix) => completeReviewArgs(prefix),
+		handler: async (args, ctx) => {
+			await runWithOptionalPicker(`--socratic ${args}`.trim(), ctx);
 		},
 	});
 
@@ -247,27 +262,42 @@ export default function (pi: ExtensionAPI) {
 	// LLM-callable tool — the main agent briefs the reviewers and judges the results.
 	pi.registerTool({
 		name: "multi_review",
-		label: "Multi-Model Code Review",
+		label: "Multi-Model Code Review & Socratic Discussion",
 		description:
-			"Send a code change to N reviewer models (other model families, each with read-only repo access) in parallel. " +
-			"You write the brief: intent, optional spec + requirements, related files, focus. Returns deduplicated findings " +
-			"with per-model attribution; you then act as lead reviewer and give the user a verdict. Read-only — never edits code.",
+			"Send a code change or technical topic to N models (other model families, each with read-only repo access and tools) in parallel. " +
+			"For code review: you write the brief (intent, optional spec + requirements, related files, focus) and act as lead reviewer on deduplicated findings. " +
+			"For Socratic discussion (`socratic: true`): models investigate the topic with the same repo tools, pose Socratic questions, cross-examine each other's positions across rounds, and you synthesize the outcome. Read-only — never edits code.",
 		promptSnippet:
-			"Run a multi-model code review on the current change (PR, working-tree diff, or a described area), optionally against a spec.",
+			"Run a multi-model code review (PR, working-tree diff, or area) or a multi-round Socratic discussion on a topic (`socratic: true`), with read-only repo tools.",
 		promptGuidelines: [
-			"Use multi_review when the user asks for a code review, a second opinion, or a check of an implementation against a spec.",
-			"Before calling, understand the change yourself and write the brief: reviewers do not see the conversation. Give them what they can't discover, not where you think the bugs are — independent discovery is what makes their agreement meaningful.",
-			"`intent`: goals plus facts reviewers can't find in the repo (external API behaviour, constraints, out-of-scope items) — not a narration of the implementation. With a spec, pass spec_path and list its checkable requirements.",
-			"`focus`: risk areas only, never hypotheses. Put your specific bug hypotheses in `suspicions`; they are hidden from reviewers and checked against what they find on their own.",
-			"`context_files` are repo paths reviewers should read in full (callers, types, tests) — not files already whole in the diff.",
-			"`checks` are up to 4 fast commands (type-check, targeted tests) run once in a sandbox (repo read-only, no network) before the review; reviewers see their output. C/C++ changes are compile-checked automatically.",
-			"Set verify=true for high-stakes changes (independent cross-check of every finding); quick=true for small diffs or a cheap first look.",
+			"Use multi_review when the user asks for a code review, a second opinion, a check of an implementation against a spec, or a Socratic discussion/debate among models on a topic.",
+			"When the user asks for a Socratic discussion about a topic, set `socratic: true` and pass the question or design tension in `topic` (framed neutrally without biasing the models toward your preferred conclusion), plus relevant `context_files` and `intent`. Models keep their tool-enabled sessions across rounds (default `rounds: 2`) to cross-examine peers' claims against the code.",
+			"Before calling, understand the change or topic yourself and write the brief: models do not see the conversation. Give them what they can't discover, not where you think the bugs are or which answer you prefer — independent discovery is what makes their agreement meaningful.",
+			"`intent`: goals plus facts models can't find in the repo (external API behaviour, constraints, out-of-scope items) — not a narration of the implementation. With a spec, pass spec_path and list its checkable requirements.",
+			"`focus`: risk areas only, never hypotheses. Put your specific bug hypotheses or devil's-advocate challenges in `suspicions`; they are hidden from Round 1 and checked against independent findings (or tested in Round 2 of a Socratic discussion).",
+			"`context_files` are repo paths models should read in full (callers, types, tests) — not files already whole in the diff.",
+			"`checks` are up to 4 fast commands (type-check, targeted tests) run once in a sandbox (repo read-only, no network) before the fan-out; models see their output. C/C++ changes are compile-checked automatically.",
+			"Set verify=true for high-stakes reviews (independent cross-check of every finding); quick=true for small diffs or a cheap first look.",
 			"For a PR that already has review comments (CodeRabbit, collaborators), set pr_comments=true to triage them (and pass `comment_authors` when filtering by specific GitHub login(s), `'bot'`, `'human'`, or `'!login'`): each is verified and you report valid/invalid per comment plus new issues, and draft replies to a local file. Never post to GitHub.",
-			"After results return, follow the lead-judgment instructions in the result. Do not apply fixes unless asked.",
+			"After results return, follow the lead-judgment or lead-moderator instructions in the result. Do not apply fixes unless asked.",
 		],
 		parameters: Type.Object({
+			socratic: Type.Optional(Type.Boolean({
+				description:
+					"Run a multi-round Socratic discussion on `topic` (or `focus`) instead of a defect-finding code review. " +
+					"Models use the same repo tools, form opening positions and Socratic questions in Round 1, and cross-examine each other in Round 2+.",
+			})),
+			topic: Type.Optional(Type.String({
+				description: "With socratic=true: the topic, question, or design tradeoff to examine Socratically (state neutrally).",
+				maxLength: 4000,
+			})),
+			rounds: Type.Optional(Type.Number({
+				description: "With socratic=true: number of discussion rounds (default 2: opening inquiry + Socratic cross-examination; max 5).",
+				minimum: 1,
+				maximum: 5,
+			})),
 			intent: Type.Optional(Type.String({
-				description: "One paragraph: what the change is supposed to accomplish and which constraints matter.",
+				description: "One paragraph: what the change is supposed to accomplish (or background context for Socratic discussion) and which constraints matter.",
 				maxLength: 4000,
 			})),
 			spec_path: Type.Optional(Type.String({
@@ -279,8 +309,8 @@ export default function (pi: ExtensionAPI) {
 			})),
 			suspicions: Type.Optional(Type.Array(Type.String({ maxLength: 600 }), {
 				description:
-					"Your own hypotheses about possible bugs. NOT shown to reviewers (they'd anchor on them); checked against " +
-					"what reviewers find independently and, with verify, cross-checked by verifiers.",
+					"Your own hypotheses about possible bugs or devil's-advocate challenges. NOT shown in Round 1 (they'd anchor models); " +
+					"checked against what reviewers find independently (or posed as Round 2 Socratic challenges).",
 				maxItems: 20,
 			})),
 			context_files: Type.Optional(Type.Array(Type.String(), {
@@ -293,8 +323,8 @@ export default function (pi: ExtensionAPI) {
 			})),
 			scope: Type.Optional(StringEnum(["diff", "area"] as const, {
 				description:
-					"'diff' (default): the working-tree diff vs the default branch, or the PR when pr_number is set. " +
-					"'area': no diff — review the part of the codebase described in `focus` (reviewers explore it with tools).",
+					"'diff' (default for review): the working-tree diff vs the default branch, or the PR when pr_number is set. " +
+					"'area' (default for socratic with a topic): no diff — explore the codebase with tools.",
 			})),
 			pr_number: Type.Optional(Type.Number({
 				description: "PR number to review (e.g. 4321 from a GitHub PR URL). Omit to review the working-tree diff.",

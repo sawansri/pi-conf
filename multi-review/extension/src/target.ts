@@ -4,7 +4,7 @@ import * as path from "node:path";
 import type { ExtensionAPI, ExecResult } from "@mariozechner/pi-coding-agent";
 import type { ParsedReviewArgs } from "./args.ts";
 import type { ReviewBrief } from "./brief.ts";
-import type { CheckResult } from "./checks.ts";
+import { CXX_FILE, type CheckResult } from "./checks.ts";
 import { discoverSourceFiles } from "./discover.ts";
 
 /**
@@ -256,6 +256,8 @@ async function buildTextTarget(pi: ExtensionAPI, cwd: string, hint: string): Pro
 	const result = await discoverSourceFiles(pi, cwd);
 	if (result.files.length > 0) {
 		const capped = result.files.slice(0, 200);
+		const cxx = !capped.some((f) => CXX_FILE.test(f)) ? result.files.find((f) => CXX_FILE.test(f)) : undefined;
+		if (cxx) capped[capped.length - 1] = cxx;
 		target.files = capped.map((path) => ({ path, lines: 0 }));
 		target.metaLines.push(
 			`directory listing: ${result.files.length} file${result.files.length === 1 ? "" : "s"} ` +

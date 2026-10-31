@@ -43,6 +43,15 @@ You have read-only tools (read, grep, find, ls, git) on the repository. Use them
 
 Report progress with the progress tool so the lead can see how far along you are: first call it with \`plan\`, the 3–8 specific things you will check (areas, functions, or claims), then call it with \`done\` naming each one as you finish it.`;
 
+/** Appended when a Socratic discussion participant runs as a nested agent with tools. */
+export const SOCRATIC_TOOLS_ADDENDUM = `
+
+You have read-only tools (read, grep, find, ls, git) on the repository. Use them to inspect relevant files, callers, types, tests, and history before stating a position or challenging a peer's claim — ground your arguments and questions in concrete file:line evidence rather than speculation.
+
+\`git\` runs log, show, blame, or diff: use blame and log on relevant lines to learn why the code is the way it is. For the behaviour of a third-party library or tool, read its source on disk first (node_modules, vendored directories, system headers, installed packages) instead of assuming.
+
+Report progress with the progress tool so the moderator can see how far along you are: first call it with \`plan\`, the 3–6 specific things you will check (files, functions, or claims), then call it with \`done\` naming each one as you finish it.`;
+
 /** Appended when the review touches C/C++ and clangd is available. */
 export const XREF_ADDENDUM = `
 

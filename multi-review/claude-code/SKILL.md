@@ -1,7 +1,7 @@
 ---
 name: multi-review
-description: Multi-model code review through pi's multi-review extension. Reviewers from other model families (Sonnet 5.5, gpt-6.1-sol, gpt-6-luna; Gemini 4 Argon as a verifier), each with read-only repo access, review the current change, a PR, or a spec implementation in parallel. You write the brief, act as lead reviewer on their findings, and, if asked, fix the issues test-first and confirm the fixes with a re-review. Also verifies a PR's existing review comments (CodeRabbit, other bots, collaborators; filterable by author): which are real, which are wrong, and what they missed, with draft replies (never posted). Use when the user asks for a multi-model review, a second opinion from other models, a check of an implementation against a spec, whether CodeRabbit's or specific reviewers' PR comments are valid or real, or to fix and confirm review findings.
-argument-hint: "[--spec=path] [--verify] [--quick] [#PR [--pr-comments [--author=login[,login]] [--nits] [--resolved]] | area to review]"
+description: Multi-model code review and Socratic discussion through pi's multi-review extension. Reviewers from other model families (Sonnet 5.5, gpt-6.1-sol, gpt-6-luna; Gemini 4 Argon as a verifier), each with read-only repo access and tools, review the current change, a PR, or a spec implementation in parallel — or hold a multi-round Socratic discussion on a topic when asked. You write the brief, act as lead reviewer or moderator on their output, and, if asked, fix issues test-first and confirm with a re-review. Also verifies a PR's existing review comments (CodeRabbit, other bots, collaborators; filterable by author): which are real, which are wrong, and what they missed, with draft replies (never posted). Use when the user asks for a multi-model review, a Socratic discussion/debate among models on a topic, a second opinion from other models, a check of an implementation against a spec, whether CodeRabbit's or specific reviewers' PR comments are valid, or to fix and confirm review findings.
+argument-hint: "[--socratic [--rounds=2]] [--spec=path] [--verify] [--quick] [#PR [--pr-comments [--author=login[,login]] [--nits] [--resolved]] | area or topic]"
 allowed-tools: Bash(pi -p *) Bash(mkdir *) Bash(git diff *) Bash(git log *) Bash(git show *) Bash(git status *) Bash(git merge-base *) Bash(git rev-parse *) Bash(gh pr view *) Bash(gh pr diff *) Read Write
 ---
 
@@ -10,11 +10,12 @@ allowed-tools: Bash(pi -p *) Bash(mkdir *) Bash(git diff *) Bash(git log *) Bash
 You are the lead reviewer. pi's `multi-review` extension runs the reviewers. You understand the change, write their brief, run the review, then judge the findings with the context they don't have. Do not edit code during this task unless the user asks.
 
 Arguments: `$ARGUMENTS`
+- `--socratic` (or `--discuss`): run a multi-round Socratic discussion on a topic instead of a defect-finding code review. Models have the same repo tools (`read`, `grep`, `find`, `ls`, `git`, `xref`, `web_search`, and sandboxed `run`), form opening positions and Socratic questions in Round 1, and cross-examine each other in Round 2+. `--rounds=<n>` sets the round count (default 2, max 5).
 - `--spec=<path>`: a spec/design doc that is the source of truth.
 - `--verify`: each finding (and each of your suspicions) is cross-checked by reviewers who didn't raise it. Costs ~1.5–2×. Use it for high-stakes changes.
 - `--quick`: a fast pool without repo tools (10–50s). Good for small diffs or a first look.
-- `#123` or a PR URL: review that PR. Any other text is either a focus for the diff review or, if there is no change to review, the area to review.
-- `--author=<login[,login]>` / `--pr-comments`: author filtering is parsed and active by default in any scenario. Passing `--author=<login[,login]>` (or setting `"comment_authors"` / `"author"` in `brief.json`) automatically enables PR comment/review triage filtered to those author(s) without needing `--pr-comments` separately. Supports GitHub logins (`alice`, `@alice`, `coderabbitai[bot]`), bot shorthands (`coderabbit`, `copilot`), `human`, `bot`, and `!pattern` exclusions (`!bot`, `!coderabbit`). `--nits` includes nitpicks, and `--resolved` re-checks resolved threads.
+- `#123` or a PR URL: review or discuss that PR. Any other text is either a focus for the diff review, the area to review, or (with `--socratic`) the topic to discuss.
+- `--author=<login[,login]>` / `--pr-comments`: author filtering is parsed and active by default in any scenario (regular PR reviews, `--pr-comments`, and Socratic discussions). Passing `--author=<login[,login]>` (or setting `"comment_authors"` / `"author"` in `brief.json`) automatically enables PR comment/review triage filtered to those author(s) without needing `--pr-comments` separately. Supports GitHub logins (`alice`, `@alice`, `coderabbitai[bot]`), bot shorthands (`coderabbit`, `copilot`), `human`, `bot`, and `!pattern` exclusions (`!bot`, `!coderabbit`). `--nits` includes nitpicks, and `--resolved` re-checks resolved threads.
 
 **Never post to GitHub.** Don't comment, review, reply, or resolve threads, whether with `gh` or the API. Replies are drafted into a local file for the user to post.
 
@@ -33,8 +34,9 @@ If this conversation produced the change, you already have most of this. Still l
 
 Reviewers do NOT see this conversation. Give them what they can't discover, but not where you think the bugs are. Independent discovery is the point. Hypotheses in the brief anchor every reviewer on the same spots, turn "consensus" into an echo of your prompt, and copy your blind spots into theirs.
 
-Write a JSON file (e.g. `/tmp/multi-review/<timestamp>/brief.json`; create the directory first). All fields are optional; text fields are strings, list fields are arrays of strings:
+Write a JSON file (e.g. `/tmp/multi-review/<timestamp>/brief.json`; create the directory first). All fields are optional; text fields are strings, list fields are arrays of strings.
 
+For a **code review**:
 ```json
 {
   "intent": "Implement Phase 1 of agent-roadmap.md: … Facts outside this repo: pi's models.json apiKey supports ${NAME} interpolation; … Out of scope: …",
@@ -48,19 +50,32 @@ Write a JSON file (e.g. `/tmp/multi-review/<timestamp>/brief.json`; create the d
 }
 ```
 
+For a **Socratic discussion** (when `--socratic` / `--discuss` is passed, or when the user asks the models to have a Socratic discussion, debate, or deliberate on a topic):
+```json
+{
+  "socratic": true,
+  "topic": "Should clangd background indexing be shared across PR worktrees or isolated per worktree, given concurrent review runs?",
+  "rounds": 2,
+  "intent": "Background: reviews run in Landlock sandboxes where the repo is read-only and ~/.local/share/multi-review/clangd-index/<repo> is writable.",
+  "context_files": ["multi-review/extension/src/xref.ts", "multi-review/extension/src/sandbox.ts"],
+  "suspicions": ["Two concurrent PR reviews on different commits of the same repo may overwrite compile_commands.json in the shared indexDir"]
+}
+```
+
 | Field | Content |
 |---|---|
-| `intent` | What the change must accomplish, plus facts reviewers can't find in the repo: external tool/API behaviour, deployment constraints, what's deliberately out of scope. State goals; don't narrate the implementation, which reviewers verify for themselves. |
+| `socratic`, `topic`, `rounds` | For Socratic discussions: set `"socratic": true`, state `"topic"` as a neutral open inquiry or design tension (never telegraph which answer you prefer), and optionally set `"rounds"` (default 2: Round 1 opening inquiry + Socratic questions, Round 2 blind cross-examination; max 5). Models have the same repo tools as during review and keep their tool-enabled sessions across rounds. Any `suspicions` you brief are hidden in Round 1 (no anchoring) and posed in Round 2 as Socratic challenges for every participant to test against the code. |
+| `intent` | What the change must accomplish (or background context for a Socratic discussion), plus facts models can't find in the repo: external tool/API behaviour, deployment constraints, what's deliberately out of scope. State goals; don't narrate the implementation, which models verify for themselves. |
 | `spec_path` | The spec path exactly as the user gave it: repo-relative or absolute (don't rewrite an absolute path; the spec may live outside the repo). Its text goes to reviewers verbatim. |
 | `requirements` | With a spec: every concrete, checkable requirement, one per item, including the edge cases and error behaviour it pins down. Without one: only explicit acceptance criteria. |
-| `context_files` | Up to 8 repo paths reviewers should read in full beyond the diff: callers, types/interfaces, tests that pin the behaviour. |
+| `context_files` | Up to 8 repo paths models should read in full beyond the diff: callers, types/interfaces, tests that pin the behaviour. |
 | `checks` | Up to 4 fast commands that type-check or run the tests covering the change, finishing well under 2 minutes in total. They run once before the review in a sandbox where the repo is read-only and there is no network, so skip in-tree builds and anything that downloads. Changed C/C++ files get a compile + cppcheck check automatically when a `compile_commands.json` exists; don't add one yourself. Never the full suite. |
 | `focus` | Risk AREAS only ("API-key handling across agents", "config-file merge lifecycle"), never hypotheses ("does X compile?"). |
-| `suspicions` | Your specific bug hypotheses, one per item. Hidden from reviewers. They're matched against what reviewers find independently, and with `verify` they're cross-checked. |
-| `scope` | `"area"` only when there is no change to review and `focus` describes the area; otherwise omit it. |
-| `pr_number` | For PR reviews. |
+| `suspicions` | Your specific bug hypotheses or devil's-advocate challenges, one per item. Hidden in Round 1. In review mode they're matched against independent findings and cross-checked with `verify`; in Socratic mode they're posed as Round 2 challenges. |
+| `scope` | `"area"` when there is no change to review and `focus`/`topic` describes the area/topic (default for `socratic: true` with a topic); `"diff"` when reviewing or discussing the uncommitted working-tree diff. |
+| `pr_number` | For PR reviews or PR discussions. |
 | `verify`, `quick` | From the arguments. |
-| `pr_comments`, `comment_authors`, `include_nits`, `include_resolved` | Author filtering is on by default in any scenario: passing `"comment_authors"` (or `"author"` / `"authors"`, e.g. `["coderabbitai"]`, `["alice", "bob"]`, `["human"]`, `["bot"]`, `["!bot"]`) automatically enables `pr_comments` without needing `"pr_comments": true` separately. Omit `comment_authors` to check all authors when `pr_comments: true`. **Do not copy PR comments into the brief** (not `focus`, not `suspicions`): reviewers must find issues independently, so agreement with a comment means something. Your own suspicions are still fine. |
+| `pr_comments`, `comment_authors`, `include_nits`, `include_resolved` | Author filtering is on by default in any scenario (regular review, `--pr-comments`, or Socratic discussion): passing `"comment_authors"` (or `"author"` / `"authors"`, e.g. `["coderabbitai"]`, `["alice", "bob"]`, `["human"]`, `["bot"]`, `["!bot"]`) automatically enables `pr_comments` without needing `"pr_comments": true` separately. Omit `comment_authors` to check all authors when `pr_comments: true`. **Do not copy PR comments into the brief** (not `focus`, not `suspicions`): models must investigate independently. |
 
 ## 3. Run the review
 
@@ -112,6 +127,15 @@ Your reply adds, as the Lead judgment section asks:
 - **New issues not mentioned on the PR:** what this review found beyond the existing comments.
 
 Then write `<dir>/pr-replies.md`: one section per comment with its link, the verdict, and a ready-to-paste reply. Valid → what will be fixed and how. Invalid → the code evidence. Question → the answer. Tell the user the path. **Do not post anything.**
+
+### With `--socratic`: moderate and synthesize the discussion
+
+Read `<dir>/result.md`. It contains each round of the Socratic discussion (`Round 1 — Opening Inquiry & Socratic Questions`, `Round 2 — Socratic Cross-Examination & Revised Positions`, etc.) with each participant's position, code evidence, assumptions, questions, refutations, and concessions, followed by the **Lead moderator synthesis** instructions. Follow that section:
+- weigh arguments by `file:line` evidence and code mechanics rather than majority vote;
+- note which Round 1 assumptions or claims were conceded or refuted during cross-examination;
+- if participants remain split on a factual claim about the code, read the relevant `file:line` yourself to settle it.
+
+Reply in its format: Topic · Participants · (Spec & Constraint Alignment) · Dialectic Progression · Surviving Conclusions · Refuted Assumptions & Claims · Genuine Tradeoffs & Open Questions · Recommended Next Steps.
 
 ## 5. If the user asks you to fix
 

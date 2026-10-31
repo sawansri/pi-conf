@@ -16,10 +16,10 @@ const ACTIVITY_REFRESH_MS = 2_000;
 /** Stderr heartbeat cadence for print mode. */
 export const ACTIVITY_LOG_MS = 30_000;
 
-/** What one reviewer or verifier session is doing right now. */
+/** What one reviewer, verifier, or Socratic discussion session is doing right now. */
 export interface ReviewerActivity {
 	reviewer: string;
-	phase: "review" | "verify";
+	phase: "review" | "verify" | `round ${number}`;
 	state: "running" | "ok" | "failed";
 	startedAt: number;
 	finishedAt?: number;

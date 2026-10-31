@@ -58,6 +58,53 @@ export function buildHandoffPrompt(
 	return lines.join("\n");
 }
 
+/**
+ * Turn a `/socratic` or `/multi-review --socratic` invocation into a task for
+ * the main agent: frame the inquiry neutrally, call `multi_review` with
+ * `socratic: true`, then moderate and synthesize the multi-round discussion.
+ */
+export function buildSocraticHandoffPrompt(
+	rawArgs: string,
+	flags: ReviewFlags,
+	specPath: string | undefined,
+	rounds?: number,
+	prComments?: { includeNits: boolean; includeResolved: boolean; authors?: string[] },
+): string {
+	const parsed = parseReviewArgs(rawArgs);
+	const topicText = parsed.kind === "text" ? parsed.value : parsed.kind === "pr" ? parsed.raw : "";
+	const effectiveAuthors = prComments?.authors?.length ? prComments.authors : flags.authors;
+	const wantPrComments = Boolean(prComments || effectiveAuthors?.length);
+	const lines: string[] = [];
+	lines.push(`The user asked for a multi-model Socratic discussion${rawArgs.trim() ? `: \`${rawArgs.trim()}\`` : ""}. You are the lead moderator. Do not edit code during this task.`);
+	lines.push("");
+	lines.push("1. **Understand the topic.** Inspect the relevant files in the repository (and the diff or PR if one is in scope) so you understand the context before briefing the participants. If the user's question is ambiguous, clarify it first.");
+	if (specPath) {
+		lines.push(`2. **Spec.** Read \`${specPath}\` in full; it is passed to all participants as reference context.`);
+	}
+	lines.push(`${specPath ? "3" : "2"}. **Brief.** Call the \`multi_review\` tool once with \`socratic: true\`. Participants are other model families with the same repo tools as reviewers (\`read\`, \`grep\`, \`find\`, \`ls\`, \`git\`, \`xref\`, \`web_search\`, and sandboxed \`run\`). They do NOT see this conversation:`);
+	lines.push(`   - \`socratic\`: true`);
+	lines.push(`   - \`topic\`: the central question, problem, or design tradeoff to examine Socratically${topicText ? ` (from the user: ${JSON.stringify(topicText)})` : ""}. Frame it as a neutral, open inquiry — do NOT telegraph which answer you prefer.`);
+	if (rounds !== undefined) lines.push(`   - \`rounds\`: ${rounds}`);
+	lines.push("   - `intent`: background context, goals, and external facts participants cannot discover from the repo alone.");
+	if (specPath) {
+		lines.push(`   - \`spec_path\`: "${specPath}"`);
+		lines.push("   - `requirements`: key constraints or requirements from the spec.");
+	}
+	lines.push("   - `context_files`: up to 8 repo paths directly relevant to the topic so participants have immediate starting points alongside their tools.");
+	lines.push("   - `checks`: optional fast commands (type-check, targeted test) if build/test output informs the discussion.");
+	lines.push("   - `suspicions`: your own hypotheses, devil's-advocate counter-examples, or subtle edge cases. They are hidden in Round 1 (so opening positions are independent) and posed in Round 2 as Socratic challenges for every participant to test against the code.");
+	if (parsed.kind === "pr") lines.push(`   - \`pr_number\`: ${parsed.number}`);
+	else if (!topicText) lines.push(`   - \`scope\`: "diff"`);
+	else lines.push(`   - \`scope\`: "area" (unless the discussion is specifically about the uncommitted working-tree diff, in which case use \`"diff"\`)`);
+	if (wantPrComments) {
+		const authorsOpt = effectiveAuthors?.length ? `, \`comment_authors\`: ${JSON.stringify(effectiveAuthors)}` : "";
+		lines.push(`   - \`pr_comments\`: true${authorsOpt}${prComments?.includeNits ? ", `include_nits`: true" : ""}${prComments?.includeResolved ? ", `include_resolved`: true" : ""}`);
+	}
+	if (flags.quick) lines.push("   - `quick`: true (fast pool, no tools)");
+	lines.push(`${specPath ? "4" : "3"}. **Synthesize.** When results return, follow the Lead moderator synthesis instructions in the tool result.`);
+	return lines.join("\n");
+}
+
 /** Appended to the tool result: the main agent is the final judge (pstack-style buckets). */
 export function leadJudgmentInstructions(hasSpec: boolean, prNumber?: number): string {
 	const lines = [

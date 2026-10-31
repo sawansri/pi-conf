@@ -4,6 +4,7 @@ import type { ModelSpec } from "./config.ts";
 import type { ReviewerFinding } from "./findings.ts";
 import type { DedupeGroup, SuspicionResult, Verification } from "./grouping.ts";
 import type { PrCommentsReport } from "./pr-comments.ts";
+import { type SocraticDetails, summarizeSocraticEntry } from "./socratic.ts";
 import { formatRange } from "./synthesis.ts";
 import type { ReviewTarget } from "./target.ts";
 import { verificationTally } from "./verify.ts";
@@ -29,6 +30,8 @@ export interface MultiReviewDetails {
 	markdown?: string;
 	suspicions?: SuspicionResult[];
 	prComments?: PrCommentsReport;
+	/** Multi-round Socratic discussion details, when run in socratic mode. */
+	socratic?: SocraticDetails;
 }
 
 const SEVERITY_COLOR: Record<ReviewerFinding["severity"], "error" | "warning" | "accent" | "muted" | "dim"> = {
@@ -60,9 +63,11 @@ export function renderMultiReviewMessage(
 	const box = new Box(1, 1, (t: string) => theme.bg("customMessageBg", t));
 	box.addChild(container);
 
-	const headline = `${theme.fg("toolTitle", theme.bold("multi-review"))} · ${
-		details ? `${details.groups.length} groups, ${details.consensusCount} consensus` : "(no payload)"
-	}`;
+	const headline = details?.socratic
+		? `${theme.fg("toolTitle", theme.bold("multi-review · socratic"))} · ${details.socratic.rounds.length} round${details.socratic.rounds.length === 1 ? "" : "s"}, ${details.reviewerSpecs.length} participant${details.reviewerSpecs.length === 1 ? "" : "s"}`
+		: `${theme.fg("toolTitle", theme.bold("multi-review"))} · ${
+			details ? `${details.groups.length} groups, ${details.consensusCount} consensus` : "(no payload)"
+		}`;
 	container.addChild(new Text(headline, 0, 0));
 
 	if (!details) {
@@ -70,6 +75,42 @@ export function renderMultiReviewMessage(
 		container.addChild(new Spacer(1));
 		const mdTheme = getMarkdownTheme();
 		container.addChild(new Markdown(message.content, 0, 0, mdTheme));
+		return box;
+	}
+
+	if (details.socratic) {
+		container.addChild(new Text(theme.fg("accent", `topic: ${truncateToWidth(details.socratic.topic, 100)}`), 0, 0));
+		container.addChild(new Text(theme.fg("dim", `${details.target.label} · ${details.target.kind}`), 0, 0));
+		container.addChild(new Text(
+			theme.fg("dim", `moderator: ${details.judge} · ${(details.judgeDurationMs / 1000).toFixed(1)}s`),
+			0, 0,
+		));
+		for (const round of details.socratic.rounds) {
+			container.addChild(new Spacer(1));
+			container.addChild(new Text(
+				theme.bold(`Round ${round.round} — ${round.title}`) + theme.fg("dim", ` (${(round.durationMs / 1000).toFixed(1)}s)`),
+				0, 0,
+			));
+			for (const entry of round.entries) {
+				const specShort = entry.formattedSpec.split("/").pop() ?? entry.formattedSpec;
+				const mark = entry.ok ? theme.fg("success", "✓") : theme.fg("error", "✗");
+				const tools = entry.toolCalls ? `, ${entry.toolCalls} tools` : "";
+				const summary = entry.ok ? summarizeSocraticEntry(entry.text, 100) : (entry.errorMessage ?? "failed");
+				container.addChild(new Text(
+					`  ${mark} ${theme.fg("muted", `${entry.alias} · ${specShort}`)}${theme.fg("dim", ` (${(entry.durationMs / 1000).toFixed(1)}s${tools}):`)} ${summary}`,
+					0, 0,
+				));
+			}
+		}
+		if (options.expanded) {
+			container.addChild(new Spacer(1));
+			container.addChild(new Text(theme.fg("muted", "─── socratic transcript & synthesis ───"), 0, 0));
+			const mdTheme = getMarkdownTheme();
+			container.addChild(new Markdown(message.content, 0, 0, mdTheme));
+		} else {
+			container.addChild(new Spacer(1));
+			container.addChild(new Text(theme.fg("dim", "(Ctrl+O to expand for full Socratic transcript)"), 0, 0));
+		}
 		return box;
 	}
 
