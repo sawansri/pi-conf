@@ -2,21 +2,21 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { parseBoolFlag, parseReviewArgs, parseReviewFlags, parseValueFlag } from "./args.ts";
+import { parseAuthorFlags, parseBoolFlag, parseReviewArgs, parseReviewFlags, parseValueFlag } from "./args.ts";
 import { type BriefInput, buildBrief, hasBriefInput, readSpecFile } from "./brief.ts";
 import { CXX_FILE, cxxAutoCheck, runChecks } from "./checks.ts";
 import { type Model, type ModelSpec, type MultiReviewConfig, type ReviewFlags, type ReviewerSpec, describeFlags, loadConfig, parseReviewerSpec, reviewerRunOptions } from "./config.ts";
 import { type HiddenClaim, type SuspicionResult, groupFindings } from "./grouping.ts";
 import { type JudgeResult, runJudge } from "./judge.ts";
 import { describeResolved, findModel, resolveJudge, resolveReviewerPoolStructured } from "./models.ts";
-import { type PrCommentsReport, classifyPrComments, fetchPrComments } from "./pr-comments.ts";
+import { type PrCommentsReport, classifyPrComments, fetchPrComments, normalizeAuthorFilter } from "./pr-comments.ts";
 import { type MultiReviewProgressReporter, type ToolUpdateFn, createProgressReporter, formatReviewerProgressLine, shortSpec } from "./progress.ts";
 import { DIFF_BUDGET_CHARS, REVIEWER_SYSTEM_PROMPT, buildReviewUserPrompt } from "./prompts.ts";
 import type { MultiReviewDetails } from "./render.ts";
 import { type ReviewerRunOptions, allReviewersFailedResult, runAllReviewers, throwIfAborted } from "./reviewers.ts";
 import { type SandboxExtras, sandboxUnavailable } from "./sandbox.ts";
 import { prClaimAsGroup, prCommentsMarkdown, suspicionAsGroup, suspicionMarkdown, synthesizeLeadView, synthesizeMarkdownFromGroups, synthesizeNoFindingsMarkdown } from "./synthesis.ts";
-import { type ReviewTarget, buildReviewTarget, preparePrCheckout } from "./target.ts";
+import { type ReviewTarget, buildReviewTarget, exec, preparePrCheckout } from "./target.ts";
 import { ReviewTrace } from "./trace.ts";
 import { runVerification } from "./verify.ts";
 import { createXrefService } from "./xref.ts";
@@ -83,8 +83,8 @@ export async function runMultiReviewFromArgs(
 		detailHint?: string;
 		/** Where the live trace goes (progress.json, trace.jsonl); default a fresh temp dir. */
 		traceDir?: string;
-		/** Triage the PR's existing review comments (CodeRabbit, collaborators). */
-		prComments?: { includeNits: boolean; includeResolved: boolean };
+		/** Triage the PR's existing review comments (CodeRabbit, collaborators), optionally filtered by author. */
+		prComments?: { includeNits: boolean; includeResolved: boolean; authors?: string[] };
 	} = {},
 ): Promise<MultiReviewRunResult> {
 	const cfg = loadConfig();
@@ -96,17 +96,41 @@ export async function runMultiReviewFromArgs(
 	const prCommentsFlag = parseBoolFlag(rawArgs, "pr-comments");
 	const nitsFlag = parseBoolFlag(prCommentsFlag.rest, "nits");
 	const resolvedFlag = parseBoolFlag(nitsFlag.rest, "resolved");
-	rawArgs = resolvedFlag.rest;
-	const prCommentOpts = runOptions.prComments ?? (prCommentsFlag.present ? { includeNits: nitsFlag.present, includeResolved: resolvedFlag.present } : undefined);
-	if (prCommentOpts && parseReviewArgs(rawArgs).kind !== "pr") {
-		return { kind: "notify", notifyMessage: "multi-review: --pr-comments needs a PR (e.g. #1234 or a PR URL)", notifyLevel: "error" };
+	const extraAuthorFlags = parseAuthorFlags(resolvedFlag.rest);
+	rawArgs = extraAuthorFlags.rest;
+	const cliAuthors = [...(flags.authors ?? []), ...extraAuthorFlags.authors];
+	const effectiveAuthors = normalizeAuthorFilter(
+		runOptions.prComments?.authors?.length
+			? runOptions.prComments.authors
+			: cliAuthors.length > 0
+				? cliAuthors
+				: cfg.commentAuthors,
+	);
+	if (effectiveAuthors.length > 0) flags.authors = effectiveAuthors;
+	const prCommentOpts = runOptions.prComments
+		? { ...runOptions.prComments, authors: effectiveAuthors.length > 0 ? effectiveAuthors : undefined }
+		: (prCommentsFlag.present || cliAuthors.length > 0)
+			? { includeNits: nitsFlag.present, includeResolved: resolvedFlag.present, authors: effectiveAuthors.length > 0 ? effectiveAuthors : undefined }
+			: undefined;
+	let parsed = parseReviewArgs(rawArgs);
+	if (prCommentOpts && parsed.kind !== "pr") {
+		const ghPr = await exec(pi, "gh", ["pr", "view", "--json", "number"], ctx.cwd, 10_000);
+		let prNum = 0;
+		try {
+			prNum = ghPr.code === 0 ? Number(JSON.parse(ghPr.stdout || "{}")?.number) : 0;
+		} catch { /* not a PR branch */ }
+		if (Number.isFinite(prNum) && prNum > 0) {
+			parsed = { kind: "pr", number: prNum, raw: parsed.kind === "text" ? parsed.value : "" };
+		} else {
+			return { kind: "notify", notifyMessage: "multi-review: --pr-comments / --author needs a PR (e.g. #1234 or an open PR on the current branch)", notifyLevel: "error" };
+		}
 	}
 	const briefInput: BriefInput = { ...runOptions.brief };
 	if (specFlag.value && !briefInput.specPath) briefInput.specPath = specFlag.value;
 	// An explicitly requested spec that can't be read must not silently
 	// degrade into a spec-less review. PR reviews check it against the PR's
 	// code after checkout instead (the PR may add the spec).
-	if (briefInput.specPath && parseReviewArgs(rawArgs).kind !== "pr") {
+	if (briefInput.specPath && parsed.kind !== "pr") {
 		const spec = readSpecFile(ctx.cwd, briefInput.specPath);
 		if ("error" in spec) return { kind: "notify", notifyMessage: `multi-review: ${spec.error}`, notifyLevel: "error" };
 	}
@@ -151,7 +175,6 @@ export async function runMultiReviewFromArgs(
 	// The pipeline copies runOpts; sharing this array lets it register cleanups here.
 	const cleanups: Array<() => void> = [];
 	try {
-		const parsed = parseReviewArgs(rawArgs);
 		progress.update({ phase: "resolving scope" });
 		const target = await buildReviewTarget(pi, parsed, ctx.cwd);
 		// A focus hint narrows attention within the diff; it never replaces the diff.
@@ -209,20 +232,23 @@ export async function runMultiReviewFromArgs(
 			if (!target.pr) {
 				target.warnings.push("could not resolve the PR via gh, so its review comments were not checked");
 			} else {
-				progress.update({ phase: "fetching PR review comments" });
-				const fetched = await fetchPrComments(pi, ctx.cwd, target.pr, prCommentOpts.includeResolved, target.warnings);
+				const authorDesc = prCommentOpts.authors?.length ? ` (author filter: ${prCommentOpts.authors.join(", ")})` : "";
+				progress.update({ phase: `fetching PR review comments${authorDesc}` });
+				const fetched = await fetchPrComments(pi, ctx.cwd, target.pr, prCommentOpts.includeResolved, target.warnings, prCommentOpts.authors);
 				progress.update({ phase: `classifying ${fetched.items.length} PR comment item(s)` });
 				const cls = await classifyPrComments(ctx, cfg, fetched.items, prCommentOpts.includeNits, signal);
 				if (cls.error) target.warnings.push(`PR comment classification failed (${cls.error}); comments were not checked`);
 				prReport = {
 					claims: cls.claims,
 					others: cls.others,
+					authors: prCommentOpts.authors?.length ? prCommentOpts.authors : undefined,
 					stats: {
 						threads: fetched.items.filter((i) => i.kind === "thread").length,
 						// (includes resolved threads, which are context only)
 						reviews: fetched.items.filter((i) => i.kind === "review").length,
 						conversation: fetched.items.filter((i) => i.kind === "conversation").length,
 						skippedResolved: fetched.skippedResolved,
+						skippedAuthors: fetched.skippedAuthors || undefined,
 						skippedNits: cls.skippedNits,
 						noise: cls.noise,
 					},

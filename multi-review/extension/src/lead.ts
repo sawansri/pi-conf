@@ -11,7 +11,7 @@ export function buildHandoffPrompt(
 	rawArgs: string,
 	flags: ReviewFlags,
 	specPath: string | undefined,
-	prComments?: { includeNits: boolean; includeResolved: boolean },
+	prComments?: { includeNits: boolean; includeResolved: boolean; authors?: string[] },
 ): string {
 	const parsed = parseReviewArgs(rawArgs);
 	const focus = parsed.kind === "text" ? parsed.value : parsed.kind === "pr" ? parsed.raw : "";
@@ -45,8 +45,14 @@ export function buildHandoffPrompt(
 	if (parsed.kind === "text") lines.push(`   - \`scope\`: "area" (and put the area description in \`focus\`)`);
 	if (flags.verify) lines.push("   - `verify`: true (each finding is cross-checked by reviewers who didn't raise it)");
 	if (flags.quick) lines.push("   - `quick`: true (fast reviewer pool, no tools)");
-	if (prComments && parsed.kind === "pr") {
-		lines.push(`   - \`pr_comments\`: true${prComments.includeNits ? ", `include_nits`: true" : ""}${prComments.includeResolved ? ", `include_resolved`: true" : ""} — the PR's existing review comments (CodeRabbit, collaborators) are fetched and verified separately. Do NOT copy them into the brief (not focus, not suspicions): reviewers must find issues independently so agreement with a comment means something. Your own suspicions are still fine.`);
+	const effectiveAuthors = prComments?.authors?.length ? prComments.authors : flags.authors;
+	const wantPrComments = Boolean(prComments || effectiveAuthors?.length);
+	if (wantPrComments) {
+		const authorsOpt = effectiveAuthors?.length ? `, \`comment_authors\`: ${JSON.stringify(effectiveAuthors)}` : "";
+		const prHint = parsed.kind === "pr" ? "" : " (resolve the current branch's PR number via `gh pr view --json number` and pass it as `pr_number`)";
+		lines.push(`   - \`pr_comments\`: true${authorsOpt}${prComments?.includeNits ? ", `include_nits`: true" : ""}${prComments?.includeResolved ? ", `include_resolved`: true" : ""}${prHint} — the PR's existing review comments (CodeRabbit, collaborators) are fetched and verified separately (use \`comment_authors\` to filter by GitHub login, \`"bot"\`, \`"human"\`, or \`"!login"\` if the user asked for specific authors). Do NOT copy them into the brief (not focus, not suspicions): reviewers must find issues independently so agreement with a comment means something. Your own suspicions are still fine.`);
+	} else if (parsed.kind === "pr") {
+		lines.push("   - `pr_comments` / `comment_authors`: if the user asked to check existing PR comments or reviews (or comments by specific author(s)), set `pr_comments: true` and optionally `comment_authors: [\"login\"]`.");
 	}
 	lines.push("4. **Verdict.** When results return, follow the lead-judgment instructions in the tool result.");
 	return lines.join("\n");

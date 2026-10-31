@@ -1,7 +1,7 @@
 ---
 name: multi-review
-description: Multi-model code review through pi's multi-review extension. Reviewers from other model families (Sonnet 5.5, gpt-6.1-sol, gpt-6-luna; Gemini 4 Argon as a verifier), each with read-only repo access, review the current change, a PR, or a spec implementation in parallel. You write the brief, act as lead reviewer on their findings, and, if asked, fix the issues test-first and confirm the fixes with a re-review. Also verifies a PR's existing review comments (CodeRabbit, other bots, collaborators): which are real, which are wrong, and what they missed, with draft replies (never posted). Use when the user asks for a multi-model review, a second opinion from other models, a check of an implementation against a spec, whether CodeRabbit's or reviewers' PR comments are valid or real, or to fix and confirm review findings.
-argument-hint: "[--spec=path] [--verify] [--quick] [#PR [--pr-comments [--nits] [--resolved]] | area to review]"
+description: Multi-model code review through pi's multi-review extension. Reviewers from other model families (Sonnet 5.5, gpt-6.1-sol, gpt-6-luna; Gemini 4 Argon as a verifier), each with read-only repo access, review the current change, a PR, or a spec implementation in parallel. You write the brief, act as lead reviewer on their findings, and, if asked, fix the issues test-first and confirm the fixes with a re-review. Also verifies a PR's existing review comments (CodeRabbit, other bots, collaborators; filterable by author): which are real, which are wrong, and what they missed, with draft replies (never posted). Use when the user asks for a multi-model review, a second opinion from other models, a check of an implementation against a spec, whether CodeRabbit's or specific reviewers' PR comments are valid or real, or to fix and confirm review findings.
+argument-hint: "[--spec=path] [--verify] [--quick] [#PR [--pr-comments [--author=login[,login]] [--nits] [--resolved]] | area to review]"
 allowed-tools: Bash(pi -p *) Bash(mkdir *) Bash(git diff *) Bash(git log *) Bash(git show *) Bash(git status *) Bash(git merge-base *) Bash(git rev-parse *) Bash(gh pr view *) Bash(gh pr diff *) Read Write
 ---
 
@@ -14,7 +14,7 @@ Arguments: `$ARGUMENTS`
 - `--verify`: each finding (and each of your suspicions) is cross-checked by reviewers who didn't raise it. Costs ~1.5–2×. Use it for high-stakes changes.
 - `--quick`: a fast pool without repo tools (10–50s). Good for small diffs or a first look.
 - `#123` or a PR URL: review that PR. Any other text is either a focus for the diff review or, if there is no change to review, the area to review.
-- `--pr-comments` (with a PR): also triage the PR's existing review comments (CodeRabbit, other bots, collaborators). `--nits` includes nitpicks, and `--resolved` re-checks resolved threads.
+- `--author=<login[,login]>` / `--pr-comments`: author filtering is parsed and active by default in any scenario. Passing `--author=<login[,login]>` (or setting `"comment_authors"` / `"author"` in `brief.json`) automatically enables PR comment/review triage filtered to those author(s) without needing `--pr-comments` separately. Supports GitHub logins (`alice`, `@alice`, `coderabbitai[bot]`), bot shorthands (`coderabbit`, `copilot`), `human`, `bot`, and `!pattern` exclusions (`!bot`, `!coderabbit`). `--nits` includes nitpicks, and `--resolved` re-checks resolved threads.
 
 **Never post to GitHub.** Don't comment, review, reply, or resolve threads, whether with `gh` or the API. Replies are drafted into a local file for the user to post.
 
@@ -60,7 +60,7 @@ Write a JSON file (e.g. `/tmp/multi-review/<timestamp>/brief.json`; create the d
 | `scope` | `"area"` only when there is no change to review and `focus` describes the area; otherwise omit it. |
 | `pr_number` | For PR reviews. |
 | `verify`, `quick` | From the arguments. |
-| `pr_comments`, `include_nits`, `include_resolved` | For `--pr-comments`, `--nits` and `--resolved`. The comments are fetched and checked by the extension. **Do not copy them into the brief** (not `focus`, not `suspicions`): reviewers must find issues independently, so agreement with a comment means something. Your own suspicions are still fine. |
+| `pr_comments`, `comment_authors`, `include_nits`, `include_resolved` | Author filtering is on by default in any scenario: passing `"comment_authors"` (or `"author"` / `"authors"`, e.g. `["coderabbitai"]`, `["alice", "bob"]`, `["human"]`, `["bot"]`, `["!bot"]`) automatically enables `pr_comments` without needing `"pr_comments": true` separately. Omit `comment_authors` to check all authors when `pr_comments: true`. **Do not copy PR comments into the brief** (not `focus`, not `suspicions`): reviewers must find issues independently, so agreement with a comment means something. Your own suspicions are still fine. |
 
 ## 3. Run the review
 

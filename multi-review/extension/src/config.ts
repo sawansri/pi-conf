@@ -115,6 +115,8 @@ export interface MultiReviewConfig {
 	 * to the judge at low thinking. "lexical" skips the model call.
 	 */
 	dedupeModel?: string;
+	/** Default GitHub author filter for PR comments/reviews when none is passed per-run. */
+	commentAuthors?: string[];
 }
 
 /**
@@ -125,6 +127,7 @@ export interface MultiReviewConfig {
 export interface ReviewFlags {
 	verify: boolean;
 	quick: boolean;
+	authors?: string[];
 }
 
 export function describeFlags(flags: ReviewFlags): string {
@@ -256,6 +259,9 @@ export function loadConfig(): MultiReviewConfig {
 		}
 		if (typeof parsed.minReviewToolCalls === "number" && parsed.minReviewToolCalls >= 0 && parsed.minReviewToolCalls <= 100) {
 			cachedConfig.minReviewToolCalls = Math.floor(parsed.minReviewToolCalls);
+		}
+		if (Array.isArray(parsed.commentAuthors)) {
+			cachedConfig.commentAuthors = parsed.commentAuthors.filter((x: unknown): x is string => typeof x === "string" && x.trim().length > 0);
 		}
 	} catch {
 		cachedConfig = { ...DEFAULTS };

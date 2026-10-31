@@ -116,9 +116,10 @@ export function renderMultiReviewMessage(
 	if (details.prComments) {
 		const pc = details.prComments;
 		const n = (v: Verification["verdict"]) => pc.claims.filter((c) => c.verifications?.some((x) => x.verdict === v)).length;
+		const authorTag = pc.authors?.length ? ` (authors: ${pc.authors.join(", ")})` : "";
 		container.addChild(new Spacer(1));
 		container.addChild(new Text(theme.fg("muted",
-			`PR comments: ${pc.claims.length} claim(s) · ✓${n("confirmed")} ✗${n("refuted")} ?${n("uncertain")} · ${pc.claims.filter((c) => c.raisedBy.length).length} also found independently · ${pc.others.length} question/preference`), 0, 0));
+			`PR comments${authorTag}: ${pc.claims.length} claim(s) · ✓${n("confirmed")} ✗${n("refuted")} ?${n("uncertain")} · ${pc.claims.filter((c) => c.raisedBy.length).length} also found independently · ${pc.others.length} question/preference`), 0, 0));
 		if (options.expanded) {
 			for (const c of pc.claims) {
 				const tally = c.verifications?.length ? ` ${verificationTally({ verifications: c.verifications } as DedupeGroup)}` : "";

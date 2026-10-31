@@ -212,10 +212,13 @@ multi_review
 ```
 
 Triage a PR's existing review comments (CodeRabbit, collaborators) and
-review it fresh. Draft replies go to a local file; nothing is posted:
+review it fresh, optionally filtered by author. Draft replies go to a local
+file; nothing is posted:
 ```
 /multi-review #1234 --pr-comments
-/multi-review #1234 --pr-comments --nits --resolved
+/multi-review #1234 --author=coderabbitai
+/multi-review #1234 --pr-comments --author=alice,bob --nits --resolved
+/multi-review #1234 --author=!bot
 ```
 
 Fast first look:

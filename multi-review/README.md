@@ -33,9 +33,9 @@ judge model writes the synthesis.
 
 | Surface | How |
 |---------|-----|
-| Slash command | `/multi-review [--spec=path] [--verify] [--quick] [--direct] [PR-number [--pr-comments [--nits] [--resolved]] \| free-text focus]` |
+| Slash command | `/multi-review [--spec=path] [--verify] [--quick] [--direct] [PR-number [--pr-comments [--author=login[,login]] [--nits] [--resolved]] \| free-text focus]` |
 | Slash command | `/multi-review-pick`: open the multi-select TUI picker to choose reviewer models from your registry (optionally saved to `multi-review.json`) |
-| LLM-callable tool | `multi_review({intent?, spec_path?, requirements?, suspicions?, context_files?, checks?, focus?, scope?, pr_number?, verify?, quick?, pr_comments?, include_nits?, include_resolved?})`. The agent can call it on its own too |
+| LLM-callable tool | `multi_review({intent?, spec_path?, requirements?, suspicions?, context_files?, checks?, focus?, scope?, pr_number?, verify?, quick?, pr_comments?, comment_authors?, include_nits?, include_resolved?})`. The agent can call it on its own too |
 
 Tool parameters:
 
@@ -51,7 +51,7 @@ Tool parameters:
 | `scope` | `diff` (default: working tree vs default branch, or the PR) or `area` (no diff; review what `focus` describes). |
 | `pr_number` | As for the slash command. |
 | `verify`, `quick` | Same as `--verify` / `--quick`. |
-| `pr_comments`, `include_nits`, `include_resolved` | With `pr_number`: triage the PR's existing review comments (see below). |
+| `pr_comments`, `comment_authors`, `include_nits`, `include_resolved` | With `pr_number`: triage the PR's existing review comments, optionally filtered by `comment_authors` (see below). |
 
 Argument autocompletion completes only the token you're typing (`--spec=`,
 `--verify`, `--quick`, `--direct`, `#`) and keeps what's already typed.
@@ -76,6 +76,14 @@ right, and what did everyone miss.
 
    Bodies are cleaned: HTML comments, badges, and CodeRabbit's "Prompt
    for AI Agents" copies are dropped.
+   - **Author filtering (`--author=login[,login]` / `comment_authors`):**
+     Filter comments, review threads, and reviews by GitHub author login
+     (with or without `@` or `[bot]`, e.g. `--author=coderabbitai` or
+     shorthand `--author=coderabbit`, `--author=alice,bob`), `"bot"` /
+     `"human"`, or `!pattern` exclusions (`--author=!bot`,
+     `--author=!coderabbit`). Passing `--author=` on a PR (or a branch
+     with an open PR) automatically enables `--pr-comments`. A default
+     filter can also be set via `"commentAuthors"` in `multi-review.json`.
 2. **Classify** (one fast call). Each item is split into checkable
    **claims**, or classed as **question**, **preference** or **noise**
    (walkthroughs, approvals, "done" replies).

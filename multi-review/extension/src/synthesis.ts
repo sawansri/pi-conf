@@ -130,10 +130,12 @@ export function prClaimAsGroup(c: PrClaim): DedupeGroup {
 export function prCommentsMarkdown(report: PrCommentsReport, groups: DedupeGroup[]): string[] {
 	const byId = new Map(groups.map((g) => [g.id, g]));
 	const st = report.stats;
+	const authorFilter = report.authors?.length ? ` (author filter: ${report.authors.join(", ")})` : "";
+	const skippedAuthors = st.skippedAuthors ? ` · ${st.skippedAuthors} by other author(s) skipped` : "";
 	const lines = [
 		"## Existing PR review comments (hidden from reviewers)",
-		`Fetched ${st.threads} review thread(s)${st.skippedResolved ? ` (${st.skippedResolved} resolved: context only, not re-checked)` : ""}, ${st.reviews} review bod(ies), ${st.conversation} conversation comment(s) → ${report.claims.length} checkable claim(s)` +
-			`${st.skippedNits ? ` · ${st.skippedNits} nit(s) skipped (--nits to include)` : ""}${st.noise ? ` · ${st.noise} non-review item(s) ignored` : ""}.`,
+		`Fetched ${st.threads} review thread(s)${st.skippedResolved ? ` (${st.skippedResolved} resolved: context only, not re-checked)` : ""}, ${st.reviews} review bod(ies), ${st.conversation} conversation comment(s)${authorFilter} → ${report.claims.length} checkable claim(s)` +
+			`${skippedAuthors}${st.skippedNits ? ` · ${st.skippedNits} nit(s) skipped (--nits to include)` : ""}${st.noise ? ` · ${st.noise} non-review item(s) ignored` : ""}.`,
 		"",
 	];
 	const mark = { confirmed: "✓", refuted: "✗", uncertain: "?" } as const;

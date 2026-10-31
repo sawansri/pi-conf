@@ -57,7 +57,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Text } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
-import { completeReviewArgs, parseBoolFlag, parseReviewArgs, parseReviewFlags, parseValueFlag } from "./src/args.ts";
+import { completeReviewArgs, parseAuthorFlags, parseBoolFlag, parseReviewArgs, parseReviewFlags, parseValueFlag } from "./src/args.ts";
 import { readSpecFile } from "./src/brief.ts";
 import { DEFAULTS, cacheConfigForFreshRead, loadConfig } from "./src/config.ts";
 import { runAgentLedReview, runHeadless } from "./src/headless.ts";
@@ -67,6 +67,7 @@ import { persistReviewerChoices, pickReviewersViaTUI } from "./src/picker.ts";
 import { runMultiReviewFromArgs, setTransientReviewers } from "./src/pipeline.ts";
 import { setStatus } from "./src/progress.ts";
 import { type MultiReviewDetails, renderMultiReviewMessage } from "./src/render.ts";
+import { exec } from "./src/target.ts";
 
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
@@ -129,11 +130,26 @@ export default function (pi: ExtensionAPI) {
 			const prC = parseBoolFlag(afterSpec, "pr-comments");
 			const nits = parseBoolFlag(prC.rest, "nits");
 			const resolvedThreads = parseBoolFlag(nits.rest, "resolved");
-			const rest = resolvedThreads.rest;
-			const prComments = prC.present ? { includeNits: nits.present, includeResolved: resolvedThreads.present } : undefined;
+			const authorFlags = parseAuthorFlags(resolvedThreads.rest);
+			let rest = authorFlags.rest;
+			const cliAuthors = [...(flags.authors ?? []), ...authorFlags.authors];
+			const effectiveAuthors = cliAuthors.length > 0 ? cliAuthors : cfg.commentAuthors;
+			if (effectiveAuthors?.length) flags.authors = effectiveAuthors;
+			const prComments = (prC.present || cliAuthors.length > 0)
+				? { includeNits: nits.present, includeResolved: resolvedThreads.present, authors: effectiveAuthors?.length ? effectiveAuthors : undefined }
+				: undefined;
 			if (prComments && parseReviewArgs(rest).kind !== "pr") {
-				ctx.ui.notify("multi-review: --pr-comments needs a PR (e.g. #1234 or a PR URL)", "error");
-				return;
+				const ghPr = await exec(pi, "gh", ["pr", "view", "--json", "number"], ctx.cwd, 10_000);
+				let prNum = 0;
+				try {
+					prNum = ghPr.code === 0 ? Number(JSON.parse(ghPr.stdout || "{}")?.number) : 0;
+				} catch { /* not a PR branch */ }
+				if (Number.isFinite(prNum) && prNum > 0) {
+					rest = `#${prNum} ${rest}`.trim();
+				} else {
+					ctx.ui.notify("multi-review: --pr-comments / --author needs a PR (e.g. #1234 or an open PR on the current branch)", "error");
+					return;
+				}
 			}
 			if (specPath) {
 				const spec = readSpecFile(ctx.cwd, specPath);
@@ -158,7 +174,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("multi-review", {
 		description:
 			"Fan-out code review across configured models. Usage: " +
-			"/multi-review [--spec=path] [--verify] [--quick] [--direct] [PR-number [--pr-comments [--nits] [--resolved]] | free-text focus]. " +
+			"/multi-review [--spec=path] [--verify] [--quick] [--direct] [PR-number [--pr-comments [--author=login[,login]] [--nits] [--resolved]] | free-text focus]. " +
 			"The main agent drafts the reviewer brief from your args (and spec), then judges the results. " +
 			"--direct skips the agent and uses the configured judge.",
 		// Argument autocomplete hints the call shape so users don't have to
@@ -246,7 +262,7 @@ export default function (pi: ExtensionAPI) {
 			"`context_files` are repo paths reviewers should read in full (callers, types, tests) — not files already whole in the diff.",
 			"`checks` are up to 4 fast commands (type-check, targeted tests) run once in a sandbox (repo read-only, no network) before the review; reviewers see their output. C/C++ changes are compile-checked automatically.",
 			"Set verify=true for high-stakes changes (independent cross-check of every finding); quick=true for small diffs or a cheap first look.",
-			"For a PR that already has review comments (CodeRabbit, collaborators), set pr_comments=true to triage them: each is verified and you report valid/invalid per comment plus new issues, and draft replies to a local file. Never post to GitHub.",
+			"For a PR that already has review comments (CodeRabbit, collaborators), set pr_comments=true to triage them (and pass `comment_authors` when filtering by specific GitHub login(s), `'bot'`, `'human'`, or `'!login'`): each is verified and you report valid/invalid per comment plus new issues, and draft replies to a local file. Never post to GitHub.",
 			"After results return, follow the lead-judgment instructions in the result. Do not apply fixes unless asked.",
 		],
 		parameters: Type.Object({
@@ -299,6 +315,12 @@ export default function (pi: ExtensionAPI) {
 				description:
 					"With pr_number: fetch the PR's existing review comments (CodeRabbit, collaborators), extract checkable claims, " +
 					"and verify each (hidden from reviewers, matched against their independent findings). Do not copy those comments into the brief.",
+			})),
+			comment_authors: Type.Optional(Type.Array(Type.String(), {
+				description:
+					"With pr_comments (and pr_number): only check PR comments and reviews by these GitHub author logins " +
+					"(e.g. ['coderabbitai'], ['alice', 'bob'], ['human'], ['bot'], or ['!bot'] to exclude). Omit to check all authors.",
+				maxItems: 20,
 			})),
 			include_nits: Type.Optional(Type.Boolean({ description: "With pr_comments: also verify nitpick-level claims." })),
 			include_resolved: Type.Optional(Type.Boolean({ description: "With pr_comments: also check resolved review threads." })),

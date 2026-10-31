@@ -1,12 +1,12 @@
 import type { ReviewFlags } from "./config.ts";
 
 /**
- * Pull `--verify` / `--quick` (and legacy `--mode=…`) out of the args.
+ * Pull `--verify`, `--quick`, `--author` (and legacy `--mode=…`) out of the args.
  * Legacy modes map onto the flags: council → verify, triage → quick,
  * balanced/light → defaults (agent-led balanced subsumes both).
  */
 export function parseReviewFlags(rawArgs: string, defaults: ReviewFlags): { flags: ReviewFlags; rest: string } {
-	const flags = { ...defaults };
+	const flags: ReviewFlags = { ...defaults, authors: defaults.authors ? [...defaults.authors] : undefined };
 	let rest = rawArgs;
 	const verify = parseBoolFlag(rest, "verify");
 	rest = verify.rest;
@@ -18,6 +18,9 @@ export function parseReviewFlags(rawArgs: string, defaults: ReviewFlags): { flag
 	rest = legacy.rest;
 	if (legacy.value?.toLowerCase() === "council") flags.verify = true;
 	if (legacy.value?.toLowerCase() === "triage") flags.quick = true;
+	const authorFlags = parseAuthorFlags(rest);
+	rest = authorFlags.rest;
+	if (authorFlags.authors.length > 0) flags.authors = authorFlags.authors;
 	return { flags, rest };
 }
 
@@ -34,6 +37,27 @@ export function parseBoolFlag(rawArgs: string, name: string): { present: boolean
 	const re = new RegExp(`(^|\\s)--${name}(?=\\s|$)`);
 	if (!re.test(rawArgs)) return { present: false, rest: rawArgs };
 	return { present: true, rest: rawArgs.replace(re, "$1").replace(/\s+/g, " ").trim() };
+}
+
+/**
+ * Pull `--author=<login[,login]>` / `--author <login[,login]>` (and `--authors`,
+ * `--comment-author`, `--comment-authors`) out of the args. Repeatable;
+ * comma-separated lists are split into individual tokens.
+ */
+export function parseAuthorFlags(rawArgs: string): { authors: string[]; rest: string } {
+	const authors: string[] = [];
+	let rest = rawArgs;
+	const re = /(^|\s)--(?:author|authors|comment-author|comment-authors)(?:=|\s+)(?!--|#\d+\b)(\S+)(?=\s|$)/;
+	for (;;) {
+		const m = rest.match(re);
+		if (!m) break;
+		rest = rest.replace(re, "$1").replace(/\s+/g, " ").trim();
+		for (const part of m[2].split(",")) {
+			const trimmed = part.trim();
+			if (trimmed && !authors.includes(trimmed)) authors.push(trimmed);
+		}
+	}
+	return { authors, rest };
 }
 
 // ---------- scope resolution ----------
@@ -85,6 +109,7 @@ const ARG_COMPLETIONS: Array<{ token: string; label: string; description: string
 	{ token: "--quick", label: "--quick", description: "fast reviewer pool, no tools" },
 	{ token: "--direct", label: "--direct", description: "skip the main agent; external judge synthesizes" },
 	{ token: "--pr-comments", label: "--pr-comments", description: "with a PR: verify its existing review comments (CodeRabbit, collaborators)" },
+	{ token: "--author=", label: "--author=<login[,login]>", description: "with --pr-comments: filter comments/reviews by author (or bot/human/!login)" },
 	{ token: "--nits", label: "--nits", description: "with --pr-comments: include nitpicks" },
 	{ token: "--resolved", label: "--resolved", description: "with --pr-comments: include resolved threads" },
 	{ token: "#", label: "#<pr>", description: "review a PR by number" },

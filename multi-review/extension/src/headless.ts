@@ -5,6 +5,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { parseValueFlag } from "./args.ts";
 import { leadJudgmentInstructions } from "./lead.ts";
 import { TRANSIENT_REVIEWERS, runMultiReviewFromArgs } from "./pipeline.ts";
+import { normalizeAuthorFilter } from "./pr-comments.ts";
 import type { ToolUpdateFn } from "./progress.ts";
 import type { MultiReviewDetails } from "./render.ts";
 
@@ -26,6 +27,8 @@ export interface ReviewRequest {
 	quick?: boolean;
 	/** Triage the PR's existing review comments (needs pr_number). */
 	pr_comments?: boolean;
+	/** Filter PR comments/reviews by GitHub author login(s), "bot", "human", or "!login". */
+	comment_authors?: string[];
 	include_nits?: boolean;
 	include_resolved?: boolean;
 }
@@ -48,7 +51,9 @@ export async function runAgentLedReview(
 ): Promise<{ text: string; markdown: string; details: MultiReviewDetails } | { error: string }> {
 	const parts: string[] = [];
 	const focus = typeof params.focus === "string" ? params.focus.trim() : "";
-	if (params.pr_comments && typeof params.pr_number !== "number") return { error: "multi_review: pr_comments needs pr_number" };
+	const authors = normalizeAuthorFilter(params.comment_authors);
+	const wantPrComments = Boolean(params.pr_comments || authors.length > 0);
+	if (wantPrComments && typeof params.pr_number !== "number") return { error: "multi_review: pr_comments / comment_authors needs pr_number" };
 	if (typeof params.pr_number === "number") parts.push(String(params.pr_number));
 	else if (params.scope === "area") {
 		if (!focus) return { error: "multi_review: scope='area' needs `focus` describing the area to review." };
@@ -69,7 +74,9 @@ export async function runAgentLedReview(
 		deadlineMs,
 		detailHint,
 		traceDir,
-		prComments: params.pr_comments ? { includeNits: Boolean(params.include_nits), includeResolved: Boolean(params.include_resolved) } : undefined,
+		prComments: wantPrComments
+			? { includeNits: Boolean(params.include_nits), includeResolved: Boolean(params.include_resolved), authors: authors.length > 0 ? authors : undefined }
+			: undefined,
 	});
 	if (!result.injectMessage) return { error: result.notifyMessage };
 	const { content: markdown, details } = result.injectMessage;
@@ -101,8 +108,14 @@ export function parseReviewRequest(raw: unknown): ReviewRequest | { error: strin
 	try {
 		// A list of focus areas is a harmless shape slip; join instead of failing the run.
 		if (Array.isArray(o.focus) && o.focus.every((x) => typeof x === "string")) o.focus = (o.focus as string[]).join("; ");
+		const rawAuthors = o.comment_authors ?? o.authors ?? o.author ?? o.comment_author;
+		if (rawAuthors !== undefined) {
+			if (typeof rawAuthors === "string") o.comment_authors = [rawAuthors];
+			else if (Array.isArray(rawAuthors) && rawAuthors.every((x) => typeof x === "string")) o.comment_authors = rawAuthors;
+			else throw new Error(`"comment_authors" must be a string or array of strings`);
+		}
 		str("intent"); str("spec_path"); str("focus");
-		strs("requirements"); strs("suspicions"); strs("context_files"); strs("checks");
+		strs("requirements"); strs("suspicions"); strs("context_files"); strs("checks"); strs("comment_authors");
 		bool("verify"); bool("quick"); bool("pr_comments"); bool("include_nits"); bool("include_resolved");
 		if (o.scope !== undefined) {
 			if (o.scope !== "diff" && o.scope !== "area") throw new Error(`"scope" must be "diff" or "area"`);

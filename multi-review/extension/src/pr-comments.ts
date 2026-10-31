@@ -56,7 +56,61 @@ export interface PrNonClaim {
 export interface PrCommentsReport {
 	claims: PrClaim[];
 	others: PrNonClaim[];
-	stats: { threads: number; reviews: number; conversation: number; skippedResolved: number; skippedNits: number; noise: number };
+	/** Author filter applied to the PR's comments/reviews, if any. */
+	authors?: string[];
+	stats: {
+		threads: number;
+		reviews: number;
+		conversation: number;
+		skippedResolved: number;
+		skippedAuthors?: number;
+		skippedNits: number;
+		noise: number;
+	};
+}
+
+function normalizeAuthorToken(raw: string): string {
+	return raw.trim().replace(/^@/, "").toLowerCase().replace(/\[bot\]$/, "");
+}
+
+/** Normalize raw author filter inputs (splitting commas, trimming, deduplicating). */
+export function normalizeAuthorFilter(authors: string[] | undefined): string[] {
+	if (!authors || authors.length === 0) return [];
+	const out: string[] = [];
+	for (const entry of authors) {
+		for (const part of entry.split(",")) {
+			const trimmed = part.trim();
+			if (trimmed && !out.includes(trimmed)) out.push(trimmed);
+		}
+	}
+	return out;
+}
+
+function matchesSingleAuthor(login: string, isBot: boolean, rawFilter: string): boolean {
+	const f = normalizeAuthorToken(rawFilter);
+	if (!f) return true;
+	if (f === "bot" || f === "bots") return isBot;
+	if (f === "human" || f === "humans") return !isBot;
+	const a = normalizeAuthorToken(login);
+	if (a === f) return true;
+	// Shorthand bot names: "coderabbit" → "coderabbitai", "copilot" → "copilot-pull-request-reviewer".
+	if (isBot && f.length >= 4 && (a.startsWith(f) || a.includes(f))) return true;
+	return false;
+}
+
+/**
+ * Whether a PR comment/review by `login` passes the author filter.
+ * Supports GitHub logins (with or without `@` or `[bot]`), `"bot"` / `"human"`,
+ * and `!pattern` exclusions (e.g. `["!bot"]`, `["!coderabbitai"]`).
+ */
+export function matchesAuthorFilter(login: string, isBot: boolean, filters: string[] | undefined): boolean {
+	const tokens = normalizeAuthorFilter(filters);
+	if (tokens.length === 0) return true;
+	const neg = tokens.filter((t) => t.startsWith("!")).map((t) => t.slice(1).trim()).filter(Boolean);
+	const pos = tokens.filter((t) => !t.startsWith("!"));
+	if (neg.some((n) => matchesSingleAuthor(login, isBot, n))) return false;
+	if (pos.length === 0) return true;
+	return pos.some((p) => matchesSingleAuthor(login, isBot, p));
 }
 
 /**
@@ -92,6 +146,7 @@ const PR_THREADS_QUERY = `query($owner: String!, $name: String!, $n: Int!) {
 /**
  * Fetch every review surface of a PR with gh (read-only). Resolved threads
  * are skipped unless asked; outdated ones are kept (does it still apply?).
+ * When `authors` is set, only comments/reviews matching the filter are kept.
  */
 export async function fetchPrComments(
 	pi: ExtensionAPI,
@@ -99,9 +154,12 @@ export async function fetchPrComments(
 	pr: NonNullable<ReviewTarget["pr"]>,
 	includeResolved: boolean,
 	warnings: string[],
-): Promise<{ items: PrCommentItem[]; skippedResolved: number }> {
+	authors?: string[],
+): Promise<{ items: PrCommentItem[]; skippedResolved: number; skippedAuthors: number }> {
 	const items: PrCommentItem[] = [];
 	let skippedResolved = 0;
+	let skippedAuthors = 0;
+	const filter = normalizeAuthorFilter(authors);
 	const gql = await exec(pi, "gh", ["api", "graphql", "-f", `query=${PR_THREADS_QUERY}`, "-F", `owner=${pr.owner}`, "-F", `name=${pr.repo}`, "-F", `n=${pr.number}`], cwd, 60_000);
 	if (gql.code !== 0) {
 		warnings.push(`could not fetch PR review threads: ${gql.stderr.trim().slice(0, 160)}`);
@@ -109,26 +167,38 @@ export async function fetchPrComments(
 		const threads = JSON.parse(gql.stdout)?.data?.repository?.pullRequest?.reviewThreads;
 		if (threads?.pageInfo?.hasNextPage) warnings.push("PR has more than 100 review threads; only the first 100 were checked");
 		for (const t of threads?.nodes ?? []) {
-			const comments = t.comments?.nodes ?? [];
+			const comments: Array<{ author?: { login?: string; __typename?: string }; body?: string; url?: string; diffHunk?: string }> = t.comments?.nodes ?? [];
 			if (comments.length === 0) continue;
+			// Match the thread starter first; if filtered by author and the starter
+			// doesn't match, check whether a matching author commented in the thread.
+			let matchIdx = 0;
+			if (filter.length > 0) {
+				matchIdx = comments.findIndex((c) => matchesAuthorFilter(c.author?.login ?? "ghost", c.author?.__typename === "Bot", filter));
+				if (matchIdx === -1) {
+					skippedAuthors++;
+					continue;
+				}
+			}
 			const skip = Boolean(t.isResolved) && !includeResolved;
 			if (skip) skippedResolved++;
-			const [first, ...rest] = comments;
-			const text = cleanCommentBody(String(first.body ?? ""));
+			const primary = comments[matchIdx];
+			const rest = comments.filter((_, idx) => idx !== matchIdx);
+			const text = cleanCommentBody(String(primary.body ?? ""));
 			if (!text) continue;
+			const firstHunk = primary.diffHunk ?? comments[0]?.diffHunk;
 			items.push({
 				id: `c${items.length + 1}`,
 				kind: "thread",
-				author: first.author?.login ?? "ghost",
-				bot: first.author?.__typename === "Bot",
-				url: first.url,
+				author: primary.author?.login ?? "ghost",
+				bot: primary.author?.__typename === "Bot",
+				url: primary.url ?? comments[0]?.url ?? "",
 				path: t.path,
 				line: t.line ?? t.originalLine ?? null,
 				outdated: Boolean(t.isOutdated),
 				resolved: Boolean(t.isResolved),
-				hunk: typeof first.diffHunk === "string" ? first.diffHunk.split("\n").slice(-12).join("\n") : undefined,
+				hunk: typeof firstHunk === "string" ? firstHunk.split("\n").slice(-12).join("\n") : undefined,
 				text: text.slice(0, skip ? 1200 : 4000),
-				replies: rest.map((c: { author?: { login?: string }; body?: string }) => `${c.author?.login ?? "ghost"}: ${cleanCommentBody(String(c.body ?? "")).slice(0, 400)}`),
+				replies: rest.map((c) => `${c.author?.login ?? "ghost"}: ${cleanCommentBody(String(c.body ?? "")).slice(0, 400)}`),
 				contextOnly: skip,
 			});
 		}
@@ -144,12 +214,17 @@ export async function fetchPrComments(
 			const c = JSON.parse(line);
 			const text = cleanCommentBody(String(c.body ?? ""));
 			if (!text) continue;
-			items.push({ id: `c${items.length + 1}`, kind, author: c.user, bot: c.type === "Bot", url: c.url, text: text.slice(0, 12_000) });
+			const isBot = c.type === "Bot";
+			if (filter.length > 0 && !matchesAuthorFilter(c.user ?? "ghost", isBot, filter)) {
+				skippedAuthors++;
+				continue;
+			}
+			items.push({ id: `c${items.length + 1}`, kind, author: c.user, bot: isBot, url: c.url, text: text.slice(0, 12_000) });
 		}
 	};
 	await rest(`repos/${pr.owner}/${pr.repo}/pulls/${pr.number}/reviews`, "review");
 	await rest(`repos/${pr.owner}/${pr.repo}/issues/${pr.number}/comments`, "conversation");
-	return { items, skippedResolved };
+	return { items, skippedResolved, skippedAuthors };
 }
 
 const CLASSIFY_SYSTEM_PROMPT = `You triage review comments on a pull request (from bots like CodeRabbit and from human collaborators) for a verification pipeline.
