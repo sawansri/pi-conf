@@ -151,9 +151,15 @@ export async function runMultiReviewFromArgs(
 	const poolName = usingTransientReviewers ? "transient" : flags.quick ? "quickReviewers" : "reviewers";
 	// verifyOnly wins over reviewers: a model listed in both only verifies.
 	const verifyOnlyIds = new Set(cfg.verifyOnly.map((raw) => parseReviewerSpec(raw)?.spec));
+	const reviewOnlySpecs = cfg.reviewers.filter((raw) => !verifyOnlyIds.has(parseReviewerSpec(raw)?.spec));
+	// Socratic discussions want the widest set of independent voices: verify-only
+	// models (e.g. Gemini 4 Argon) join as full participants. Quick runs have no
+	// tools, so they keep the quick pool.
+	const socraticSpecs = [...reviewOnlySpecs, ...cfg.verifyOnly]
+		.filter((raw, i, all) => all.findIndex((o) => parseReviewerSpec(o)?.spec === parseReviewerSpec(raw)?.spec) === i);
 	const effectiveReviewerSpecs: string[] = usingTransientReviewers
 		? transientReviewers
-		: flags.quick ? cfg.quickReviewers : cfg.reviewers.filter((raw) => !verifyOnlyIds.has(parseReviewerSpec(raw)?.spec));
+		: flags.quick ? cfg.quickReviewers : isSocratic ? socraticSpecs : reviewOnlySpecs;
 	if (usingTransientReviewers && transientReviewers === TRANSIENT_REVIEWERS) TRANSIENT_REVIEWERS = null;
 	if (effectiveReviewerSpecs.length === 0) {
 		return {

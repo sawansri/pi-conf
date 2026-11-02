@@ -130,7 +130,10 @@ Example, on lemonade #3765 (a shared-HF-cache model-deletion fix):
 
 `/socratic <topic>` (or `/multi-review --socratic [--rounds=2] <topic>`, or
 `multi_review({ socratic: true, topic: "..." })`) runs a multi-round Socratic
-inquiry across the configured models. Every participant has the **same tools
+inquiry across the configured models: the `reviewers` pool **plus the
+`verifyOnly` models** (Gemini 4 Argon by default), which join as full
+participants since a discussion benefits from every independent voice
+(`--quick` uses the quick pool instead). Every participant has the **same tools
 as during review** (`read`, `grep`, `find`, `ls`, `git`, `progress`,
 `web_search`, `xref` for C/C++, and sandboxed `run`), and keeps its in-memory
 agent session across rounds so files read in Round 1 stay in context during
@@ -660,7 +663,8 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
 [Executing code](#executing-code-tools-checks-and-the-sandbox).
 `verifyOnly` models skip the review and only join the `--verify` (and
 `--pr-comments`) verification round; a model listed in both `reviewers` and
-`verifyOnly` only verifies. Quick runs leave them out.
+`verifyOnly` only verifies. They also join Socratic discussions as full
+participants. Quick runs leave them out.
 `dedupeModel: "lexical"` skips the grouping call.
 
 This file stays optional — if absent, the extension warns on `/multi-review`
