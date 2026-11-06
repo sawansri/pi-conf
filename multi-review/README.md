@@ -130,9 +130,8 @@ Example, on lemonade #3765 (a shared-HF-cache model-deletion fix):
 
 `/socratic <topic>` (or `/multi-review --socratic [--rounds=2] <topic>`, or
 `multi_review({ socratic: true, topic: "..." })`) runs a multi-round Socratic
-inquiry across the configured models: the `reviewers` pool **plus the
-`verifyOnly` models** (Gemini 4 Argon by default), which join as full
-participants since a discussion benefits from every independent voice
+inquiry across the configured models: the `reviewers` pool **plus any
+`verifyOnly` models**, which join as full participants since a discussion benefits from every independent voice
 (`--quick` uses the quick pool instead). Every participant has the **same tools
 as during review** (`read`, `grep`, `find`, `ls`, `git`, `progress`,
 `web_search`, `xref` for C/C++, and sandboxed `run`), and keeps its in-memory
@@ -406,10 +405,10 @@ The modes used to mix three separate choices: breadth (which reviewers),
 depth (a second checking round), and who writes the verdict. Now each is
 its own option:
 
-| Option | What it does | When | Cost / time (3-reviewer pool) |
+| Option | What it does | When | Cost / time (4-reviewer pool) |
 |--------|-------------|------|------------------------------|
-| *(default)* | Sonnet 5.5 + gpt-6.1-sol + Kimi K3.1 Pro with read-only tools → grouping → the main agent judges | Most reviews | ~1× · ~2–3 min on a 700-line diff |
-| `--verify` | Adds a cross-check round: each issue goes to `verifiersPerFinding` (2) reviewers **who did not raise it**, or to `verifyOnly` models (Gemini 4 Argon@medium). With tools, they reply confirmed / refuted / uncertain plus code evidence | High-stakes changes; when false positives are expensive | ~1.5–2× |
+| *(default)* | Sonnet 5.5 + gpt-6.1-sol + Kimi K3.1 Pro + Gemini 4 Argon with read-only tools → grouping → the main agent judges | Most reviews | ~1× · ~2–3 min on a 700-line diff |
+| `--verify` | Adds a cross-check round: each issue goes to `verifiersPerFinding` (2) reviewers **who did not raise it**, plus any `verifyOnly` models. With tools, they reply confirmed / refuted / uncertain plus code evidence | High-stakes changes; when false positives are expensive | ~1.5–2× |
 | `--quick` | `quickReviewers` pool (gpt-6-luna@low, Haiku 5.5, Gemini Flash@low), single completions, no tools | Small diffs, a cheap first look | ~0.2× · 10–50s |
 | `--direct` | No agent hand-off: the configured judge writes the synthesis (print/RPC modes always do this) | Scripting, or when you don't want the agent involved | +1 judge call |
 
@@ -593,9 +592,17 @@ Findings:
   overlap least with theirs. On a narrow area review it took ~350s at
   `@high` (past the straggler cutoff) and ~270s at `@medium`, where it
   confirmed the main findings and added one no other reviewer raised.
-  Over the next real reviews it returned 0 findings every time (one run
-  timed out), while its verifier verdicts cited concrete code, so it moved
-  to `verifyOnly`: it verifies but no longer reviews.
+  Over the next two real reviews it returned 0 findings, so it moved to
+  `verifyOnly` for a while. The traces show it stopped after 6–11 tool
+  calls with `[]`, before `minReviewToolCalls` existed to push back on
+  that. Retried with the nudge on PR #4041 alongside the new pool, it took
+  203s at `@medium` (gpt-6.1-sol took 215s, so no added wall time), agreed
+  with the pool on two findings, and raised one real bug no one else did
+  (ThinkSound/ACE-Step report a deleted main `.gguf` as downloaded).
+  `@low` was no faster (313s, more tool calls). It's back in the pool at
+  `@medium`. About 1 in 4 of its verifier runs end in Google's
+  `content_filter` (likely recitation of quoted code); a reviewer that hits
+  it is reported as failed and the rest of the pool carries on.
 - **DeepSeek V4.1 Flash** (the gateway's pre-1017 checkpoint) works with
   tools and thinking but was too slow to review: cut as a straggler at
   `@high`, timed out at 900s at `@max` after ~200k characters of reasoning.
@@ -639,7 +646,8 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
   "reviewers": [
     "amd-gateway-anthropic/Claude-Sonnet-5.5@high",
     "amd-gateway/gpt-6.1-sol@high",
-    "amd-gateway/Kimi-K3.1-Pro@high"
+    "amd-gateway/Kimi-K3.1-Pro@high",
+    "amd-gateway/gemini-4-argon@medium"
   ],
   "judge": "amd-gateway-anthropic/Claude-Opus-5.5",
   "judgeThinking": "high",
@@ -647,7 +655,7 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
   "temperature": 0.2,
   "verify": false,
   "verifiersPerFinding": 2,
-  "verifyOnly": ["amd-gateway/gemini-4-argon@medium"],
+  "verifyOnly": [],
   "quickReviewers": [
     "amd-gateway/gpt-6-luna@low",
     "amd-gateway-anthropic/Claude-Haiku-5.5",

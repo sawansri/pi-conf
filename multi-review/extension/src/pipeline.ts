@@ -153,7 +153,7 @@ export async function runMultiReviewFromArgs(
 	const verifyOnlyIds = new Set(cfg.verifyOnly.map((raw) => parseReviewerSpec(raw)?.spec));
 	const reviewOnlySpecs = cfg.reviewers.filter((raw) => !verifyOnlyIds.has(parseReviewerSpec(raw)?.spec));
 	// Socratic discussions want the widest set of independent voices: verify-only
-	// models (e.g. Gemini 4 Argon) join as full participants. Quick runs have no
+	// models join as full participants. Quick runs have no
 	// tools, so they keep the quick pool.
 	const socraticSpecs = [...reviewOnlySpecs, ...cfg.verifyOnly]
 		.filter((raw, i, all) => all.findIndex((o) => parseReviewerSpec(o)?.spec === parseReviewerSpec(raw)?.spec) === i);

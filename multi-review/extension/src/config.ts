@@ -142,9 +142,13 @@ export function describeFlags(flags: ReviewFlags): string {
  * extras per minute.
  * Gemini 4 Argon was added after the benchmark as a frontier model from a
  * third family (Google), for diversity of blind spots; at @medium, since
- * @high (~350s on a narrow area review) ran past the straggler cutoff. As a
- * reviewer it returned 0 findings on every run (one timed out) while its
- * verifier verdicts cited concrete code, so it now only verifies.
+ * @high (~350s on a narrow area review) ran past the straggler cutoff. It
+ * spent a while as verify-only after returning 0 findings in two real
+ * reviews, but those runs predate minReviewToolCalls: it stopped after 6-11
+ * tool calls with `[]`. Retried with the nudge on PR #4041 it took 203s
+ * @medium (inside gpt-6.1-sol's 215s, so no added wall time), agreed with
+ * the pool on two findings and raised a real one no one else did. @low was
+ * no faster (313s, more tool calls), so it reviews at @medium.
  * Kimi K3.1 Pro@high replaced gpt-6-luna@high: over 45 real reviews luna
  * raised half as many findings as gpt-6.1-sol (56 vs 107, 14 vs 34 uniquely
  * confirmed) and failed or timed out in 8; head to head on PR #4041 luna
@@ -167,6 +171,7 @@ export const DEFAULTS: MultiReviewConfig = {
 		"amd-gateway-anthropic/Claude-Sonnet-5.5@high",
 		"amd-gateway/gpt-6.1-sol@high",
 		"amd-gateway/Kimi-K3.1-Pro@high",
+		"amd-gateway/gemini-4-argon@medium",
 	],
 	judge: "amd-gateway-anthropic/Claude-Opus-5.5",
 	judgeThinking: "high",
@@ -174,7 +179,7 @@ export const DEFAULTS: MultiReviewConfig = {
 	temperature: 0.2,
 	verify: false,
 	verifiersPerFinding: 2,
-	verifyOnly: ["amd-gateway/gemini-4-argon@medium"],
+	verifyOnly: [],
 	quickReviewers: [
 		"amd-gateway/gpt-6-luna@low",
 		"amd-gateway-anthropic/Claude-Haiku-5.5",

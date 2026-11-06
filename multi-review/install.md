@@ -100,7 +100,8 @@ cat > ~/.pi/agent/multi-review.json << 'EOF'
   "reviewers": [
     "amd-gateway-anthropic/Claude-Sonnet-5.5@high",
     "amd-gateway/gpt-6.1-sol@high",
-    "amd-gateway/Kimi-K3.1-Pro@high"
+    "amd-gateway/Kimi-K3.1-Pro@high",
+    "amd-gateway/gemini-4-argon@medium"
   ],
   "judge": "amd-gateway-anthropic/Claude-Opus-5.5",
   "judgeThinking": "high",
@@ -108,7 +109,7 @@ cat > ~/.pi/agent/multi-review.json << 'EOF'
   "temperature": 0.2,
   "verify": false,
   "verifiersPerFinding": 2,
-  "verifyOnly": ["amd-gateway/gemini-4-argon@medium"],
+  "verifyOnly": [],
   "quickReviewers": [
     "amd-gateway/gpt-6-luna@low",
     "amd-gateway-anthropic/Claude-Haiku-5.5",
@@ -266,7 +267,7 @@ follows it.
 
 The status footer shows the loaded pool on session start:
 ```
-multi-review · pool: 3 (amd-gateway-anthropic/Claude-Sonnet-5.5@high, amd-gateway/gpt-6.1-sol@high, amd-gateway/Kimi-K3.1-Pro@high)
+multi-review · pool: 4 (amd-gateway-anthropic/Claude-Sonnet-5.5@high, amd-gateway/gpt-6.1-sol@high, amd-gateway/Kimi-K3.1-Pro@high, amd-gateway/gemini-4-argon@medium)
 ```
 
 Per-run status updates flow through the same status key and a temporary
