@@ -139,12 +139,18 @@ export function describeFlags(flags: ReviewFlags): string {
  * internal benchmark (10 known bugs in a 3.3k-line file, 2 runs each, Opus
  * grading; see README "Model choice"): Sonnet 5.5 had the best recall with
  * zero dubious findings and was the fastest; gpt-6-sol adds the most valid
- * extras per minute; gpt-6-luna is precise (zero dubious) and fast.
+ * extras per minute.
  * Gemini 4 Argon was added after the benchmark as a frontier model from a
  * third family (Google), for diversity of blind spots; at @medium, since
  * @high (~350s on a narrow area review) ran past the straggler cutoff. As a
  * reviewer it returned 0 findings on every run (one timed out) while its
  * verifier verdicts cited concrete code, so it now only verifies.
+ * Kimi K3.1 Pro@high replaced gpt-6-luna@high: over 45 real reviews luna
+ * raised half as many findings as gpt-6.1-sol (56 vs 107, 14 vs 34 uniquely
+ * confirmed) and failed or timed out in 8; head to head on PR #4041 luna
+ * timed out at 344s while Kimi finished first (121s, 3 of 4 findings
+ * confirmed, one high-severity bug no other reviewer found) and verified
+ * 6/6 in 59s. It is also a third model family next to Claude and GPT.
  * gpt-6.1-sol@high replaced gpt-6-sol@xhigh: about as fast (153s vs 125s on
  * a narrow area review) and it caught both models' unique findings; at
  * @xhigh it took 386s. Grok-4.7 and GLM-5.3-Flash were too slow (900s
@@ -160,7 +166,7 @@ export const DEFAULTS: MultiReviewConfig = {
 	reviewers: [
 		"amd-gateway-anthropic/Claude-Sonnet-5.5@high",
 		"amd-gateway/gpt-6.1-sol@high",
-		"amd-gateway/gpt-6-luna@high",
+		"amd-gateway/Kimi-K3.1-Pro@high",
 	],
 	judge: "amd-gateway-anthropic/Claude-Opus-5.5",
 	judgeThinking: "high",

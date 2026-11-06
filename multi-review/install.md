@@ -9,9 +9,11 @@
 - One or more models registered in your pi config with valid credentials.
   Anywhere `ctx.modelRegistry.getAvailable()` returns a model is fair game
   (any provider with credentials). The default pool expects
-  `amd-gateway/gemini-4-argon` in `models.json` (an `openai-completions`
-  entry shaped like `gemini-3.8-flash`); if it's missing, that reviewer is
-  skipped with a notice.
+  `amd-gateway/gemini-4-argon` and `amd-gateway/Kimi-K3.1-Pro` in
+  `models.json` (`openai-completions` entries shaped like
+  `gemini-3.8-flash` and `Kimi-K2.7-Code`; Kimi K3.1 Pro takes every
+  level from `minimal` to `max`, `off` maps to `none`); if one is missing,
+  that reviewer is skipped with a notice.
 - For PR-number input: `gh` CLI authenticated (`gh auth status`), or a git
   repo where `git fetch origin pull/<N>/head:pr-<N>` is reachable without
   GH-aware tooling.
@@ -98,7 +100,7 @@ cat > ~/.pi/agent/multi-review.json << 'EOF'
   "reviewers": [
     "amd-gateway-anthropic/Claude-Sonnet-5.5@high",
     "amd-gateway/gpt-6.1-sol@high",
-    "amd-gateway/gpt-6-luna@high"
+    "amd-gateway/Kimi-K3.1-Pro@high"
   ],
   "judge": "amd-gateway-anthropic/Claude-Opus-5.5",
   "judgeThinking": "high",
@@ -264,7 +266,7 @@ follows it.
 
 The status footer shows the loaded pool on session start:
 ```
-multi-review · pool: 3 (amd-gateway-anthropic/Claude-Sonnet-5.5@high, amd-gateway/gpt-6.1-sol@high, amd-gateway/gpt-6-luna@high)
+multi-review · pool: 3 (amd-gateway-anthropic/Claude-Sonnet-5.5@high, amd-gateway/gpt-6.1-sol@high, amd-gateway/Kimi-K3.1-Pro@high)
 ```
 
 Per-run status updates flow through the same status key and a temporary
@@ -275,7 +277,7 @@ multi-review · mode=balanced+verify · reviewers running (2/4)
 latest: ✓ gpt-6.1-sol@high (2/4) — 11 findings, 132.5s, 24 tool calls
 multi-review · mode=balanced+verify · grouping findings (Claude-Opus-5.5)
 multi-review · mode=balanced+verify · verifying findings (2/3)
-latest: ✓ gpt-6-luna@high verified 3/3 (2 confirmed, 1 refuted), 8.9s
+latest: ✓ Kimi-K3.1-Pro@high verified 3/3 (2 confirmed, 1 refuted), 8.9s
 multi-review · done
 ```
 When called through the `multi_review` tool, the same progress is also sent

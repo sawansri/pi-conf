@@ -408,7 +408,7 @@ its own option:
 
 | Option | What it does | When | Cost / time (3-reviewer pool) |
 |--------|-------------|------|------------------------------|
-| *(default)* | Sonnet 5.5 + gpt-6.1-sol + gpt-6-luna with read-only tools → grouping → the main agent judges | Most reviews | ~1× · ~2–3 min on a 700-line diff |
+| *(default)* | Sonnet 5.5 + gpt-6.1-sol + Kimi K3.1 Pro with read-only tools → grouping → the main agent judges | Most reviews | ~1× · ~2–3 min on a 700-line diff |
 | `--verify` | Adds a cross-check round: each issue goes to `verifiersPerFinding` (2) reviewers **who did not raise it**, or to `verifyOnly` models (Gemini 4 Argon@medium). With tools, they reply confirmed / refuted / uncertain plus code evidence | High-stakes changes; when false positives are expensive | ~1.5–2× |
 | `--quick` | `quickReviewers` pool (gpt-6-luna@low, Haiku 5.5, Gemini Flash@low), single completions, no tools | Small diffs, a cheap first look | ~0.2× · 10–50s |
 | `--direct` | No agent hand-off: the configured judge writes the synthesis (print/RPC modes always do this) | Scripting, or when you don't want the agent involved | +1 judge call |
@@ -585,7 +585,7 @@ Findings:
   were no better than one level lower, only slower. Model choice matters
   far more than level.
 - **Sonnet + gpt-6-sol cover every bug any model found** (the
-  maxTokens/reasoning bug went unfound by all). luna adds a third
+  maxTokens/reasoning bug went unfound by all). A third reviewer adds an
   independent voice for consensus and for the verifier pool.
 - **Gemini 4 Argon joined the default pool after this benchmark** and
   isn't in the table yet. It's a frontier model from a different family
@@ -603,6 +603,16 @@ Findings:
   review: 6-sol@xhigh took 125s (5 findings), 6.1-sol@xhigh 386s (6),
   6.1-sol@high 153s (6, including each other model's unique finding),
   6.1-sol@medium 83s (4).
+- **Kimi K3.1 Pro@high replaced gpt-6-luna@high** (Kimi K3.1 Pro came out
+  after the benchmark). Over 45 real reviews luna raised about half as
+  many findings as gpt-6.1-sol (56 vs 107; 14 vs 34 confirmed by
+  verifiers and raised by no one else) and failed or timed out in 8 of
+  them. Head to head on PR #4041 with the whole pool, luna timed out at
+  344s; Kimi finished first (121s vs Sonnet 126s, 6.1-sol 203s) with 4
+  findings: 3 confirmed, including a high-severity bug no other reviewer
+  found, 1 unverified. As a verifier it checked 6/6 in 59s. It also adds a
+  third model family (Moonshot) next to Claude and GPT. luna stays in the
+  `--quick` pool at `@low`, where it's fast.
 - **Grok-4.7 and GLM-5.3-Flash are still too slow** on this gateway, even
   with GLM's on-prem endpoint no longer hanging. Grok timed out at 900s
   at `@high` and `@xhigh` (3–4.5 min per turn). GLM took 777s at `@high`
@@ -629,7 +639,7 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
   "reviewers": [
     "amd-gateway-anthropic/Claude-Sonnet-5.5@high",
     "amd-gateway/gpt-6.1-sol@high",
-    "amd-gateway/gpt-6-luna@high"
+    "amd-gateway/Kimi-K3.1-Pro@high"
   ],
   "judge": "amd-gateway-anthropic/Claude-Opus-5.5",
   "judgeThinking": "high",
