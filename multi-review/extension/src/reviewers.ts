@@ -16,6 +16,46 @@ export function isEmptyFindingsReply(text: string): boolean {
 	return /^\s*(```(?:json)?\s*)?\[\s*\]\s*(```)?\s*$/.test(text);
 }
 
+/** The session's last assistant turn ended in a provider safety filter (finish_reason content_filter). */
+export function endedInContentFilter(messages: readonly unknown[]): boolean {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const m = messages[i] as { role?: string; stopReason?: string; errorMessage?: string } | undefined;
+		if (m?.role !== "assistant") continue;
+		return m.stopReason === "error" && (m.errorMessage ?? "").includes("content_filter");
+	}
+	return false;
+}
+
+export const CONTENT_FILTER_RETRIES = 1;
+
+export const CONTENT_FILTER_RETRY_PROMPT =
+	"Your last reply was blocked by the provider's content filter, most likely for quoting source code verbatim. " +
+	"Continue from where you left off: you keep everything you have read. Describe code in your own words and cite file:line instead of quoting it; quote at most a few identifiers.";
+
+/**
+ * session.prompt that re-prompts the same session when a turn ends in
+ * content_filter. Gemini's recitation check trips on quoted code, about 1 in
+ * 4 of Argon's verifier runs, often after minutes of tool use; pi drops the
+ * errored turn from the context, so the retry keeps every file read so far.
+ */
+export function promptWithFilterRetry(
+	session: { prompt(text: string): Promise<void>; readonly messages: readonly unknown[] },
+	signal: AbortSignal,
+	onEvent?: (event: AgentSessionEvent) => void,
+): (text: string) => Promise<void> {
+	const aborted = new Error("aborted");
+	const once = (text: string) => abortable(session.prompt(text), signal, () => { throw aborted; });
+	let retries = CONTENT_FILTER_RETRIES;
+	return async (text) => {
+		await once(text);
+		while (retries > 0 && !signal.aborted && endedInContentFilter(session.messages)) {
+			retries--;
+			onEvent?.({ type: "multi_review_filter_retry" } as unknown as AgentSessionEvent);
+			await once(CONTENT_FILTER_RETRY_PROMPT);
+		}
+	};
+}
+
 export interface AgenticExtras {
 	/** Directory for the sandboxed `run` tool; unset means no `run`. */
 	runDir?: string;
@@ -111,8 +151,7 @@ export async function createReviewerSession(
 			const unsubscribe = onEvent ? session.subscribe(onEvent) : undefined;
 			try {
 				if (signal.aborted) throw new Error("aborted before start");
-				const aborted = new Error("aborted");
-				const prompt = (text: string) => abortable(session.prompt(text), signal, () => { throw aborted; });
+				const prompt = promptWithFilterRetry(session, signal, onEvent);
 				await prompt(userPrompt);
 				let text = lastTurnAssistantText(session.messages.slice(msgCountBefore));
 				if (!signal.aborted && !text.trim() && nudgeIfEmptyPrompt) {
@@ -229,8 +268,7 @@ async function runAgenticReviewer(
 	const unsubscribe = onEvent ? session.subscribe(onEvent) : undefined;
 	try {
 		if (signal.aborted) throw new Error("aborted before start");
-		const aborted = new Error("aborted");
-		const prompt = (text: string) => abortable(session.prompt(text), signal, () => { throw aborted; });
+		const prompt = promptWithFilterRetry(session, signal, onEvent);
 		await prompt(userPrompt);
 		// Agent turns sometimes end on a tool result or thinking with no final
 		// answer; one in-session nudge recovers it with the context intact.

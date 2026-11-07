@@ -117,6 +117,9 @@ export class ReviewTrace {
 					this.append(a, { kind: "tool", tool: "web_search", native: true, args: { query } });
 				} else if ((event as { type: string }).type === "multi_review_nudge") {
 					this.append(a, { kind: "nudge", toolCalls: (event as unknown as { toolCalls: number }).toolCalls });
+				} else if ((event as { type: string }).type === "multi_review_filter_retry") {
+					a.lastTool = "retry after content_filter";
+					this.append(a, { kind: "filter_retry" });
 				} else if (event.type === "tool_execution_end" && (event.toolName === GIT_TOOL || event.toolName === RUN_TOOL || event.toolName === XREF_TOOL || event.toolName === WEB_SEARCH_TOOL)) {
 					// Executed commands are evidence; keep the head of what they returned.
 					const content = ((event.result as { content?: Array<{ type: string; text?: string }> } | undefined)?.content ?? []);

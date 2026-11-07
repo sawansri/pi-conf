@@ -601,8 +601,11 @@ Findings:
   (ThinkSound/ACE-Step report a deleted main `.gguf` as downloaded).
   `@low` was no faster (313s, more tool calls). It's back in the pool at
   `@medium`. About 1 in 4 of its verifier runs end in Google's
-  `content_filter` (likely recitation of quoted code); a reviewer that hits
-  it is reported as failed and the rest of the pool carries on.
+  `content_filter` (likely recitation of quoted code). Any session that
+  hits it is re-prompted once in place, keeping what it has read, and asked
+  to describe code and cite `file:line` instead of quoting it; if the retry
+  is blocked too, that reviewer is reported as failed and the rest of the
+  pool carries on.
 - **DeepSeek V4.1 Flash** (the gateway's pre-1017 checkpoint) works with
   tools and thinking but was too slow to review: cut as a straggler at
   `@high`, timed out at 900s at `@max` after ~200k characters of reasoning.
