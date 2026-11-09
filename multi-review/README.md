@@ -405,9 +405,9 @@ The modes used to mix three separate choices: breadth (which reviewers),
 depth (a second checking round), and who writes the verdict. Now each is
 its own option:
 
-| Option | What it does | When | Cost / time (4-reviewer pool) |
+| Option | What it does | When | Cost / time (5-reviewer pool) |
 |--------|-------------|------|------------------------------|
-| *(default)* | Sonnet 5.5 + gpt-6.1-sol + Kimi K3.1 Pro + Gemini 4 Argon with read-only tools → grouping → the main agent judges | Most reviews | ~1× · ~2–3 min on a 700-line diff |
+| *(default)* | Opus 5.5 + Sonnet 5.5 + gpt-6.1-sol + Kimi K3.1 Pro + Gemini 4 Argon with read-only tools → grouping → the main agent judges | Most reviews | ~1× · ~2–3 min on a 700-line diff |
 | `--verify` | Adds a cross-check round: each issue goes to `verifiersPerFinding` (2) reviewers **who did not raise it**, plus any `verifyOnly` models. With tools, they reply confirmed / refuted / uncertain plus code evidence | High-stakes changes; when false positives are expensive | ~1.5–2× |
 | `--quick` | `quickReviewers` pool (gpt-6-luna@low, Haiku 5.5, Gemini Flash@low), single completions, no tools | Small diffs, a cheap first look | ~0.2× · 10–50s |
 | `--direct` | No agent hand-off: the configured judge writes the synthesis (print/RPC modes always do this) | Scripting, or when you don't want the agent involved | +1 judge call |
@@ -623,6 +623,9 @@ Findings:
   found, 1 unverified. As a verifier it checked 6/6 in 59s. It also adds a
   third model family (Moonshot) next to Claude and GPT. luna stays in the
   `--quick` pool at `@low`, where it's fast.
+- **Opus 5.5@high joined as a fifth reviewer**, so reviews and Socratic
+  discussions also get the strongest Claude model's own findings and
+  positions, not only its synthesis as judge.
 - **Grok-4.7 and GLM-5.3-Flash are still too slow** on this gateway, even
   with GLM's on-prem endpoint no longer hanging. Grok timed out at 900s
   at `@high` and `@xhigh` (3–4.5 min per turn). GLM took 777s at `@high`
@@ -635,7 +638,7 @@ On a realistic 700-line diff (commit `a88d67e` against its parent), the
 default pool finished in **138s**, with 7 of 12 issues confirmed by two
 or more reviewers.
 
-The judge and grouping model stay Opus 5.5 (your main model). Public
+The judge and grouping model stay Opus 5.5 (your main model), now also one of the reviewers. Public
 code-review benchmarks (Qodo, Macroscope) point the same way: Claude
 models lead on recall, while gpt-6-astra leads on precision but is slow.
 
@@ -647,6 +650,7 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
 ```json
 {
   "reviewers": [
+    "amd-gateway-anthropic/Claude-Opus-5.5@high",
     "amd-gateway-anthropic/Claude-Sonnet-5.5@high",
     "amd-gateway/gpt-6.1-sol@high",
     "amd-gateway/Kimi-K3.1-Pro@high",

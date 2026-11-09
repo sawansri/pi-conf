@@ -98,6 +98,7 @@ session without installing, use
 cat > ~/.pi/agent/multi-review.json << 'EOF'
 {
   "reviewers": [
+    "amd-gateway-anthropic/Claude-Opus-5.5@high",
     "amd-gateway-anthropic/Claude-Sonnet-5.5@high",
     "amd-gateway/gpt-6.1-sol@high",
     "amd-gateway/Kimi-K3.1-Pro@high",
@@ -267,7 +268,7 @@ follows it.
 
 The status footer shows the loaded pool on session start:
 ```
-multi-review · pool: 4 (amd-gateway-anthropic/Claude-Sonnet-5.5@high, amd-gateway/gpt-6.1-sol@high, amd-gateway/Kimi-K3.1-Pro@high, amd-gateway/gemini-4-argon@medium)
+multi-review · pool: 5 (amd-gateway-anthropic/Claude-Opus-5.5@high, amd-gateway-anthropic/Claude-Sonnet-5.5@high, amd-gateway/gpt-6.1-sol@high, +2 more)
 ```
 
 Per-run status updates flow through the same status key and a temporary
