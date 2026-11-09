@@ -22,7 +22,7 @@ Output ONLY a JSON array:
     "title": "<≤80 chars>",
     "comment": "<what is wrong, ≤400 chars>",
     "evidence": "<the execution path / spec clause / lines that prove it, ≤400 chars>",
-    "repro": "<concrete trigger → observed vs expected, e.g. \"set('k', v, 1000), get('k') at t+500ms → undefined; expected v\". Omit only for pure design/docs findings. ≤300 chars>",
+    "repro": "<steps someone can run as written: the exact command, test, or call sequence with concrete inputs, driving the changed code itself (not a re-implementation of it), then observed vs expected, e.g. \"cache.set('k', v, 1000); advance clock 500ms; cache.get('k') → undefined; expected v\". Omit only for pure design/docs findings. ≤400 chars>",
     "suggestion": "<optional concrete fix, ≤200 chars>"
   }
 ]
