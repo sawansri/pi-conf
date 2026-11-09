@@ -95,10 +95,18 @@ pi -p "/multi-review-run --brief=<brief.json> --out=<dir>/result.json" < /dev/nu
 
 Read `<dir>/result.md`. It is the compact lead view. Each issue has one canonical description with **Evidence**, **Repro** and **Fix**, other reviewers' framings as one-liners, and its verification tally and evidence. Then come your suspicions, warnings, and a **Lead judgment** section. Follow that section:
 - verify single-reviewer findings by reading the code;
+- **run each finding's repro yourself**, in this session rather than a subagent, so the results stay in your context:
+  - first correct the reviewer's steps against the code: the right entry point, inputs that reach the flagged line, the real expected value;
+  - drive the code under review (import it, call it, run the binary or an existing test), never a re-implementation of it;
+  - run it as a short script, targeted test, or build of the touched target, in a scratch worktree or under `/tmp` (never edit the user's working tree);
+  - record reproduced / not reproduced / not run, with the command and its output;
+  - if it doesn't reproduce, check why: fix a wrong setup and rerun once, but don't bend the trigger until it fails.
+
+  Reproduced findings go in Act On; ones that still don't reproduce are Dismissed unless the code shows the attempt can't reach the trigger here; ones you couldn't run are judged on the code;
 - weigh verification evidence rather than votes;
 - say which of your suspicions held up.
 
-Reply in its format: Intent · Reviewers · (Spec conformance) · Act On · Side effects · Consider · Noted · Dismissed · Agreement Map. Every Act On item gets a **Repro** and a **Test**. **Side effects** lists, for each Act On fix, everything it changes besides fixing the issue: behavior or output changes, API or config changes, callers and tests that need updating, compatibility, and performance. Check the call sites to find them, and write "none" for a fix with no side effects.
+Reply in its format: Intent · Reviewers · (Spec conformance) · Act On · Side effects · Consider · Noted · Dismissed · Agreement Map. Every Act On item gets a **Repro** with its result (the command and the output) and a **Test**. **Side effects** lists, for each Act On fix, everything it changes besides fixing the issue: behavior or output changes, API or config changes, callers and tests that need updating, compatibility, and performance. Check the call sites to find them, and write "none" for a fix with no side effects.
 
 If you need a reviewer's exact wording, `result.json` → `details.groups[].members` has the verbatim per-reviewer text (look issues up by id).
 
@@ -111,6 +119,7 @@ Review: <dir>/result.md
 ## Act On
 - [ ] A1 (g2) <title> — `file:line`
   - Repro: <trigger → observed vs expected>
+  - Repro result: reproduced | not run (<why>) — `<command>` → <output>
   - Test: <test file / name and what it asserts>
   - Fix: <approach>
   - Side effects: <what else the fix changes, or "none">
@@ -140,7 +149,7 @@ Reply in its format: Topic · Participants · (Spec & Constraint Alignment) · D
 ## 5. If the user asks you to fix
 
 Don't edit until asked. Then work through `verdict.md`:
-1. **Test first.** For each Act On item, write the test from its repro, run it and see it **fail**, then fix and see it **pass**. A test that passes before the fix proves nothing; rewrite it. Tick the item in `verdict.md`.
+1. **Test first.** For each Act On item, write the test from its repro (start from your repro script), run it and see it **fail**, then fix and see it **pass**. A test that passes before the fix proves nothing; rewrite it. Tick the item in `verdict.md`.
 2. **Run the full test suite.**
 3. **Confirmation re-review.** Write a new brief and run step 3 again:
    - `intent`: "Fixes for the issues in <dir>/verdict.md: …" plus the original intent.

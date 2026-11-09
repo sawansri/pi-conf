@@ -114,6 +114,8 @@ export function leadJudgmentInstructions(hasSpec: boolean, prNumber?: number): s
 		"Dismiss: hypotheticals the call sites rule out, \"I would have done it differently\", findings about code the change didn't touch, and nits inflated to fill a review.",
 		"If the result lists your suspicions: one raised independently is strong signal; one nobody raised is either wrong or a shared blind spot — read the code (or weigh its verification evidence) before deciding. Say which of your suspicions held up.",
 		"If a finding has independent verification (✓ confirmed / ✗ refuted / ? uncertain by reviewers who did not raise it), weigh the evidence, not the vote: a refutation citing concrete code usually means Dismissed; a split verdict means read the code yourself.",
+		"Reproduce before you judge, yourself in this session (don't delegate to a subagent: the results are evidence you need in context). For every finding with a Repro (pure design/docs findings have none), first check the reviewer's steps against the code and correct them: the right entry point, inputs that actually reach the flagged line, and the real expected value. The repro must drive the code under review (import the module, call the function, run the binary or an existing test); a re-implementation of the logic proves nothing. Then run it: a short script, a targeted test, or a build of the touched target. Record the result as reproduced (the observed behavior matches), not reproduced (and what you observed instead), or not run (and why: needs hardware, the network, a long build, …). Work in a scratch copy of the code under review (a `git worktree` with the diff applied, or the PR's branch) or under /tmp; never edit the user's working tree for this. Keep each attempt short and targeted; never run the full test suite.",
+		"A reproduced finding goes in Act On. If a repro does not reproduce, check why before concluding: wrong setup or inputs are your repro's bug, so fix them and rerun once, but don't bend the trigger until it fails. One that still does not reproduce is Dismissed, unless reading the code shows the attempt cannot reach the trigger here (say how). A finding you could not run is judged on the code; say so.",
 		"",
 		"Reply to the user in this format:",
 		"### Intent",
@@ -135,7 +137,7 @@ export function leadJudgmentInstructions(hasSpec: boolean, prNumber?: number): s
 	}
 	lines.push(
 		"### Act On",
-		"Real issues that would block a PR, numbered. Each: what, where (file:line), which models raised it, why it matters, **Repro** (the concrete trigger → observed vs expected; take the reviewer's and correct it if needed), **Test** (the failing test that will prove the fix), and the fix. Aim for ≤5; more means you aren't filtering hard enough.",
+		"Real issues that would block a PR, numbered. Each: what, where (file:line), which models raised it, why it matters, **Repro** (the concrete trigger → observed vs expected; take the reviewer's and correct it if needed) and its result (reproduced / not run, with the command and the output that shows it), **Test** (the failing test that will prove the fix), and the fix. Aim for ≤5; more means you aren't filtering hard enough.",
 		"### Side effects",
 		"For each Act On fix: what changes besides fixing the issue — behavior or output changes, API/signature or config changes, callers or tests that will need updating, compatibility, performance, and error-handling changes. Check the call sites; don't guess. Write \"none\" for a fix with no side effects, rather than leaving it out.",
 		"### Consider",
@@ -143,7 +145,7 @@ export function leadJudgmentInstructions(hasSpec: boolean, prNumber?: number): s
 		"### Noted",
 		"Valid but not actionable; one line each.",
 		"### Dismissed",
-		"Each with a one-line reason, so the user can override you.",
+		"Each with a one-line reason, so the user can override you. A finding that did not reproduce says what you ran and what you observed.",
 		"### Agreement Map",
 		"Where models agreed or diverged, and what that pattern suggests.",
 		"",
@@ -154,7 +156,7 @@ export function leadJudgmentInstructions(hasSpec: boolean, prNumber?: number): s
 			]
 			: []),
 		"Do not apply fixes unless the user asks. If they do, work from your verdict, not this raw review:",
-		"1. For each Act On item: write its test from the repro, run it and see it FAIL, fix, see it PASS. A test that passes before the fix doesn't prove anything; rewrite it.",
+		"1. For each Act On item: write its test from the repro (start from your repro script), run it and see it FAIL, fix, see it PASS. A test that passes before the fix doesn't prove anything; rewrite it.",
 		"2. Run the project's full test suite.",
 		"3. Confirm with a re-review of the new diff: multi_review with verify: true, `focus` on the areas you touched, and `suspicions` = each fixed Act On item phrased as a claim that it is still present (e.g. \"g2 still present: get() returns expired entries at cache.ts:6\"). Report each as fixed (refuted by verifiers, not raised) or still present, plus any new issues the fixes introduced.",
 	);
