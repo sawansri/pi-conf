@@ -12,6 +12,8 @@ export interface Review {
   branch: string
   /** The tree (or PR-head commit) the reviewers read. */
   sha: string
+  /** HEAD's tree when a working tree was reviewed: what of `sha` was committed then. */
+  base?: string
   pr?: number
   /** When the review finished. */
   at: number
@@ -20,7 +22,7 @@ export interface Review {
   result?: string
 }
 
-export type Target = Pick<Review, 'root' | 'branch' | 'sha' | 'pr'>
+export type Target = Pick<Review, 'root' | 'branch' | 'sha' | 'pr' | 'base'>
 
 export interface Freshness {
   review: Review
@@ -36,10 +38,13 @@ export interface BriefInfo {
   pr_number?: number
 }
 
-async function run($: EngineInterface, argv: string[], cwd?: string, env?: Record<string, string>): Promise<string | undefined> {
-  const r = await $.process.run(argv, { ...(cwd ? { cwd } : {}), ...(env ? { env } : {}), timeoutMs: 15_000 }).catch(() => undefined)
+async function run($: EngineInterface, argv: string[], cwd?: string, env?: Record<string, string>, stdin?: string): Promise<string | undefined> {
+  const r = await $.process.run(argv, { ...(cwd ? { cwd } : {}), ...(env ? { env } : {}), ...(stdin !== undefined ? { stdin } : {}), timeoutMs: 15_000 }).catch(() => undefined)
   return r?.exitCode === 0 ? r.stdout.trim() : undefined
 }
+
+/** NUL-separated paths (`git … -z`). */
+const paths = (out: string | undefined) => (out ?? '').split('\0').filter(Boolean)
 
 /**
  * The working tree as git would commit it with `git add -A`: tracked and
@@ -63,6 +68,16 @@ async function snapshotNow($: EngineInterface, root: string): Promise<string | u
   if (!index) return undefined
   const env = { GIT_INDEX_FILE: index }
   if ((await run($, ['git', 'add', '-A'], root, env)) === undefined) return undefined
+  // Tracked files that match .gitignore (a committed build output): `add -A`
+  // into a fresh index skips them as ignored. Force-add the ones still on
+  // disk; a deleted one is already gone from this index after `add -A`, and
+  // naming it would fail the add.
+  const deleted = new Set(paths(await run($, ['git', 'ls-files', '-z', '-d'], root)))
+  const ignored = paths(await run($, ['git', 'ls-files', '-z', '-c', '-i', '--exclude-standard'], root)).filter((p) => !deleted.has(p))
+  if (ignored.length > 0) {
+    const added = await run($, ['git', 'add', '-A', '-f', '--pathspec-from-file=-', '--pathspec-file-nul'], root, env, ignored.map((p) => `${p}\0`).join(''))
+    if (added === undefined) return undefined
+  }
   return run($, ['git', 'write-tree'], root, env)
 }
 
@@ -73,12 +88,24 @@ export function briefPath(command: string): string | undefined {
   return path && path.startsWith('/') && !/[$`~]/.test(path) ? path : undefined
 }
 
+/**
+ * Whether pi runs the brief as a Socratic discussion, by its rules
+ * (extension/src/headless.ts parseReviewRequest): `socratic`, else
+ * `discuss`, `mode: "socratic"|"discuss"`, or `rounds`.
+ */
+export function isSocratic(b: Record<string, unknown>): boolean {
+  if (typeof b.socratic === 'boolean') return b.socratic
+  if (typeof b.discuss === 'boolean') return b.discuss
+  if (typeof b.mode === 'string' && ['socratic', 'discuss'].includes(b.mode.toLowerCase())) return true
+  return typeof b.rounds === 'number'
+}
+
 export async function readBrief($: EngineInterface, path: string | undefined): Promise<BriefInfo> {
   if (!path) return {}
   try {
     const b = JSON.parse(await $.fs.read(path)) as Record<string, unknown>
     return {
-      socratic: b.socratic === true,
+      socratic: isSocratic(b),
       ...(typeof b.pr_number === 'number' ? { pr_number: b.pr_number } : typeof b.pr_number === 'string' && /^\d+$/.test(b.pr_number) ? { pr_number: Number(b.pr_number) } : {}),
     }
   } catch {
@@ -110,7 +137,8 @@ export async function captureTarget($: EngineInterface, brief: BriefInfo): Promi
     }
   }
   const sha = await snapshot($, here.root)
-  return sha ? { ...here, sha } : undefined
+  const base = await run($, ['git', 'rev-parse', 'HEAD^{tree}'], here.root)
+  return sha ? { ...here, sha, ...(base ? { base } : {}) } : undefined
 }
 
 export const storeKey = (root: string, branch: string) => `review:${root}:${branch}`
@@ -140,14 +168,27 @@ export async function freshness($: EngineInterface, against: 'worktree' | 'HEAD'
   }
   const now = against === 'HEAD' ? await run($, ['git', 'rev-parse', 'HEAD^{tree}'], here.root) : await snapshot($, here.root)
   if (!now) return undefined
-  // At a push, files only the snapshot has are untracked files nobody
-  // committed (scratch notes): not part of what's pushed.
-  const stat = await run($, ['git', 'diff', '--shortstat', ...(against === 'HEAD' ? ['--diff-filter=d'] : []), review.sha, now], here.root)
+  const stat = await run($, ['git', 'diff', '--shortstat', review.sha, now, ...(against === 'HEAD' ? await scratchExcludes($, review, now) : [])], here.root)
   if (stat === undefined) return undefined
   return { review, ...parseShortstat(stat) }
 }
 
 /** Any file: renames, mode changes and binary files change no lines. */
+/**
+ * At a push: pathspecs leaving out files that were untracked when reviewed
+ * and still aren't committed (scratch notes). They're in the reviewed
+ * snapshot but were never pushed. A file deleted and committed after the
+ * review was tracked then (in `base`), so it still counts.
+ */
+async function scratchExcludes($: EngineInterface, review: Review, head: string): Promise<string[]> {
+  if (!review.base) return []
+  const untrackedThen = paths(await run($, ['git', 'diff', '--name-only', '-z', '--no-renames', '--diff-filter=A', review.base, review.sha], review.root))
+  if (untrackedThen.length === 0) return []
+  const absentNow = new Set(paths(await run($, ['git', 'diff', '--name-only', '-z', '--no-renames', '--diff-filter=D', review.sha, head], review.root)))
+  const scratch = untrackedThen.filter((p) => absentNow.has(p))
+  return scratch.length ? ['--', '.', ...scratch.map((p) => `:(exclude,literal)${p}`)] : []
+}
+
 export const isStale = (f: Freshness) => f.isMissing === true || f.files > 0
 
 export function age(ms: number): string {

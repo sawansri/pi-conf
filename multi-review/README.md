@@ -404,9 +404,11 @@ multi-review · ⚠ +412 −30 in 9 files since the review 2h ago (balanced+veri
 ```
 
 When a run starts, the mod records what the reviewers read: the working
-tree, untracked files included, as a tree (`git add -A` and
+tree, untracked files and tracked files matching `.gitignore` included, as
+a tree (`git add -A`, a forced add of those tracked-but-ignored files, and
 `git write-tree` into its own index, `<git-dir>/multi-review-index`; your
-index is never touched), or the PR head for a PR review. Once
+index is never touched), or the PR head for a PR review. Briefs pi runs
+as discussions (`socratic`, `discuss`, `mode`, `rounds`) aren't recorded. Once
 `result.json` says `ok`, it keeps that tree in the mod's store, per
 repository and branch, across sessions. Socratic discussions and failed
 runs don't count. After Bash and edit calls it snapshots the tree again
@@ -415,8 +417,9 @@ covers the code shows a ✓ line for 15 minutes; a stale one shows the warning a
 `git push`, `gh pr create`, `gh pr ready` or `gh pr merge` that sends code
 the review didn't cover (HEAD's tree against the reviewed one, so
 uncommitted edits don't count) gets a toast, and the model gets a note to
-tell you. Untracked files nobody committed (scratch notes) aren't part
-of a push. Any changed file makes a review stale, renames and mode changes
+tell you. Files that were untracked when reviewed and still aren't
+committed (scratch notes) aren't part of a push, but a file deleted and
+committed after the review is. Any changed file makes a review stale, renames and mode changes
 included; `git push` in quoted text, a heredoc or a shell comment isn't a
 push, and neither is `git push-to-checkout`. The
 recorded tree is unreferenced, so `git gc` may prune it after a couple
