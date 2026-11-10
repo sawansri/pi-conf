@@ -549,9 +549,16 @@ extglob — documented limitation.
    disk are the local checkout, and reviewers are told the diff is
    authoritative.
 
-5. **Reviewer prompt** — adversarial and evidence-required (trace the
+5. **Reviewer prompt** — adversarial, evidence-required, and aimed at
+   recall: investigate every suspicious pattern, and report a problem
+   traced only part of the way, saying in evidence what wasn't traced.
+   Precision is the job of the later phases (verifiers, the lead's
+   repros), not of the reviewer deciding what's worth saying; Cursor's
+   Bugbot found the same when it moved to agentic review (bugs resolved
+   52% → 70% after it told the agent to investigate every suspicious
+   pattern, [Cursor](https://cursor.com/blog/building-bugbot)). Still: trace the
    execution path, trace security inputs to the sink, no "I'd have done it
-   differently", empty review is valid). Output is ONLY a JSON array of
+   differently", no style padding, and `[]` only after investigating. Output is ONLY a JSON array of
    `{file, line_start, line_end, severity, category, title, comment,
    evidence, repro, suggestion}`. `repro` is the concrete trigger and the
    observed vs expected result, which makes every finding test-ready. Category `spec` marks unmet requirements. The
