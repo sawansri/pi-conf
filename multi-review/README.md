@@ -644,8 +644,10 @@ extglob — documented limitation.
    it with `result.json` and appends one line per finding to
    `~/.local/share/multi-review/outcomes.jsonl` (`$XDG_DATA_HOME`): the
    model and pass, category, severity, `evidence_kind`, verification
-   tally, veto, and bucket. A run is recorded once; suspicions and PR
-   claims aren't a model's findings and are left out. Once a model has
+   tally, veto, and bucket. Each issue is recorded once, so rerunning after
+   bucketing more issues records just those; suspicions and PR claims
+   aren't a model's findings and are left out. An issue both of a model's
+   passes raised counts once in its track record. Once a model has
    10 judged findings, the lead view gets a **Reviewer track record**
    section: how often its findings were acted on or dismissed, its most
    dismissed categories (5+ findings), and its act-on rate by

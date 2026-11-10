@@ -139,7 +139,7 @@ and run, exactly in this form:
 pi -p "/multi-review-outcomes --dir=<dir>" < /dev/null
 ```
 
-It appends to `~/.local/share/multi-review/outcomes.jsonl` and prints how many findings it recorded. Record a run once, after your verdict is final. If the result has a **Reviewer track record** section, use it as a prior for how far to trust each model's findings, never as a reason to skip checking one.
+It appends to `~/.local/share/multi-review/outcomes.jsonl` and prints how many findings it recorded. Run it after your verdict is final; issues already recorded are skipped, so rerunning after bucketing more of them records just those. If the result has a **Reviewer track record** section, use it as a prior for how far to trust each model's findings, never as a reason to skip checking one.
 
 ### With `--pr-comments`: triage and draft replies
 

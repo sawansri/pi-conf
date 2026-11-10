@@ -70,10 +70,15 @@ function normalizeBucket(raw: unknown): Bucket | undefined {
 
 /**
  * Join `<dir>/result.json` (the review) with `<dir>/outcomes.json` (the
- * lead's `{ "g1": "act_on", … }`) and append one record per finding. A run
- * already in the log is not recorded twice.
+ * lead's `{ "g1": "act_on", … }`) and append one record per finding. An
+ * issue already in the log is not recorded twice, so rerunning after adding
+ * buckets records just the new ones.
  */
-export function recordOutcomes(dir: string, file = outcomesPath(), now = new Date()): { recorded: number; skipped: string[] } | { error: string } {
+export function recordOutcomes(
+	dir: string,
+	file = outcomesPath(),
+	now = new Date(),
+): { recorded: number; skipped: string[]; already: string[] } | { error: string } {
 	let result: { ok?: boolean; details?: { groups?: DedupeGroup[]; scope?: string } };
 	let buckets: Record<string, unknown>;
 	try {
@@ -89,12 +94,17 @@ export function recordOutcomes(dir: string, file = outcomesPath(), now = new Dat
 	const groups = result.details?.groups;
 	if (!result.ok || !groups) return { error: "result.json has no review groups (failed run or Socratic discussion)" };
 	const run = path.resolve(dir);
-	if (readOutcomes(file).some((r) => r.run === run)) return { error: `${run} is already recorded` };
+	const recordedGroups = new Set(readOutcomes(file).filter((r) => r.run === run).map((r) => r.group));
 	const records: OutcomeRecord[] = [];
 	const skipped: string[] = [];
+	const already: string[] = [];
 	for (const g of groups) {
 		// Suspicions and PR claims are the lead's and others' claims, not a model's findings.
 		if (g.category === "suspicion" || g.category === "pr-claim") continue;
+		if (recordedGroups.has(g.id)) {
+			already.push(g.id);
+			continue;
+		}
 		const bucket = normalizeBucket(buckets[g.id]);
 		if (!bucket) {
 			skipped.push(g.id);
@@ -114,7 +124,7 @@ export function recordOutcomes(dir: string, file = outcomesPath(), now = new Dat
 		fs.mkdirSync(path.dirname(file), { recursive: true });
 		fs.appendFileSync(file, records.map((r) => JSON.stringify(r)).join("\n") + "\n");
 	}
-	return { recorded: records.length, skipped };
+	return { recorded: records.length, skipped, already };
 }
 
 /** Below this many judged findings, a model's record says too little to show. */
@@ -133,7 +143,14 @@ export interface TrackRecord {
 
 export function trackRecords(records: OutcomeRecord[], specs: string[]): TrackRecord[] {
 	return specs.flatMap((spec) => {
-		const mine = records.filter((r) => r.spec === spec);
+		// One finding per issue: a model's two passes raising it is one finding.
+		const seen = new Set<string>();
+		const mine = records.filter((r) => {
+			const key = `${r.run}\u0000${r.group}`;
+			if (r.spec !== spec || seen.has(key)) return false;
+			seen.add(key);
+			return true;
+		});
 		if (mine.length < MIN_TRACK_RECORD) return [];
 		const count = (rs: OutcomeRecord[], b: Bucket) => rs.filter((r) => r.bucket === b).length;
 		const categories = [...new Set(mine.map((r) => r.category))]

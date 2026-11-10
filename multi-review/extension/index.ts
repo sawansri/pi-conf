@@ -229,7 +229,8 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			const skipped = out.skipped.length ? `; no bucket for ${out.skipped.join(", ")}` : "";
-			console.error(`multi-review-outcomes: recorded ${out.recorded} findings${skipped}`);
+			const already = out.already.length ? `; already recorded: ${out.already.join(", ")}` : "";
+			console.error(`multi-review-outcomes: recorded ${out.recorded} findings${skipped}${already}`);
 		},
 	});
 

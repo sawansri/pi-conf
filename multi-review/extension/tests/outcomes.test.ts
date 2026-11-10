@@ -23,15 +23,19 @@ test("a run's verdicts are recorded once per finding, joined with how it was rai
 	const log = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "mr-log-")), "outcomes.jsonl");
 	const dir = runDir(GROUPS, { g1: "Act On", g2: "dismissed", g3: "act_on" });
 	const out = recordOutcomes(dir, log, new Date("2026-11-10T00:00:00Z"));
-	assert.deepEqual(out, { recorded: 3, skipped: ["g4"] });
+	assert.deepEqual(out, { recorded: 3, skipped: ["g4"], already: [] });
 	const records = readOutcomes(log);
 	assert.deepEqual(records.map((r) => [r.group, r.spec, r.pass, r.bucket, r.evidenceKind, r.vetoed, r.verification]), [
 		["g1", "p/opus", undefined, "act_on", "executed", true, "✓0 ✗1 ?0"],
 		["g1", "p/sonnet", 2, "act_on", undefined, true, "✓0 ✗1 ?0"],
 		["g2", "p/kimi", undefined, "dismissed", undefined, false, ""],
 	]);
-	assert.match(String((recordOutcomes(dir, log) as { error: string }).error), /already recorded/);
+	assert.deepEqual(recordOutcomes(dir, log), { recorded: 0, skipped: ["g4"], already: ["g1", "g2"] });
 	assert.equal(readOutcomes(log).length, 3);
+	// bucketing the rest later records just that
+	fs.writeFileSync(path.join(dir, "outcomes.json"), JSON.stringify({ g1: "act_on", g2: "dismissed", g4: "noted" }));
+	assert.deepEqual(recordOutcomes(dir, log), { recorded: 1, skipped: [], already: ["g1", "g2"] });
+	assert.deepEqual(readOutcomes(log).map((r) => r.group), ["g1", "g1", "g2", "g4"]);
 });
 
 test("a run without outcomes.json or review groups is an error, and records nothing", () => {
@@ -45,12 +49,13 @@ test("a run without outcomes.json or review groups is an error, and records noth
 	assert.equal(fs.existsSync(log), false);
 });
 
+let nextGroup = 0;
 const rec = (spec: string, bucket: OutcomeRecord["bucket"], category = "correctness", evidenceKind?: OutcomeRecord["evidenceKind"]): OutcomeRecord =>
-	({ t: "", run: "r", scope: "", group: "g", spec, category, severity: "high", verification: "", vetoed: false, bucket, ...(evidenceKind ? { evidenceKind } : {}) });
+	({ t: "", run: "r", scope: "", group: `g${nextGroup++}`, spec, category, severity: "high", verification: "", vetoed: false, bucket, ...(evidenceKind ? { evidenceKind } : {}) });
 
 test("a model's track record shows once it has enough judged findings", () => {
-	const kimi = [...Array(6).fill(rec("p/kimi", "dismissed", "design")), ...Array(4).fill(rec("p/kimi", "act_on", "correctness", "executed"))];
-	const opus = Array(MIN_TRACK_RECORD - 1).fill(rec("p/opus", "act_on"));
+	const kimi = [...Array.from({ length: 6 }, () => rec("p/kimi", "dismissed", "design")), ...Array.from({ length: 4 }, () => rec("p/kimi", "act_on", "correctness", "executed"))];
+	const opus = Array.from({ length: MIN_TRACK_RECORD - 1 }, () => rec("p/opus", "act_on"));
 	const [t, ...rest] = trackRecords([...kimi, ...opus], ["p/kimi", "p/opus"]);
 	assert.deepEqual(rest, []);
 	assert.deepEqual([t.spec, t.n, t.actOn, t.dismissed], ["p/kimi", 10, 4, 6]);
@@ -59,4 +64,10 @@ test("a model's track record shows once it has enough judged findings", () => {
 	assert.match(lines, /kimi: 10 findings judged, 40% acted on, 60% dismissed · most dismissed: design 100% of 6 · act on by evidence: executed 100% of 4/);
 	assert.match(lines, /not a filter/);
 	assert.deepEqual(trackRecordLines(opus, ["p/opus"]), []);
+});
+
+test("an issue both of a model's passes raised is one finding in its track record", () => {
+	const both = [...Array(MIN_TRACK_RECORD)].flatMap((_, i) => [{ ...rec("p/sonnet", "act_on"), group: `g${i}` }, { ...rec("p/sonnet", "act_on"), group: `g${i}`, pass: 2 }]);
+	assert.equal(trackRecords(both, ["p/sonnet"])[0].n, MIN_TRACK_RECORD);
+	assert.deepEqual(trackRecords(both.slice(0, MIN_TRACK_RECORD + 2), ["p/sonnet"]), []);
 });
