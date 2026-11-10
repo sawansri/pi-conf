@@ -1,6 +1,7 @@
 import type { On, ToolCallResult } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
-import { briefPath, describe as describeFresh, parseShortstat } from '../hooks/freshness.js'
+import { briefPath, describe as describeFresh, isStale, parseShortstat } from '../hooks/freshness.js'
+import { isPush } from '../hooks/register.js'
 
 const DIR = '/tmp/mr-run'
 const COMMAND = `pi -p "/multi-review-run --brief=${DIR}/brief.json --out=${DIR}/result.json" < /dev/null`
@@ -20,6 +21,8 @@ interface Repo {
   shortstat: string
   /** What `git write-tree` prints: the working tree, untracked files included. */
   tree: string
+  /** `git rev-parse HEAD^{tree}`: what a push sends. */
+  headTree: string
   /** Objects that exist. */
   objects: Set<string>
   argvs: string[]
@@ -53,9 +56,13 @@ function stub(on: On, repo: Repo) {
     if (argv === 'git branch --show-current') return out('feat/x\n')
     if (argv === 'git rev-parse --path-format=absolute --git-path multi-review-index') return out(`${OWN_INDEX}\n`)
     if (argv === 'git add -A') return out('')
+    if (argv === 'git rev-parse HEAD^{tree}') return out(`${repo.headTree}\n`)
     if (argv === 'git write-tree') return out(`${repo.tree}\n`)
     if (argv.startsWith('git cat-file -e ')) return out('', repo.objects.has(argv.slice(16).replace('^{tree}', '')) ? 0 : 1)
-    if (argv.startsWith('git diff --shortstat ')) return out(repo.shortstat)
+    if (argv.startsWith('git diff --shortstat ')) {
+      const [a, b] = argv.slice(21).split(' ')
+      return out(a === b ? '' : repo.shortstat)
+    }
     if (argv.startsWith('gh pr view 4102')) return out(JSON.stringify({ headRefOid: 'prhead', headRefName: 'feat/x' }))
     return out('', 1)
   })
@@ -68,7 +75,7 @@ function stub(on: On, repo: Repo) {
   return { clock, toasts }
 }
 
-const repo = (over: Partial<Repo> = {}): Repo => ({ brief: {}, result: { ok: true }, shortstat: '', tree: 'tree1', objects: new Set(['tree1', 'prhead']), argvs: [], onRealIndex: [], ...over })
+const repo = (over: Partial<Repo> = {}): Repo => ({ brief: {}, result: { ok: true }, shortstat: '', tree: 'tree1', headTree: 'tree1', objects: new Set(['tree1', 'prhead']), argvs: [], onRealIndex: [], ...over })
 
 test('a successful review covers the code until it changes, and a push after that is flagged', async ($, on) => {
   const r = repo()
@@ -88,6 +95,7 @@ test('a successful review covers the code until it changes, and a push after tha
   await clock.advance(2500)
   expect(await band.find({ type: 'Text', text: /⚠ \+10 −3 in 2 files since the review/ })).toBeDefined()
 
+  r.headTree = 'tree2' // committed
   const pushed = await $.tool.call({ tool: 'Bash', command: 'git push -u origin feat/x' })
   expect(toasts.some((t) => /changes made after the last review/.test(t))).toBe(true)
   expect(pushed.context?.join('\n')).toMatch(/review is stale/)
@@ -153,8 +161,9 @@ test('only a real push of stale code is flagged', async ($, on) => {
   await $.tool.call({ tool: 'Bash', command: COMMAND })
   await clock.settle()
   r.tree = 'tree2'
+  r.headTree = 'tree2'
   r.shortstat = ' 1 file changed, 1 insertion(+)\n'
-  for (const command of ['git stash push -m wip', 'git commit -m "push fix"', 'git log --grep=push']) {
+  for (const command of ['git stash push -m wip', 'git commit -m "push fix"', 'git log --grep=push', 'git commit -m "remember to git push later"']) {
     const ran = await $.tool.call({ tool: 'Bash', command })
     expect(ran.context).toBeUndefined()
   }
@@ -166,10 +175,29 @@ test('only a real push of stale code is flagged', async ($, on) => {
   expect(toasts).toHaveLength(3)
 })
 
+test('a push is measured by what it sends: uncommitted edits don\'t count', async ($, on) => {
+  const r = repo()
+  const { clock, toasts } = stub(on, r)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await $.tool.call({ tool: 'Bash', command: COMMAND })
+  await clock.settle()
+  r.tree = 'tree2'
+  r.shortstat = ' 1 file changed, 2 insertions(+)\n'
+  const pushed = await $.tool.call({ tool: 'Bash', command: 'git push' })
+  expect(toasts).toEqual([])
+  expect(pushed.context).toBeUndefined()
+})
+
 test('helpers', () => {
+  // a rename, a mode change or a binary file changes no lines
+  const review = { root: '/w', branch: 'b', sha: 's', at: 0, mode: 'quick' }
+  expect(isStale({ review, ...parseShortstat(' 1 file changed, 0 insertions(+), 0 deletions(-)') })).toBe(true)
+  expect(isPush('git commit -m "remember to git push later"')).toBe(false)
+  expect(isPush("git log --format='%s' && git push")).toBe(true)
+  expect(isPush("python3 - <<'EOF'\nrun('git push -u origin x')\nEOF\ngit status")).toBe(false)
+  expect(isPush("cat > f <<EOF\nx\nEOF\ngit push")).toBe(true)
   expect(briefPath(COMMAND)).toBe(`${DIR}/brief.json`)
   expect(briefPath('pi -p "/multi-review-run --brief=$D/b.json"')).toBeUndefined()
   expect(parseShortstat(' 1 file changed, 1 insertion(+)')).toEqual({ files: 1, insertions: 1, deletions: 0 })
-  const review = { root: '/w', branch: 'b', sha: 's', at: 0, mode: 'quick' }
   expect(describeFresh({ review, files: 0, insertions: 0, deletions: 0, isMissing: true }, 3 * 3_600_000)).toMatch(/3h ago, but that snapshot is gone/)
 })

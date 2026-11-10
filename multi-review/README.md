@@ -408,8 +408,11 @@ repository and branch, across sessions. Socratic discussions and failed
 runs don't count. After Bash and edit calls it snapshots the tree again
 and runs `git diff --shortstat <reviewed> <now>`. A review that still
 covers the code shows a ✓ line for 15 minutes; a stale one shows the warning above until the next review. A
-`git push`, `gh pr create`, `gh pr ready` or `gh pr merge` made while the
-review is stale gets a toast, and the model gets a note to tell you. The
+`git push`, `gh pr create`, `gh pr ready` or `gh pr merge` that sends code
+the review didn't cover (HEAD's tree against the reviewed one, so
+uncommitted edits don't count) gets a toast, and the model gets a note to
+tell you. Any changed file makes a review stale, renames and mode changes
+included; `git push` in quoted text or a heredoc isn't a push. The
 recorded tree is unreferenced, so `git gc` may prune it after a couple
 of weeks; the band then says the changes since are unknown.
 

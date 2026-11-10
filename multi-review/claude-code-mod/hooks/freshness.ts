@@ -49,7 +49,16 @@ async function run($: EngineInterface, argv: string[], cwd?: string, env?: Recor
  * one, which is never touched; kept between calls, so its stat cache spares
  * rehashing unchanged files.
  */
-export async function snapshot($: EngineInterface, root: string): Promise<string | undefined> {
+export function snapshot($: EngineInterface, root: string): Promise<string | undefined> {
+  // One at a time: overlapping calls (a refresh, a run starting, a push) would fail on the index's lock.
+  const next = snapshots.then(() => snapshotNow($, root))
+  snapshots = next.catch(() => undefined)
+  return next
+}
+
+let snapshots: Promise<unknown> = Promise.resolve()
+
+async function snapshotNow($: EngineInterface, root: string): Promise<string | undefined> {
   const index = await run($, ['git', 'rev-parse', '--path-format=absolute', '--git-path', 'multi-review-index'], root)
   if (!index) return undefined
   const env = { GIT_INDEX_FILE: index }
@@ -116,8 +125,11 @@ export function parseShortstat(out: string): { files: number; insertions: number
   return { files: num(/(\d+) files? changed/), insertions: num(/(\d+) insertions?\(\+\)/), deletions: num(/(\d+) deletions?\(-\)/) }
 }
 
-/** How far the code here has moved from the last review of this branch, if there was one. */
-export async function freshness($: EngineInterface): Promise<Freshness | undefined> {
+/**
+ * How far the code here has moved from the last review of this branch, if
+ * there was one: the working tree, or `HEAD` (what a push sends).
+ */
+export async function freshness($: EngineInterface, against: 'worktree' | 'HEAD' = 'worktree'): Promise<Freshness | undefined> {
   const here = await where($)
   if (!here) return undefined
   const review = (await $.store.get(storeKey(here.root, here.branch)).catch(() => undefined)) as Review | undefined
@@ -126,14 +138,15 @@ export async function freshness($: EngineInterface): Promise<Freshness | undefin
   if ((await run($, ['git', 'cat-file', '-e', `${review.sha}^{tree}`], here.root)) === undefined) {
     return { review, files: 0, insertions: 0, deletions: 0, isMissing: true }
   }
-  const now = await snapshot($, here.root)
+  const now = against === 'HEAD' ? await run($, ['git', 'rev-parse', 'HEAD^{tree}'], here.root) : await snapshot($, here.root)
   if (!now) return undefined
   const stat = await run($, ['git', 'diff', '--shortstat', review.sha, now], here.root)
   if (stat === undefined) return undefined
   return { review, ...parseShortstat(stat) }
 }
 
-export const isStale = (f: Freshness) => f.isMissing === true || f.insertions + f.deletions > 0
+/** Any file: renames, mode changes and binary files change no lines. */
+export const isStale = (f: Freshness) => f.isMissing === true || f.files > 0
 
 export function age(ms: number): string {
   const m = Math.max(0, Math.round(ms / 60_000))

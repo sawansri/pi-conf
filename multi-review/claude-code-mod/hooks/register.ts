@@ -74,6 +74,14 @@ const claimed = new Set<number>()
 let fresh: Freshness | undefined
 let refreshTimer: Timer | undefined
 
+/** Whether `command` pushes; heredoc bodies and quoted text (a commit message, a script) don't count. */
+export function isPush(command: string): boolean {
+  const code = command
+    .replace(/<<-?\s*(['"]?)(\w+)\1[^\n]*\n[\s\S]*?\n\s*\2(?=\n|$)/g, '')
+    .replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, "''")
+  return PUSHES.test(code)
+}
+
 export function isRunCommand(command: unknown): command is string {
   return typeof command === 'string' && command.includes('/multi-review-run')
 }
@@ -228,10 +236,10 @@ export function register(on: On) {
   // returns; a backgrounded one when progress.json says it finished.
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     if (!isRunCommand(e.command)) {
-      if (!PUSHES.test(e.command)) return next(e)
+      if (!isPush(e.command)) return next(e)
       const ran = await next(e)
       if (ran.deny !== undefined || ran.isError) return ran
-      const f = await freshness($).catch(() => undefined)
+      const f = await freshness($, 'HEAD').catch(() => undefined)
       if (!f || !isStale(f)) return ran
       const since = f.isMissing ? 'by an unknown amount' : `by +${f.insertions} −${f.deletions} in ${f.files} files`
       $.ui.toast(`multi-review: this push includes changes made after the last review (${since})`, { timeoutMs: 8000 })
