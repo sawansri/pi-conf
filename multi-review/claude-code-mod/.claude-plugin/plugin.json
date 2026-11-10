@@ -1,6 +1,6 @@
 {
   "name": "multi-review-status",
-  "version": "0.1.1",
-  "description": "Shows a running multi-review (pi -p /multi-review-run) live above the prompt, like pi's progress widget",
+  "version": "0.2.0",
+  "description": "Shows a running multi-review (pi -p /multi-review-run) live above the prompt, like pi's progress widget, and between runs whether the last review still covers the code",
   "author": { "name": "Sawan Srivastava" }
 }

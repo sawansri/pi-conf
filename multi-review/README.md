@@ -391,6 +391,28 @@ headless run writes to `~/.cache/multi-review/runs/<pid>.json` (so
 `--out=$D/result.json` after a `cd` still works). The band clears 4s after the run ends, as
 pi's widget does. That works for foreground and `run_in_background` runs.
 The VS Code extension has no band, so only the spinner text shows there.
+
+**Review freshness.** Between runs, the same band says whether the last
+successful review of this branch still covers the code:
+
+```
+multi-review · ⚠ +412 −30 in 9 files since the review 2h ago (balanced+verify)
+```
+
+When a run starts, the mod records what the reviewers read: the working
+tree, untracked files included, as a tree (`git add -A` and
+`git write-tree` into its own index, `<git-dir>/multi-review-index`; your
+index is never touched), or the PR head for a PR review. Once
+`result.json` says `ok`, it keeps that tree in the mod's store, per
+repository and branch, across sessions. Socratic discussions and failed
+runs don't count. After Bash and edit calls it snapshots the tree again
+and runs `git diff --shortstat <reviewed> <now>`. A review that still
+covers the code shows a ✓ line for 15 minutes; a stale one shows the warning above until the next review. A
+`git push`, `gh pr create`, `gh pr ready` or `gh pr merge` made while the
+review is stale gets a toast, and the model gets a note to tell you. The
+recorded tree is unreferenced, so `git gc` may prune it after a couple
+of weeks; the band then says the changes since are unknown.
+
 Install: see install.md. Tests: `claude plugin test` in `claude-code-mod/`.
 
 Claude Code becomes the lead with the implementation context, just as

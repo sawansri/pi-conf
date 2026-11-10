@@ -1,4 +1,6 @@
-import type { EngineInterface, On } from 'claude-code'
+import type { EngineInterface, On, Timer } from 'claude-code'
+
+import { age, briefPath, captureTarget, describe, type Freshness, freshness, isStale, readBrief, remember, type Target } from './freshness'
 
 // Shows a running multi-review in Claude Code the way pi's progress widget
 // does. The skill runs `pi -p "/multi-review-run --brief=… --out=<dir>/result.json"`
@@ -12,6 +14,10 @@ import type { EngineInterface, On } from 'claude-code'
 // Otherwise (`--out=$D/…`, a relative path after a `cd`) it's the one the
 // run announces in ~/.cache/multi-review/runs/<pid>.json
 // (extension/src/headless.ts RUNS_DIR).
+//
+// Between runs it says whether the last successful review still covers the
+// code (hooks/freshness.ts): a warning line while anything changed since,
+// and a note to the model and a toast when such a change is pushed.
 
 const POLL_MS = 1000
 /** pi clears its widget this long after a run ends. */
@@ -21,6 +27,12 @@ const STALE_MS = 2 * 60_000
 const BAR_WIDTH = 12
 /** A run's announcement may land a little before the mod's clock read. */
 const ANNOUNCE_SLACK_MS = 2000
+/** A review that still covers the code is shown this long after it finished. */
+const FRESH_SHOWN_MS = 15 * 60_000
+/** Tools after which the code may have changed. */
+const CHANGES_CODE = new Set(['Bash', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
+/** `git push` (after any global options, like `-C dir`), not `git stash push`; `gh pr create/ready/merge`. */
+const PUSHES = /\bgit(?:\s+(?:-[Cc]\s+\S+|--?[\w-]+(?:=\S+)?))*\s+push\b|\bgh\s+pr\s+(?:ready|merge|create)\b/
 
 /** progress.json's `run`: pi's progress widget state (extension/src/progress.ts RunSnapshot). */
 interface RunSnapshot {
@@ -43,17 +55,24 @@ interface Run {
   snap?: RunSnapshot
   /** pi's per-reviewer activity lines. */
   activity?: string[]
+  /** What the reviewers read, captured as the run started. */
+  target?: Promise<Target | undefined>
+  isRecorded?: boolean
 }
 
 interface Line {
   head?: string
   text: string
+  isWarning?: boolean
 }
 
 /** Runs being shown, oldest first. */
 let runs: Run[] = []
 /** pids of announced runs already matched to a Bash call. */
 const claimed = new Set<number>()
+/** How the last review of this branch compares with the code now. */
+let fresh: Freshness | undefined
+let refreshTimer: Timer | undefined
 
 export function isRunCommand(command: unknown): command is string {
   return typeof command === 'string' && command.includes('/multi-review-run')
@@ -151,10 +170,38 @@ async function poll($: EngineInterface, run: Run): Promise<void> {
   if (run.endedAt === undefined && run.background && now - stat.mtimeMs > STALE_MS) run.endedAt = now
 }
 
+async function refresh($: EngineInterface): Promise<void> {
+  fresh = await freshness($).catch(() => undefined)
+  $.ui.invalidate('ui.render')
+}
+
+/** Refreshes once the burst of tool calls that may have changed the code settles. */
+function refreshSoon($: EngineInterface): void {
+  refreshTimer?.cancel()
+  refreshTimer = $.clock.after(2000, () => void refresh($))
+}
+
+/** Keeps an ended run as the branch's last review when its result.json says it succeeded. */
+async function keepReview($: EngineInterface, run: Run): Promise<void> {
+  if (run.isRecorded) return
+  run.isRecorded = true
+  const target = await run.target
+  if (!target || !run.progress) return
+  const result = `${run.progress.slice(0, run.progress.lastIndexOf('/'))}/result.json`
+  try {
+    if ((JSON.parse(await $.fs.read(result)) as { ok?: unknown }).ok !== true) return
+  } catch {
+    return
+  }
+  await remember($, { ...target, at: await $.clock.now(), mode: run.snap?.mode ?? 'review', result: result.replace(/\.json$/, '.md') })
+  await refresh($)
+}
+
 async function tick($: EngineInterface): Promise<void> {
   if (runs.length === 0) return
   const now = await $.clock.now()
   for (const run of runs) if (run.endedAt === undefined) await poll($, run)
+  for (const run of runs) if (run.endedAt !== undefined && !run.isRecorded) await keepReview($, run)
   runs = runs.filter((r) => r.endedAt === undefined || now - r.endedAt < LINGER_MS)
   $.ui.invalidate('ui.render')
 }
@@ -162,15 +209,38 @@ async function tick($: EngineInterface): Promise<void> {
 export function register(on: On) {
   on('session.start', async ($, e, next) => {
     $.clock.every(POLL_MS, () => tick($))
+    void refresh($)
     return next(e)
   })
+
+  on('turn.complete', async ($, e, next) => {
+    refreshSoon($)
+    return next(e)
+  })
+
+  on('tool.call', async ($, e, next) => {
+    const ran = await next(e)
+    if (CHANGES_CODE.has(String(e.tool))) refreshSoon($)
+    return ran
+  }).catch(($, e, next) => next(e))
 
   // The Bash call that starts a run. A foreground run ends when the call
   // returns; a backgrounded one when progress.json says it finished.
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
-    if (!isRunCommand(e.command)) return next(e)
+    if (!isRunCommand(e.command)) {
+      if (!PUSHES.test(e.command)) return next(e)
+      const ran = await next(e)
+      if (ran.deny !== undefined || ran.isError) return ran
+      const f = await freshness($).catch(() => undefined)
+      if (!f || !isStale(f)) return ran
+      const since = f.isMissing ? 'by an unknown amount' : `by +${f.insertions} −${f.deletions} in ${f.files} files`
+      $.ui.toast(`multi-review: this push includes changes made after the last review (${since})`, { timeoutMs: 8000 })
+      const note = `multi-review-status: the code pushed has changed ${since} since the last multi-review of ${f.review.branch} (${age((await $.clock.now()) - f.review.at)}, ${f.review.mode}, ${f.review.result ?? 'result unknown'}). Tell the user the review is stale and offer to run it again.`
+      return { ...ran, context: [...(ran.context ?? []), note] }
+    }
     const dir = outDir(e.command)
     const run: Run = { startedAt: await $.clock.now(), background: e.run_in_background === true }
+    run.target = readBrief($, briefPath(e.command)).then((brief) => captureTarget($, brief)).catch(() => undefined)
     if (dir) run.progress = `${dir}/progress.json`
     runs = [...runs.filter((r) => !run.progress || r.progress !== run.progress), run]
     $.ui.invalidate('ui.render')
@@ -181,6 +251,7 @@ export function register(on: On) {
       else {
         await poll($, run)
         run.endedAt ??= await $.clock.now()
+        if (!('isError' in result && result.isError)) await keepReview($, run)
       }
       return result
     } catch (err) {
@@ -192,12 +263,16 @@ export function register(on: On) {
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (runs.length === 0 || e.props.hasSurvey) return next(e)
-    const { Box, Text } = $.ui.resolve(e)
     const now = await $.clock.now()
-    const ours = runs.flatMap((run) => runLines(run, now)).map((line) =>
+    const lines = runs.flatMap((run) => runLines(run, now))
+    if (runs.length === 0 && fresh && (isStale(fresh) || now - fresh.review.at < FRESH_SHOWN_MS)) {
+      lines.push({ head: 'multi-review', text: describe(fresh, now), isWarning: isStale(fresh) })
+    }
+    if (lines.length === 0 || e.props.hasSurvey) return next(e)
+    const { Box, Text } = $.ui.resolve(e)
+    const ours = lines.map((line) =>
       line.head
-        ? Text({ wrap: 'truncate-end', children: [Text({ color: 'claude', children: [line.head] }), line.text] })
+        ? Text({ wrap: 'truncate-end', children: [Text({ color: line.isWarning ? 'warning' : 'claude', children: [line.head] }), line.text] })
         : Text({ wrap: 'truncate-end', dimColor: true, children: [line.text] }),
     )
     const theirs = await next(e)
