@@ -55,3 +55,18 @@ test("one run's two findings never merge, even when they look alike", () => {
 	const groups = dedupeReviewerFindings([run("p/sonnet", ["get returns expired cache entries after ttl", "get returns expired cache entries after ttl again"])]);
 	assert.equal(groups.length, 2);
 });
+
+test("a second pass doesn't make an issue's own words look common to lexical grouping", () => {
+	// Without the others, only 4 findings: a word in 3 of them would count as common.
+	const bug = "get returns expired cache entries after ttl";
+	const groups = dedupeReviewerFindings([run("p/sonnet", [bug]), run("p/sonnet", [bug], 2), run("p/opus", [bug]), run("p/kimi", ["unrelated banner typo"])]);
+	assert.equal(groups.filter((g) => g.title === bug).length, 1);
+});
+
+test("a second pass is named #2 in the trace", async () => {
+	const { ctx } = fakeCtx(() => "[]");
+	const names: string[] = [];
+	const trace = { start: (name: string) => { names.push(name); return { onEvent() {}, finish() {} }; } };
+	await runAllReviewers([row("p/sonnet"), row("p/sonnet", 2)], "SYS", "U", 2, 0, undefined, ctx, { useTools: false, timeoutMs: 60_000, trace: trace as never });
+	assert.deepEqual(names.sort(), ["p/sonnet", "p/sonnet #2"]);
+});

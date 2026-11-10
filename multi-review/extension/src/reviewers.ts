@@ -418,6 +418,8 @@ export interface ReviewerRunOptions {
 	minToolCalls?: number;
 	/** The fan-out's straggler cutoff; set by runAllReviewers. */
 	cutoff?: StragglerCutoff;
+	/** The session's name in the trace when not just its spec (a second pass's "#2"). */
+	traceName?: string;
 }
 
 export async function runReviewer(
@@ -435,7 +437,7 @@ export async function runReviewer(
 	const signal = abortSignal ? AbortSignal.any([abortSignal, deadline.cut]) : deadline.cut;
 	// Late work (the harvest, a JSON repair after it) runs to the hard end.
 	const lateSignal = abortSignal ? AbortSignal.any([abortSignal, deadline.end]) : deadline.end;
-	const tracer = runOpts.trace?.start(formatReviewerSpec(reviewerSpec), runOpts.tracePhase ?? "review", runOpts.cwd ?? ctx.cwd);
+	const tracer = runOpts.trace?.start(runOpts.traceName ?? formatReviewerSpec(reviewerSpec), runOpts.tracePhase ?? "review", runOpts.cwd ?? ctx.cwd);
 	const verifying = runOpts.tracePhase === "verify";
 	// Reviewers run their own repros; verifiers run code to settle claims.
 	const canRun = Boolean(runOpts.sandbox);
@@ -582,7 +584,7 @@ export async function runAllReviewers(
 			const slot = resolved[idx];
 			try {
 				const prompt = typeof userPrompt === "string" ? userPrompt : userPrompt(slot);
-				const partial = await runReviewer(slot.model, slot.rs, ctx, systemPrompt, prompt, temperature, abortSignal, phaseOpts);
+				const partial = await runReviewer(slot.model, slot.rs, ctx, systemPrompt, prompt, temperature, abortSignal, slot.pass ? { ...phaseOpts, traceName: formatRunSpec(slot) } : phaseOpts);
 				const full: ReviewerRunResult = {
 					formattedSpec: formatRunSpec(slot),
 					...(slot.pass ? { pass: slot.pass } : {}),

@@ -225,7 +225,9 @@ export function dedupeReviewerFindings(results: ReviewerRunResult[], clusters?: 
 	const memberFindings: GroupMemberFinding[][] = [];
 	// Words most findings share (the file's domain, "spec", quoted spec text)
 	// say nothing about WHICH issue a finding is; drop them before matching.
-	const allTexts = results.filter((r) => r?.ok).flatMap((r) => r.findings.map((f) => keywords(f.match_text ?? `${f.title} ${f.comment}`)));
+	// First passes only: a second pass repeats its model's findings, which
+	// would make an issue's own words look common and drop them.
+	const allTexts = results.filter((r) => r?.ok && !r.pass).flatMap((r) => r.findings.map((f) => keywords(f.match_text ?? `${f.title} ${f.comment}`)));
 	const docFreq = new Map<string, number>();
 	for (const ws of allTexts) for (const w of ws) docFreq.set(w, (docFreq.get(w) ?? 0) + 1);
 	const commonCutoff = Math.max(3, Math.ceil(allTexts.length * 0.4));

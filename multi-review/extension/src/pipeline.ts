@@ -571,11 +571,13 @@ async function runReviewPipeline(
 	const prClaimGroups = prClaims.map(prClaimAsGroup);
 	const verifyTimeLeft = deadlineMs === undefined ? Number.POSITIVE_INFINITY : deadlineMs - Date.now() - FINAL_RESERVE_MS;
 	// A straggler's harvested findings are always verified: it was cut off mid-check.
-	const partialSpecs = new Set(runs.filter((r) => r.partial).map((r) => r.spec));
-	const findingGroups = flags.verify ? groups : groups.filter((g) => g.reviewerSpecs.some((s) => partialSpecs.has(s)));
+	// By run, not model: one partial pass doesn't make the other's findings partial.
+	const runKey = (r: { spec: string; pass?: number }) => `${r.spec}#${r.pass ?? 1}`;
+	const partialRuns = new Set(runs.filter((r) => r.partial).map(runKey));
+	const findingGroups = flags.verify ? groups : groups.filter((g) => g.members.some((m) => partialRuns.has(runKey(m))));
 	const toVerify = [...findingGroups, ...suspicionGroups, ...prClaimGroups];
 	if (toVerify.length > 0 && verifyTimeLeft < MIN_PHASE_MS) {
-		const unverifiedPartial = partialSpecs.size > 0 ? "; partial reviewers' findings are unverified" : "";
+		const unverifiedPartial = partialRuns.size > 0 ? "; partial reviewers' findings are unverified" : "";
 		target.warnings.push(`verification skipped: only ${Math.max(0, Math.round(verifyTimeLeft / 1000))}s left of the run's time budget${unverifiedPartial}`);
 	} else if (toVerify.length > 0) {
 		// One row per model: a duplicate would count as two independent verifiers.
