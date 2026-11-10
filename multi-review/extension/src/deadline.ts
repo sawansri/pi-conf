@@ -235,7 +235,12 @@ export async function harvest(
 		session.setActiveToolsByName([]);
 		stage("asking");
 		await abortable(session.prompt(harvestPrompt(late.finalFormat)), signal, aborted);
-		return signal.aborted ? undefined : lastTurnAssistantText(session.messages.slice(before)) || undefined;
+		if (signal.aborted) return undefined;
+		const reply = session.messages.slice(before);
+		// A reply that ended in an error (content_filter, a dropped stream) isn't an answer, whatever text it got out.
+		const last = [...reply].reverse().find((m) => (m as { role?: string }).role === "assistant") as { stopReason?: string } | undefined;
+		if (last?.stopReason === "error" || last?.stopReason === "aborted") return undefined;
+		return lastTurnAssistantText(reply) || undefined;
 	} catch {
 		return undefined;
 	} finally {

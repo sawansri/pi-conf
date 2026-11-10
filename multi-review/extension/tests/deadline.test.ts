@@ -195,6 +195,17 @@ test("the harvest answer is the harvest's own reply, never the stopped turn's la
 	assert.equal(await harvest(s, lateFor(d)), undefined);
 });
 
+test("a harvest reply that ended in an error isn't an answer, whatever text it has", async () => {
+	const d = startDeadline(10 * MIN);
+	mock.timers.tick(9 * MIN);
+	const s = fakeSession("");
+	s.prompt = async (text: string) => {
+		s.prompts.push({ text, tools: [...s.tools] });
+		s.messages.push({ role: "assistant", stopReason: "error", errorMessage: "Provider finish_reason: content_filter", content: [{ type: "text", text: "[]" }] });
+	};
+	assert.equal(await harvest(s, lateFor(d)), undefined);
+});
+
 test("a turn that never started (a Socratic round cut before it began) isn't harvested from earlier rounds", async () => {
 	const d = startDeadline(10 * MIN);
 	mock.timers.tick(9 * MIN);
