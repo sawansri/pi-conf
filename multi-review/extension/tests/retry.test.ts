@@ -80,3 +80,14 @@ test("errors another attempt won't fix aren't retried", async () => {
 		assert.equal(isPermanentError(e), false, e);
 	}
 });
+
+test("status codes count only as the status, and pi's credential and quota errors are final", () => {
+	for (const e of [
+		"error: 401 Unauthorized", 'error: 404 {"error":{"message":"model not found"}}', "403 Forbidden", "HTTP 401", 'status: 403',
+		"No API key for provider: amd-gateway", "No API key found for openai. Use /login", "error: 429 You exceeded your current quota (insufficient_quota)",
+	]) assert.equal(isPermanentError(e), true, e);
+	for (const e of [
+		"error: 429 Rate limit reached. Limit 1000000, Requested 403.", "error: 502 Bad Gateway: retry after 400 ms", "error: 503 upstream timed out after 404ms",
+		"request id 4013-401a failed: 500",
+	]) assert.equal(isPermanentError(e), false, e);
+});

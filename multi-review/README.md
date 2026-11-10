@@ -559,8 +559,9 @@ extglob — documented limitation.
    limit, dropped stream, content filter after its in-place retry) is
    re-run in a fresh session up to 3 times, 15s apart. Retries share the
    reviewer's timeout. Timeouts, straggler cuts and errors another attempt
-   won't fix (401/403/404: bad credentials, no access, a missing model)
-   aren't retried. Other 400s usually come from the failed session's own
+   won't fix (401/403/404 as the status, missing or bad credentials, an
+   exhausted quota, a missing model) aren't retried; a status-like number
+   inside a transient error ("retry after 400 ms") doesn't count. Other 400s usually come from the failed session's own
    history (Anthropic's "thinking blocks … cannot be modified" with
    native web search, a context window filled by tool output), and a
    fresh session clears them; a reviewer cut while

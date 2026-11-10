@@ -49,12 +49,15 @@ export const ERROR_RETRIES = 3;
 export const ERROR_RETRY_DELAY_MS = 15_000;
 
 /**
- * Errors another attempt won't fix: bad credentials, no access, a missing
- * model. Most 400s are about the session's own history and a fresh session
+ * Errors another attempt won't fix: bad credentials (pi-ai's "No API key
+ * for provider"), no access, an exhausted quota, a missing model. A status
+ * code counts only where it is the status (message start, "HTTP 401",
+ * "status: 403"), not a number in a transient error ("retry after 400 ms"). Most 400s are about the session's own history and a fresh session
  * clears them (Anthropic's "thinking blocks … cannot be modified", seen in 9
  * runs, or a context window filled by tool output), so they're retried.
  */
-const PERMANENT_ERROR = /\b(401|403|404)\b|unauthori[sz]ed|forbidden|invalid.{0,20}api.?key|model.{0,20}(not found|does not exist)/i;
+const PERMANENT_ERROR =
+	/(?:^|error:\s*|HTTP\s*|status(?:code)?["':\s]*)(?:401|403|404)\b|unauthori[sz]ed|forbidden|invalid.{0,20}api.?key|no api key|insufficient_quota|model.{0,20}(not found|does not exist)/i;
 
 export function isPermanentError(errorMessage: string): boolean {
 	return PERMANENT_ERROR.test(errorMessage);
