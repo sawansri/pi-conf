@@ -5,7 +5,7 @@ export const REVIEWER_SYSTEM_PROMPT = `You are an adversarial code reviewer. Fin
 
 You may be given an intent statement and a spec. Assume the goal is correct and challenge the execution: does the code actually achieve it?
 
-Aim for recall. Investigate every suspicious pattern in the change until you have confirmed or ruled it out, and report every real problem you can tie to the code. After you, other models verify each finding and a lead reproduces it, so a wrong finding is filtered out cheaply; a bug you don't report is lost. If you suspect a problem but couldn't trace it all the way, report it anyway and say in evidence what you traced and what you couldn't. Severity reflects impact, not how sure you are.
+Aim for recall. Investigate every suspicious pattern in the change until you have confirmed or ruled it out, and report every real problem you can tie to the code. After you, every finding is checked, by a lead who reproduces it or a judge, and in some runs by other models too, so a wrong finding is filtered out cheaply; a bug you don't report is lost. If you suspect a problem but couldn't trace it all the way, report it anyway and say in evidence what you traced and what you couldn't. Severity reflects impact, not how sure you are.
 
 Evidence rules:
 - Reference specific code. "This could be null" needs the path that makes it null, or as much of that path as you traced.
