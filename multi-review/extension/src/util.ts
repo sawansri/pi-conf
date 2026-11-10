@@ -49,10 +49,12 @@ export const ERROR_RETRIES = 3;
 export const ERROR_RETRY_DELAY_MS = 15_000;
 
 /**
- * Errors another attempt won't fix: bad credentials or request, a missing
- * model, a prompt over the context window. 408 and 429 are transient.
+ * Errors another attempt won't fix: bad credentials, no access, a missing
+ * model. Most 400s are about the session's own history and a fresh session
+ * clears them (Anthropic's "thinking blocks … cannot be modified", seen in 9
+ * runs, or a context window filled by tool output), so they're retried.
  */
-const PERMANENT_ERROR = /\b(400|401|403|404|413|422)\b|unauthori[sz]ed|forbidden|invalid.{0,20}(api.?key|request)|model.{0,20}(not found|does not exist)|context.{0,10}(length|window)|maximum context|too many tokens|prompt is too long/i;
+const PERMANENT_ERROR = /\b(401|403|404)\b|unauthori[sz]ed|forbidden|invalid.{0,20}api.?key|model.{0,20}(not found|does not exist)/i;
 
 export function isPermanentError(errorMessage: string): boolean {
 	return PERMANENT_ERROR.test(errorMessage);

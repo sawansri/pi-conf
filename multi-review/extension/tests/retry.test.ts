@@ -66,12 +66,17 @@ test("an abort during the wait ends it early without another attempt", async () 
 });
 
 test("errors another attempt won't fix aren't retried", async () => {
-	for (const e of ["error: 401 Unauthorized", "error: 404 model not found", "error: This model's maximum context length is 200000 tokens", "error: 400 invalid request", "error: prompt is too long"]) {
+	for (const e of ["error: 401 Unauthorized", "error: 404 model not found", "error: 403 Forbidden", "error: invalid x-api-key"]) {
 		const s = scripted([failed(e), ok]);
 		assert.equal((await retryOnError(new AbortController().signal, s.attempt, undefined, 0)).errorMessage, e);
 		assert.equal(s.calls, 1, e);
 	}
-	for (const e of ["error: 429 Too Many Requests", "error: 503 Service Unavailable", "error: 408 Request Timeout", "socket hang up", "error: Provider finish_reason: content_filter"]) {
+	// A fresh session clears these: they're about the failed session's history.
+	for (const e of [
+		"error: 429 Too Many Requests", "error: 503 Service Unavailable", "error: 408 Request Timeout", "socket hang up", "error: Provider finish_reason: content_filter",
+		'error: 400 {"type":"invalid_request_error","message":"messages.1.content.18: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified."}',
+		"error: prompt is too long: 210000 tokens > 200000 maximum",
+	]) {
 		assert.equal(isPermanentError(e), false, e);
 	}
 });

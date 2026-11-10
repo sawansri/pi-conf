@@ -556,8 +556,11 @@ extglob — documented limitation.
    limit, dropped stream, content filter after its in-place retry) is
    re-run in a fresh session up to 3 times, 15s apart. Retries share the
    reviewer's timeout. Timeouts, straggler cuts and errors another attempt
-   won't fix (400/401/403/404/413/422, bad credentials, a missing model, a
-   prompt over the context window) aren't retried; a reviewer cut while
+   won't fix (401/403/404: bad credentials, no access, a missing model)
+   aren't retried. Other 400s usually come from the failed session's own
+   history (Anthropic's "thinking blocks … cannot be modified" with
+   native web search, a context window filled by tool output), and a
+   fresh session clears them; a reviewer cut while
    waiting to retry reports both the cut and the error. The trace logs an
    `error_retry` event per retry. Fail-soft: one reviewer's failure doesn't stop the rest, but
    failures (`stopReason` error/aborted/timeout, empty output at maxTokens,
