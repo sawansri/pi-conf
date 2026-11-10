@@ -5,7 +5,7 @@ import { callModel } from "./models.ts";
 import { budgetDiff } from "./prompts.ts";
 import { formatRange } from "./synthesis.ts";
 import type { ReviewTarget } from "./target.ts";
-import { verificationTally } from "./verify.ts";
+import { verificationTally, vetoes } from "./verdicts.ts";
 
 // ---------- judge pass ----------
 
@@ -44,7 +44,7 @@ After the side effects, if any models errored or produced unparseable output, ad
 Rules:
 - Keep every finding in the output (mark false positives, never delete them). Do not invent new findings.
 - Verify against the diff. A finding about code the diff doesn't touch is at most "plausible" unless the diff clearly breaks it.
-- When independent verification is present, weigh it: a refutation with concrete code evidence usually makes a finding a false positive; confirmations from non-raisers are strong support. Say which way it went.
+- When independent verification is present, weigh it: a refutation with concrete code evidence (marked VETO) makes a finding a false positive unless the diff shows the refutation is wrong, however many verifiers confirmed; a confirmation that ran the repro (executed) is strong support, one that only reasoned is weak. Say which way it went.
 - You may adjust the displayed severity by one step when the evidence warrants; note the change in the take.
 - Keep each finding ≤ 90 words. Do not paste reviewer comments verbatim; they are shown separately.
 - Use file paths exactly as given — do not rewrite to absolute paths.
@@ -106,7 +106,8 @@ function renderGroupsForJudge(target: ReviewTarget, groups: DedupeGroup[]): stri
 			}
 			if (g.verifications?.length) {
 				lines.push(`    independent verification (${verificationTally(g)}):`);
-				for (const v of g.verifications) lines.push(`      - ${v.spec}: ${v.verdict} — ${v.evidence}`);
+				for (const v of g.verifications) lines.push(`      - ${v.spec}: ${v.verdict}${v.evidenceKind ? ` (${v.evidenceKind})` : ""} — ${v.evidence}`);
+				if (vetoes(g).length) lines.push(`    VETO: refuted with evidence; not "confirmed" unless the diff shows the refutation is wrong`);
 			} else if (g.verificationNote) {
 				lines.push(`    verification: ${g.verificationNote}`);
 			}

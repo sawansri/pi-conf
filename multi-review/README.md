@@ -588,8 +588,19 @@ extglob — documented limitation.
 6b. **Verification** (`--verify`) — `assignVerifiers` gives each issue to
    up to `verifiersPerFinding` reviewers outside its raisers, least-loaded
    first. Each verifier gets the same brief and diff plus its assigned
-   issues (with the reviewers' comments, de-identified) and returns
-   `[{id, verdict, evidence}]`. Off-schema field names and verdict words
+   issues: each reviewer's claim and repro, de-identified, but not their
+   evidence or argument, since persuasive reasoning makes verifiers agree
+   rather than check. LLM validators confirm too easily (Jain et al. 2025:
+   96% of real problems accepted, under 25% of wrong ones rejected), so
+   the prompt has them **refute first**: look for the guard, type, caller
+   or test that prevents the bug, and only then check it happens, by
+   running the repro or tracing every step; "plausible" isn't confirmed.
+   They return `[{id, verdict, evidence_kind, evidence}]`. A refutation
+   with evidence is a **veto**: the lead view and the judge flag it, and
+   the lead must reproduce the finding or show from the code why the
+   refutation is wrong before acting on it, however many verifiers
+   confirmed (a minority veto cut worst-case error from 17.6% to 2.8% in
+   that study). Off-schema field names and verdict words
    are normalized. A reply with no usable verdicts counts as a verifier
    failure (shown under Warnings); the issues it was assigned stay
    unverified, never counted as refuted.

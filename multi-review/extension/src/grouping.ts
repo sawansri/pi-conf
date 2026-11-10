@@ -1,6 +1,6 @@
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { type Model, type ModelSpec, type MultiReviewConfig, type ThinkingLevelAlias, parseReviewerSpec } from "./config.ts";
-import type { FindingParts, ReviewerFinding, ReviewerRunResult } from "./findings.ts";
+import type { EvidenceKind, FindingParts, ReviewerFinding, ReviewerRunResult } from "./findings.ts";
 import { callModel, findModel } from "./models.ts";
 import { type MultiReviewProgressReporter, shortSpec } from "./progress.ts";
 import { formatRange } from "./synthesis.ts";
@@ -66,6 +66,8 @@ export interface Verification {
 	spec: ModelSpec;
 	verdict: "confirmed" | "refuted" | "uncertain";
 	evidence: string;
+	/** How the verifier knows: ran it, traced it, or inferred. */
+	evidenceKind?: EvidenceKind;
 }
 
 /** Models cite slightly different lines for the same issue; allow this much slack. */

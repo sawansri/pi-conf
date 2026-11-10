@@ -101,3 +101,11 @@ export function lastTurnAssistantText(turnMessages: readonly unknown[]): string 
 	}
 	return "";
 }
+
+/** "L3", "L3-7", "…7" or "file" for a finding's line range. */
+export function formatRange(start: number | null, end: number | null): string {
+	if (start === null && end === null) return "file";
+	if (start === null) return `…${end}`;
+	if (end === null || end === start) return `L${start}`;
+	return `L${start}-${end}`;
+}

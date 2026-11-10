@@ -7,7 +7,7 @@ import type { PrCommentsReport } from "./pr-comments.ts";
 import { type SocraticDetails, summarizeSocraticEntry } from "./socratic.ts";
 import { formatRange } from "./synthesis.ts";
 import type { ReviewTarget } from "./target.ts";
-import { verificationTally } from "./verify.ts";
+import { verificationTally } from "./verdicts.ts";
 
 // ---------- chat render ----------
 

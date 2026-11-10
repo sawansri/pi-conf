@@ -4,14 +4,11 @@ import { type DedupeGroup, type SuspicionResult, jaccard, keywords } from "./gro
 import type { PrClaim, PrCommentsReport } from "./pr-comments.ts";
 import { shortSpec } from "./progress.ts";
 import type { ReviewTarget } from "./target.ts";
-import { verificationTally } from "./verify.ts";
+import { verificationTally, vetoes } from "./verdicts.ts";
 
-export function formatRange(start: number | null, end: number | null): string {
-	if (start === null && end === null) return "file";
-	if (start === null) return `…${end}`;
-	if (end === null || end === start) return `L${start}`;
-	return `L${start}-${end}`;
-}
+import { formatRange } from "./util.ts";
+
+export { formatRange };
 
 /**
  * Light-mode markdown synthesis. Produces a structured markdown doc
@@ -25,9 +22,18 @@ function verificationLines(g: DedupeGroup): string[] {
 	const icon = { confirmed: "✓ confirmed", refuted: "✗ refuted", uncertain: "? uncertain" } as const;
 	return [
 		`- **Verification (${verificationTally(g)}):**`,
-		...g.verifications.map((v) => `    - \`${v.spec}\` ${icon[v.verdict]}: ${v.evidence}`),
+		...g.verifications.map((v) => `    - \`${v.spec}\` ${icon[v.verdict]}${v.evidenceKind ? ` (${v.evidenceKind})` : ""}: ${v.evidence}`),
+		...vetoLines(g),
 		...(g.verificationNote ? [`    - note: ${g.verificationNote}`] : []),
 	];
+}
+
+/** A refutation with evidence: the lead answers it before acting. */
+function vetoLines(g: DedupeGroup): string[] {
+	const v = vetoes(g);
+	return v.length
+		? [`- **Veto:** refuted with evidence by ${v.map((x) => shortSpec(x.spec)).join(", ")}. Answer the refutation (your own repro, or the code that shows it's wrong) before putting this in Act On.`]
+		: [];
 }
 
 /** Below this word overlap with the canonical description, a reviewer's framing is shown. */
@@ -98,7 +104,8 @@ export function synthesizeLeadView(
 		if (alt) lines.push(`- **Another angle:** ${shortSpec(alt.m.spec)}: "${firstSentence(alt.m.parts?.core ?? alt.m.comment, 120)}"`);
 		if (g.verifications?.length) {
 			const mark = { confirmed: "✓", refuted: "✗", uncertain: "?" } as const;
-			lines.push(`- **Verification:** ${g.verifications.map((v) => `${mark[v.verdict]} ${shortSpec(v.spec)}: ${v.evidence.replace(/\s+/g, " ").slice(0, 240)}`).join(" · ")}`);
+			lines.push(`- **Verification:** ${g.verifications.map((v) => `${mark[v.verdict]} ${shortSpec(v.spec)}${v.evidenceKind ? ` (${v.evidenceKind})` : ""}: ${v.evidence.replace(/\s+/g, " ").slice(0, 240)}`).join(" · ")}`);
+			lines.push(...vetoLines(g));
 		} else if (g.verificationNote) {
 			lines.push(`- **Verification:** ${g.verificationNote}`);
 		}
