@@ -34,9 +34,11 @@ export interface DedupeGroup {
 		line_end: number | null;
 		title?: string;
 		parts?: FindingParts;
+		/** A model's second pass (see secondPass); unset for the first. */
+		pass?: number;
 	}[];
 	reviewerSpecs: ModelSpec[]; // unique specs that flagged this group
-	consensus: boolean; // ≥ 2 distinct reviewers
+	consensus: boolean; // ≥ 2 distinct models: one model's two passes agreeing isn't independent
 	/** Cross-checks from reviewers who did NOT raise the finding (verify round). */
 	verifications?: Verification[];
 	/** Why a group got fewer verifiers than asked (e.g. every reviewer raised it). */
@@ -135,7 +137,7 @@ function sameIssue(members: GroupMemberFinding[], f: ReviewerFinding, words: Set
 /** Stable id for one reviewer finding: `<run index>:<finding index>`. */
 export type FindingKey = string;
 
-function newGroup(spec: ModelSpec, finding: ReviewerFinding): DedupeGroup {
+function newGroup(spec: ModelSpec, finding: ReviewerFinding, pass?: number): DedupeGroup {
 	return {
 		id: "",
 		file: finding.file,
@@ -145,13 +147,13 @@ function newGroup(spec: ModelSpec, finding: ReviewerFinding): DedupeGroup {
 		category: finding.category,
 		title: finding.title,
 		titles: [finding.title],
-		members: [memberOf(spec, finding)],
+		members: [memberOf(spec, finding, pass)],
 		reviewerSpecs: [spec],
 		consensus: false,
 	};
 }
 
-function memberOf(spec: ModelSpec, finding: ReviewerFinding): DedupeGroup["members"][number] {
+function memberOf(spec: ModelSpec, finding: ReviewerFinding, pass?: number): DedupeGroup["members"][number] {
 	return {
 		spec,
 		comment: finding.comment,
@@ -160,13 +162,14 @@ function memberOf(spec: ModelSpec, finding: ReviewerFinding): DedupeGroup["membe
 		line_end: finding.line_end,
 		title: finding.title,
 		parts: finding.parts,
+		...(pass ? { pass } : {}),
 	};
 }
 
-function addToGroup(group: DedupeGroup, spec: ModelSpec, finding: ReviewerFinding): void {
-	group.members.push(memberOf(spec, finding));
-	group.reviewerSpecs.push(spec);
-	group.consensus = true;
+function addToGroup(group: DedupeGroup, spec: ModelSpec, finding: ReviewerFinding, pass?: number): void {
+	group.members.push(memberOf(spec, finding, pass));
+	if (!group.reviewerSpecs.includes(spec)) group.reviewerSpecs.push(spec);
+	group.consensus = group.reviewerSpecs.length >= 2;
 	if (!group.titles.includes(finding.title)) group.titles.push(finding.title);
 	if (SEVERITY_RANK[finding.severity] > SEVERITY_RANK[group.severity]) group.severity = finding.severity;
 	const g = normalizedRange(group.line_start, group.line_end);
@@ -209,8 +212,8 @@ export function dedupeReviewerFindings(results: ReviewerRunResult[], clusters?: 
 				const r = results[ri];
 				const finding = r?.findings[fi];
 				if (!r || !finding) continue;
-				if (!group) group = newGroup(r.spec, finding);
-				else addToGroup(group, r.spec, finding);
+				if (!group) group = newGroup(r.spec, finding, r.pass);
+				else addToGroup(group, r.spec, finding, r.pass);
 				(group.keys ??= []).push(key);
 			}
 			if (group) groups.push(group);
@@ -231,12 +234,13 @@ export function dedupeReviewerFindings(results: ReviewerRunResult[], clusters?: 
 		if (!r?.ok) continue;
 		for (const finding of r.findings) {
 			const words = distinctive(keywords(finding.match_text ?? `${finding.title} ${finding.comment}`));
-			const gi = groups.findIndex((g, i) => !g.reviewerSpecs.includes(r.spec) && sameIssue(memberFindings[i], finding, words));
+			// Never two findings of one run in a group; a model's other pass may join.
+			const gi = groups.findIndex((g, i) => !g.members.some((m) => m.spec === r.spec && m.pass === r.pass) && sameIssue(memberFindings[i], finding, words));
 			if (gi >= 0) {
-				addToGroup(groups[gi], r.spec, finding);
+				addToGroup(groups[gi], r.spec, finding, r.pass);
 				memberFindings[gi].push({ finding, words });
 			} else {
-				groups.push(newGroup(r.spec, finding));
+				groups.push(newGroup(r.spec, finding, r.pass));
 				memberFindings.push([{ finding, words }]);
 			}
 		}

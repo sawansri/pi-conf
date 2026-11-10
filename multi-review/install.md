@@ -106,11 +106,12 @@ cat > ~/.pi/agent/multi-review.json << 'EOF'
   ],
   "judge": "amd-gateway-anthropic/Claude-Opus-5.5",
   "judgeThinking": "high",
-  "concurrency": 5,
+  "concurrency": 6,
   "temperature": 0.2,
   "verify": false,
   "verifiersPerFinding": 2,
   "verifyOnly": [],
+  "secondPass": ["amd-gateway-anthropic/Claude-Sonnet-5.5"],
   "quickReviewers": [
     "amd-gateway/gpt-6-luna@low",
     "amd-gateway-anthropic/Claude-Haiku-5.5",

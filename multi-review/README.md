@@ -420,7 +420,11 @@ included; `git push` in quoted text or a heredoc isn't a push. The
 recorded tree is unreferenced, so `git gc` may prune it after a couple
 of weeks; the band then says the changes since are unknown.
 
-Install: see install.md. Tests: `claude plugin test` in `claude-code-mod/`.
+Install: see install.md. Tests: `claude plugin test` in `claude-code-mod/`;
+for the extension, in `extension/`:
+`node --experimental-transform-types --import ./tests/support/pi-packages.mjs --test tests/*.test.ts`
+(the import resolves pi's packages from the installed pi release, so
+modules that import pi load without it; models are faked, no network).
 
 Claude Code becomes the lead with the implementation context, just as
 pi's main agent is inside pi. The skill pre-approves only `pi -p`,
@@ -741,11 +745,12 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
   ],
   "judge": "amd-gateway-anthropic/Claude-Opus-5.5",
   "judgeThinking": "high",
-  "concurrency": 5,
+  "concurrency": 6,
   "temperature": 0.2,
   "verify": false,
   "verifiersPerFinding": 2,
   "verifyOnly": [],
+  "secondPass": ["amd-gateway-anthropic/Claude-Sonnet-5.5"],
   "quickReviewers": [
     "amd-gateway/gpt-6-luna@low",
     "amd-gateway-anthropic/Claude-Haiku-5.5",
@@ -769,6 +774,17 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
 `sandbox`, `checkTimeoutSec`, `autoChecks`, `minReviewToolCalls` and
 `sandboxHomeDirs` are described under
 [Executing code](#executing-code-tools-checks-and-the-sandbox).
+`secondPass` models (by `provider/id`, any level) review twice: the
+second session gets the diff's files in reverse order, so it sees first
+what the first pass saw last, and a diff over the 200k-character budget
+loses its other end to truncation. A single model's runs vary a lot (o3
+found one known kernel bug in 8 of 100 runs), and combining runs raised
+F1 by up to 44% on SWR-Bench's 1,000 PRs, flattening after about 5. The
+pass shows as `Claude-Sonnet-5.5@high #2`; grouping keeps two findings
+of one run apart but joins the two passes, and agreement between them
+doesn't count toward consensus (×N counts models). Sonnet is the default
+for recall per second; the default `concurrency` is 6 so the pass runs
+alongside the others. Quick runs keep one pass each.
 `verifyOnly` models skip the review and only join the `--verify` (and
 `--pr-comments`) verification round; a model listed in both `reviewers` and
 `verifyOnly` only verifies. They also join Socratic discussions as full

@@ -533,9 +533,10 @@ export function allReviewersFailedResult(runs: ReviewerRunResult[], mode: string
  * arrays gives us the cap without a custom queue.
  */
 export async function runAllReviewers(
-	resolved: Array<{ rs: ReviewerSpec; model: Model; clamped: boolean }>,
+	resolved: Array<{ rs: ReviewerSpec; model: Model; clamped: boolean; pass?: number }>,
 	systemPrompt: string,
-	userPrompt: string,
+	/** A string, or per row (a second pass gets the diff's files reversed). */
+	userPrompt: string | ((row: { pass?: number }) => string),
 	concurrency: number,
 	temperature: number,
 	abortSignal: AbortSignal | undefined,
@@ -580,9 +581,11 @@ export async function runAllReviewers(
 			if (idx >= resolved.length) return;
 			const slot = resolved[idx];
 			try {
-				const partial = await runReviewer(slot.model, slot.rs, ctx, systemPrompt, userPrompt, temperature, abortSignal, phaseOpts);
+				const prompt = typeof userPrompt === "string" ? userPrompt : userPrompt(slot);
+				const partial = await runReviewer(slot.model, slot.rs, ctx, systemPrompt, prompt, temperature, abortSignal, phaseOpts);
 				const full: ReviewerRunResult = {
-					formattedSpec: formatReviewerSpec(slot.rs),
+					formattedSpec: formatRunSpec(slot),
+					...(slot.pass ? { pass: slot.pass } : {}),
 					spec: slot.rs.spec,
 					thinking: slot.rs.thinking,
 					clamped: slot.clamped,
@@ -594,7 +597,8 @@ export async function runAllReviewers(
 				onProgress?.(done, total, full);
 			} catch (err) {
 				const full: ReviewerRunResult = {
-					formattedSpec: formatReviewerSpec(slot.rs),
+					formattedSpec: formatRunSpec(slot),
+					...(slot.pass ? { pass: slot.pass } : {}),
 					spec: slot.rs.spec,
 					thinking: slot.rs.thinking,
 					clamped: slot.clamped,
@@ -617,6 +621,11 @@ export async function runAllReviewers(
 	await Promise.all(Array.from({ length: cap }, () => worker()));
 	throwIfAborted(abortSignal);
 	return results;
+}
+
+/** A reviewer's spec as shown, with " #2" on a model's second pass. */
+export function formatRunSpec(row: { rs: ReviewerSpec; pass?: number }): string {
+	return formatReviewerSpec(row.rs) + (row.pass ? ` #${row.pass}` : "");
 }
 
 export const STRAGGLER_MIN_GRACE_MS = 45_000;

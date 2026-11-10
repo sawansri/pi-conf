@@ -83,7 +83,7 @@ export function synthesizeLeadView(
 		const tally = verificationTally(g);
 		lines.push(`### ${g.id} · ${g.severity.toUpperCase()} · ${g.title} — ×${g.reviewerSpecs.length}${tally ? ` · ${tally}` : ""}`);
 		lines.push(`- **Where:** \`${g.file}:${formatRange(g.line_start, g.line_end)}\` · ${g.category}`);
-		lines.push(`- **Raised by:** ${g.members.map((m) => shortSpec(m.spec) + (m.severity !== g.severity ? ` (says ${m.severity.toUpperCase()})` : "")).join(", ")}`);
+		lines.push(`- **Raised by:** ${g.members.map((m) => shortSpec(m.spec) + (m.pass ? ` #${m.pass}` : "") + (m.severity !== g.severity ? ` (says ${m.severity.toUpperCase()})` : "")).join(", ")}`);
 		lines.push(`- **What:** ${(canon.parts?.core ?? canon.comment).replace(/\s+/g, " ")}`);
 		const evidence = canon.parts?.evidence;
 		const repro = canon.parts?.repro ?? g.members.find((m) => m.parts?.repro)?.parts?.repro;

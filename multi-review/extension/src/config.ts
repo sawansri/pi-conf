@@ -81,6 +81,13 @@ export interface MultiReviewConfig {
 	 * pool (with tools) but skip the fan-out. Unused in `--quick` runs.
 	 */
 	verifyOnly: string[];
+	/**
+	 * Reviewers (by provider/id) that review twice, the second pass with the
+	 * diff's files in reverse order. Runs of one model vary a lot, and
+	 * combining them raised F1 by up to 44% on SWR-Bench; agreement between
+	 * a model's two passes doesn't count as consensus.
+	 */
+	secondPass: string[];
 	/** Fast pool for `--quick` runs: single completions, no tools. */
 	quickReviewers: string[];
 	/** Run finding reviewers as nested agents with read-only repo tools. */
@@ -179,11 +186,14 @@ export const DEFAULTS: MultiReviewConfig = {
 	],
 	judge: "amd-gateway-anthropic/Claude-Opus-5.5",
 	judgeThinking: "high",
-	concurrency: 5,
+	// The 5 reviewers plus Sonnet's second pass, all at once.
+	concurrency: 6,
 	temperature: 0.2,
 	verify: false,
 	verifiersPerFinding: 2,
 	verifyOnly: [],
+	// Sonnet: the best recall per second in the pool.
+	secondPass: ["amd-gateway-anthropic/Claude-Sonnet-5.5"],
 	quickReviewers: [
 		"amd-gateway/gpt-6-luna@low",
 		"amd-gateway-anthropic/Claude-Haiku-5.5",
@@ -250,6 +260,9 @@ export function loadConfig(): MultiReviewConfig {
 		}
 		if (Array.isArray(parsed.verifyOnly)) {
 			cachedConfig.verifyOnly = parsed.verifyOnly.filter((x: unknown): x is string => typeof x === "string" && x.includes("/"));
+		}
+		if (Array.isArray(parsed.secondPass)) {
+			cachedConfig.secondPass = parsed.secondPass.filter((x: unknown): x is string => typeof x === "string" && x.includes("/"));
 		}
 		if (Array.isArray(parsed.quickReviewers)) {
 			cachedConfig.quickReviewers = parsed.quickReviewers.filter((x: unknown): x is string => typeof x === "string" && x.includes("/"));

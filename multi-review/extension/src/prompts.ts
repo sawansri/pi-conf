@@ -109,7 +109,18 @@ export function budgetDiff(diffText: string): string {
 		`\n…(diff truncated to ${DIFF_BUDGET_CHARS} chars; ${diffText.length} total)\n`;
 }
 
-export function buildReviewUserPrompt(target: ReviewTarget): string {
+/**
+ * The diff with its files in reverse order: a model's second pass sees
+ * first what the first pass saw last (attention fades along a long diff),
+ * and a diff over budget loses its other end to truncation.
+ */
+export function reverseDiffFiles(diffText: string): string {
+	const files = diffText.split(/^(?=diff --git )/m);
+	const head = files[0]?.startsWith("diff --git ") ? "" : files.shift() ?? "";
+	return head + files.reverse().map((f) => (f.endsWith("\n") ? f : `${f}\n`)).join("");
+}
+
+export function buildReviewUserPrompt(target: ReviewTarget, opts: { reverseFiles?: boolean } = {}): string {
 	const chunks: string[] = [];
 	const brief = target.brief;
 	if (brief?.intent) {
@@ -136,11 +147,11 @@ export function buildReviewUserPrompt(target: ReviewTarget): string {
 	if (target.checkResults?.length) chunks.push(...checkPromptLines(target.checkResults));
 	if (target.diffText) {
 		chunks.push("## Diff");
-		chunks.push(budgetDiff(target.diffText));
+		chunks.push(budgetDiff(opts.reverseFiles ? reverseDiffFiles(target.diffText) : target.diffText));
 		chunks.push("");
 	} else if (target.files.length > 0) {
 		chunks.push("## Files in scope (no diff; review at the file level)");
-		for (const f of target.files) chunks.push(`- ${f.path}`);
+		for (const f of opts.reverseFiles ? [...target.files].reverse() : target.files) chunks.push(`- ${f.path}`);
 		chunks.push("");
 	}
 	if (brief && brief.contextFiles.length > 0) {

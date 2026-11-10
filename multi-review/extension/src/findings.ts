@@ -62,6 +62,8 @@ export interface ReviewerRunResult {
 	durationMs: number;
 	/** Cut short as a straggler or at the timeout (the reason); findings come from the harvest. */
 	partial?: string;
+	/** 2 for a model's second pass (the diff's files in reverse order); unset for the first. */
+	pass?: number;
 }
 
 /**

@@ -530,11 +530,16 @@ async function runReviewPipeline(
 	runOpts = prep.runOpts;
 	const { sandboxReason, sandboxExtras } = prep;
 	const userPrompt = buildReviewUserPrompt(target);
-	progress.update({ phase: `fanning out to ${rows.length} reviewers (cap ${cfg.concurrency})`, done: 0, total: rows.length });
+	// secondPass models review twice, the second time with the diff's files
+	// reversed. Quick runs (single completions) keep one pass each.
+	const twice = new Set(cfg.secondPass.map((raw) => parseReviewerSpec(raw)?.spec));
+	const passes = flags.quick ? rows : [...rows, ...rows.filter((r) => twice.has(r.rs.spec)).map((r) => ({ ...r, pass: 2 }))];
+	const reversedPrompt = passes.length > rows.length ? buildReviewUserPrompt(target, { reverseFiles: true }) : userPrompt;
+	progress.update({ phase: `fanning out to ${passes.length} reviewers (cap ${cfg.concurrency})`, done: 0, total: passes.length });
 	const runs = await runAllReviewers(
-		rows,
+		passes,
 		REVIEWER_SYSTEM_PROMPT,
-		userPrompt,
+		(row) => (row.pass ? reversedPrompt : userPrompt),
 		cfg.concurrency,
 		cfg.temperature,
 		signal,
