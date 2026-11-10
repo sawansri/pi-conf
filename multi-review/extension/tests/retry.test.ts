@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ModelCallResult } from "../src/models.ts";
-import { ERROR_RETRIES, retryOnError } from "../src/util.ts";
+import { ERROR_RETRIES, isPermanentError, retryOnError } from "../src/util.ts";
 
 const ok: ModelCallResult = { text: "[]", stopReason: "stop", durationMs: 1 };
 const failed = (errorMessage: string): ModelCallResult => ({ text: "", stopReason: "error", errorMessage, durationMs: 1 });
@@ -63,4 +63,15 @@ test("an abort during the wait ends it early without another attempt", async () 
 	const result = retryOnError(ac.signal, s.attempt, () => queueMicrotask(() => ac.abort("timeout")), 60_000);
 	assert.equal((await result).errorMessage, "503");
 	assert.equal(s.calls, 1);
+});
+
+test("errors another attempt won't fix aren't retried", async () => {
+	for (const e of ["error: 401 Unauthorized", "error: 404 model not found", "error: This model's maximum context length is 200000 tokens", "error: 400 invalid request", "error: prompt is too long"]) {
+		const s = scripted([failed(e), ok]);
+		assert.equal((await retryOnError(new AbortController().signal, s.attempt, undefined, 0)).errorMessage, e);
+		assert.equal(s.calls, 1, e);
+	}
+	for (const e of ["error: 429 Too Many Requests", "error: 503 Service Unavailable", "error: 408 Request Timeout", "socket hang up", "error: Provider finish_reason: content_filter"]) {
+		assert.equal(isPermanentError(e), false, e);
+	}
 });

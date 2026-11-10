@@ -49,11 +49,22 @@ export const ERROR_RETRIES = 3;
 export const ERROR_RETRY_DELAY_MS = 15_000;
 
 /**
+ * Errors another attempt won't fix: bad credentials or request, a missing
+ * model, a prompt over the context window. 408 and 429 are transient.
+ */
+const PERMANENT_ERROR = /\b(400|401|403|404|413|422)\b|unauthori[sz]ed|forbidden|invalid.{0,20}(api.?key|request)|model.{0,20}(not found|does not exist)|context.{0,10}(length|window)|maximum context|too many tokens|prompt is too long/i;
+
+export function isPermanentError(errorMessage: string): boolean {
+	return PERMANENT_ERROR.test(errorMessage);
+}
+
+/**
  * Re-run a failed model call up to ERROR_RETRIES times, ERROR_RETRY_DELAY_MS
  * apart. Gateway 5xx, rate limits and dropped streams usually clear within
- * seconds, and one blip shouldn't drop a model from the pool. Timeouts and
- * aborts aren't retried: retries share the caller's signal, so they never
- * outlast its deadline. A throw counts as an error.
+ * seconds, and one blip shouldn't drop a model from the pool. Timeouts,
+ * aborts and permanent errors (isPermanentError) aren't retried: retries
+ * share the caller's signal, so they never outlast its deadline. A throw
+ * counts as an error.
  */
 export async function retryOnError(
 	signal: AbortSignal,
@@ -63,7 +74,7 @@ export async function retryOnError(
 ): Promise<ModelCallResult> {
 	const run = () => attempt().catch((err): ModelCallResult => ({ text: "", stopReason: "error", errorMessage: err instanceof Error ? err.message : String(err), durationMs: 0 }));
 	let result = await run();
-	for (let retry = 1; retry <= ERROR_RETRIES && result.errorMessage !== undefined && !signal.aborted; retry++) {
+	for (let retry = 1; retry <= ERROR_RETRIES && result.errorMessage !== undefined && !isPermanentError(result.errorMessage) && !signal.aborted; retry++) {
 		onRetry?.(retry, result.errorMessage);
 		if (!(await sleep(delayMs, signal))) break;
 		result = await run();

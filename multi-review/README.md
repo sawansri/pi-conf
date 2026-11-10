@@ -555,8 +555,11 @@ extglob — documented limitation.
    verifier or Socratic turn that ends in an error (gateway 5xx, rate
    limit, dropped stream, content filter after its in-place retry) is
    re-run in a fresh session up to 3 times, 15s apart. Retries share the
-   reviewer's timeout, and timeouts and straggler cuts aren't retried; the
-   trace logs an `error_retry` event per retry. Fail-soft: one reviewer's failure doesn't stop the rest, but
+   reviewer's timeout. Timeouts, straggler cuts and errors another attempt
+   won't fix (400/401/403/404/413/422, bad credentials, a missing model, a
+   prompt over the context window) aren't retried; a reviewer cut while
+   waiting to retry reports both the cut and the error. The trace logs an
+   `error_retry` event per retry. Fail-soft: one reviewer's failure doesn't stop the rest, but
    failures (`stopReason` error/aborted/timeout, empty output at maxTokens,
    no JSON array) are reported as failures, never as "no findings". If
    every reviewer fails, the run reports errors instead of a review.

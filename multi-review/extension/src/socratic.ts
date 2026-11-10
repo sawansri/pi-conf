@@ -375,7 +375,9 @@ export async function runSocraticDiscussion(
 							tracer?.onEvent({ type: "multi_review_error_retry", retry, error } as unknown as AgentSessionEvent);
 						});
 						deadline.dispose();
-						if (call.errorMessage && deadline.cut.aborted && !abortSignal?.aborted) call.errorMessage = String(deadline.cut.reason);
+						if (call.errorMessage && deadline.cut.aborted && !abortSignal?.aborted) {
+							call.errorMessage = call.errorMessage.startsWith("aborted") ? String(deadline.cut.reason) : `${String(deadline.cut.reason)}, retrying after: ${call.errorMessage}`;
+						}
 						const ok = call.errorMessage === undefined && Boolean(call.text.trim());
 						if (!ok) resetSession(idx);
 						const errorMessage = call.errorMessage ?? (!call.text.trim() ? "empty response" : undefined);

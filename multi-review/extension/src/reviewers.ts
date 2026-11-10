@@ -462,7 +462,10 @@ export async function runReviewer(
 			temperature,
 			signal,
 		}), (retry, error) => tracer?.onEvent({ type: "multi_review_error_retry", retry, error } as unknown as AgentSessionEvent));
-	if (call.errorMessage && deadline.cut.aborted && !abortSignal?.aborted) call.errorMessage = String(deadline.cut.reason);
+	// Cut while waiting to retry an error: say both.
+	if (call.errorMessage && deadline.cut.aborted && !abortSignal?.aborted) {
+		call.errorMessage = call.errorMessage.startsWith("aborted") ? String(deadline.cut.reason) : `${String(deadline.cut.reason)}, retrying after: ${call.errorMessage}`;
+	}
 	if (process.env.MULTI_REVIEW_DEBUG === "2") console.error(`[raw ${formatReviewerSpec(reviewerSpec)}] ${call.text.slice(0, 4000)}`);
 	let findings: ReviewerFinding[] = [];
 	let errorMessage = call.errorMessage;
