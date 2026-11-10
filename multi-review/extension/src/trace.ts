@@ -120,6 +120,10 @@ export class ReviewTrace {
 				} else if ((event as { type: string }).type === "multi_review_filter_retry") {
 					a.lastTool = "retry after content_filter";
 					this.append(a, { kind: "filter_retry" });
+				} else if ((event as { type: string }).type === "multi_review_error_retry") {
+					const { retry, error } = event as unknown as { retry: number; error: string };
+					a.lastTool = `retry ${retry} after error`;
+					this.append(a, { kind: "error_retry", retry, error: error.slice(0, 300) });
 				} else if (event.type === "tool_execution_end" && (event.toolName === GIT_TOOL || event.toolName === RUN_TOOL || event.toolName === XREF_TOOL || event.toolName === WEB_SEARCH_TOOL)) {
 					// Executed commands are evidence; keep the head of what they returned.
 					const content = ((event.result as { content?: Array<{ type: string; text?: string }> } | undefined)?.content ?? []);

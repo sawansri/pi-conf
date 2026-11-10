@@ -1,3 +1,5 @@
+import type { ModelCallResult } from "./models.ts";
+
 
 
 /**
@@ -25,6 +27,48 @@ export function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefine
 			(e) => { signal.removeEventListener("abort", listener); reject(e); },
 		);
 	});
+}
+
+/** Wait `ms`, or less if `signal` fires; false when it was cut short. */
+export function sleep(ms: number, signal?: AbortSignal): Promise<boolean> {
+	return new Promise((resolve) => {
+		if (signal?.aborted) return resolve(false);
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve(true);
+		}, ms);
+		const onAbort = () => {
+			clearTimeout(timer);
+			resolve(false);
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+export const ERROR_RETRIES = 3;
+export const ERROR_RETRY_DELAY_MS = 15_000;
+
+/**
+ * Re-run a failed model call up to ERROR_RETRIES times, ERROR_RETRY_DELAY_MS
+ * apart. Gateway 5xx, rate limits and dropped streams usually clear within
+ * seconds, and one blip shouldn't drop a model from the pool. Timeouts and
+ * aborts aren't retried: retries share the caller's signal, so they never
+ * outlast its deadline. A throw counts as an error.
+ */
+export async function retryOnError(
+	signal: AbortSignal,
+	attempt: () => Promise<ModelCallResult>,
+	onRetry?: (retry: number, errorMessage: string) => void,
+	delayMs = ERROR_RETRY_DELAY_MS,
+): Promise<ModelCallResult> {
+	const run = () => attempt().catch((err): ModelCallResult => ({ text: "", stopReason: "error", errorMessage: err instanceof Error ? err.message : String(err), durationMs: 0 }));
+	let result = await run();
+	for (let retry = 1; retry <= ERROR_RETRIES && result.errorMessage !== undefined && !signal.aborted; retry++) {
+		onRetry?.(retry, result.errorMessage);
+		if (!(await sleep(delayMs, signal))) break;
+		result = await run();
+	}
+	return result;
 }
 
 /** Caller's signal plus a per-reviewer deadline, so one hung model can't stall the run. */

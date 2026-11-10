@@ -492,7 +492,12 @@ extglob — documented limitation.
    are cut. A degraded endpoint
    no longer holds the whole review hostage. Aborts are authoritative: a
    call returns when its signal fires even if the provider stream hangs.
-   Abort is threaded from the tool's signal. Fail-soft: one reviewer's failure doesn't stop the rest, but
+   Abort is threaded from the tool's signal. **Error retries:** a reviewer,
+   verifier or Socratic turn that ends in an error (gateway 5xx, rate
+   limit, dropped stream, content filter after its in-place retry) is
+   re-run in a fresh session up to 3 times, 15s apart. Retries share the
+   reviewer's timeout, and timeouts and straggler cuts aren't retried; the
+   trace logs an `error_retry` event per retry. Fail-soft: one reviewer's failure doesn't stop the rest, but
    failures (`stopReason` error/aborted/timeout, empty output at maxTokens,
    no JSON array) are reported as failures, never as "no findings". If
    every reviewer fails, the run reports errors instead of a review.
@@ -604,8 +609,9 @@ Findings:
   `content_filter` (likely recitation of quoted code). Any session that
   hits it is re-prompted once in place, keeping what it has read, and asked
   to describe code and cite `file:line` instead of quoting it; if the retry
-  is blocked too, that reviewer is reported as failed and the rest of the
-  pool carries on.
+  is blocked too, the session starts over under the error retries (up to 3,
+  15s apart), and after those that reviewer is reported as failed and the
+  rest of the pool carries on.
 - **DeepSeek V4.1 Flash** (the gateway's pre-1017 checkpoint) works with
   tools and thinking but was too slow to review: cut as a straggler at
   `@high`, timed out at 900s at `@max` after ~200k characters of reasoning.

@@ -1,4 +1,4 @@
-import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { AgentSessionEvent, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { checkLines, checkPromptLines } from "./checks.ts";
 import { type Model, type ModelSpec, type MultiReviewConfig, type ReviewerSpec, type ThinkingLevelAlias, formatReviewerSpec } from "./config.ts";
 import type { JudgeResult } from "./judge.ts";
@@ -19,7 +19,7 @@ import {
 	throwIfAborted,
 } from "./reviewers.ts";
 import type { ReviewTarget } from "./target.ts";
-import { withTimeout } from "./util.ts";
+import { retryOnError, withTimeout } from "./util.ts";
 
 // ---------- Socratic discussion ----------
 
@@ -333,33 +333,40 @@ export async function runSocraticDiscussion(
 					const formattedSpec = formatReviewerSpec(slot.rs);
 					const signal = withTimeout(roundAbort, roundTimeoutMs);
 					const tracer = runOpts.trace?.start(formattedSpec, `round ${r}`, cwd);
-					const hadPriorSession = sessions[idx] !== null;
 					const ownPrevText = prevRound?.entries[idx]?.ok ? prevRound.entries[idx].text : undefined;
-					const userPrompt = r === 1
-						? round1Prompt
-						: buildSocraticFollowUpPrompt(
-							r,
-							totalRounds,
-							topic,
-							prevRound!,
-							idx,
-							r === 2 ? target.brief?.suspicions : undefined,
-							// Include own prior response when stateless (--quick) or when the session was recreated after an earlier error.
-							!runOpts.useTools || !hadPriorSession ? ownPrevText : undefined,
-						);
-					try {
-						const call = runOpts.useTools
-							? await (await ensureSession(idx)).promptTurn(
+					// Per attempt: a retry runs in a fresh session, which needs Round 1 again.
+					const attempt = () => {
+						const hadPriorSession = sessions[idx] !== null;
+						const userPrompt = r === 1
+							? round1Prompt
+							: buildSocraticFollowUpPrompt(
+								r,
+								totalRounds,
+								topic,
+								prevRound!,
+								idx,
+								r === 2 ? target.brief?.suspicions : undefined,
+								// Include own prior response when stateless (--quick) or when the session was recreated after an earlier error.
+								!runOpts.useTools || !hadPriorSession ? ownPrevText : undefined,
+							);
+						return runOpts.useTools
+							? ensureSession(idx).then((sess) => sess.promptTurn(
 								!hadPriorSession && r > 1 ? `${round1Prompt}\n\n---\n\n${userPrompt}` : userPrompt,
 								signal,
 								tracer?.onEvent,
 								SOCRATIC_EMPTY_NUDGE,
-							)
-							: await callModel(ctx, slot.model, SOCRATIC_SYSTEM_PROMPT, r === 1 ? userPrompt : `${round1Prompt}\n\n---\n\n${userPrompt}`, {
+							))
+							: callModel(ctx, slot.model, SOCRATIC_SYSTEM_PROMPT, r === 1 ? userPrompt : `${round1Prompt}\n\n---\n\n${userPrompt}`, {
 								thinking: slot.rs.thinking,
 								temperature: cfg.temperature,
 								signal,
 							});
+					};
+					try {
+						const call = await retryOnError(signal, attempt, (retry, error) => {
+							resetSession(idx);
+							tracer?.onEvent({ type: "multi_review_error_retry", retry, error } as unknown as AgentSessionEvent);
+						});
 						if (call.errorMessage && signal.aborted && !abortSignal?.aborted) {
 							call.errorMessage = straggler.signal.aborted
 								? String(straggler.signal.reason)

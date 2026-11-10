@@ -7,7 +7,7 @@ import type { MultiReviewRunResult } from "./pipeline.ts";
 import { REVIEWER_TOOLS_ADDENDUM, SOCRATIC_TOOLS_ADDENDUM, VERIFIER_RUN_ADDENDUM, XREF_ADDENDUM } from "./prompts.ts";
 import type { SandboxExtras } from "./sandbox.ts";
 import { ReviewTrace, type ReviewerActivity } from "./trace.ts";
-import { abortable, withTimeout } from "./util.ts";
+import { abortable, retryOnError, withTimeout } from "./util.ts";
 import { type WebSearchOptions, NO_WEB_ADDENDUM, createWebSearchTool, installNativeWebSearch, searchesNatively, webSearchAddendum, webSearchAvailable } from "./web-search.ts";
 import { XrefService, createXrefTool } from "./xref.ts";
 
@@ -380,8 +380,9 @@ export async function runReviewer(
 	const tracer = runOpts.trace?.start(formatReviewerSpec(reviewerSpec), runOpts.tracePhase ?? "review", runOpts.cwd ?? ctx.cwd);
 	const verifying = runOpts.tracePhase === "verify";
 	const canRun = verifying && Boolean(runOpts.sandbox);
-	const call = runOpts.useTools
-		? await runAgenticReviewer(
+	// Each retry starts a fresh session: an errored one may have dropped its stream mid-turn.
+	const call = await retryOnError(signal, () => runOpts.useTools
+		? runAgenticReviewer(
 			ctx, model, reviewerSpec.thinking,
 			systemPrompt + buildToolPromptAddendum(model, runOpts, canRun, false),
 			userPrompt, signal, runOpts.cwd ?? ctx.cwd, tracer?.onEvent,
@@ -394,11 +395,11 @@ export async function runReviewer(
 				minToolCalls: verifying ? undefined : runOpts.minToolCalls,
 			},
 		)
-		: await callModel(ctx, model, systemPrompt, userPrompt, {
+		: callModel(ctx, model, systemPrompt, userPrompt, {
 			thinking: reviewerSpec.thinking,
 			temperature,
 			signal,
-		});
+		}), (retry, error) => tracer?.onEvent({ type: "multi_review_error_retry", retry, error } as unknown as AgentSessionEvent));
 	if (call.errorMessage && signal.aborted && !abortSignal?.aborted) {
 		call.errorMessage = `timed out after ${Math.round(runOpts.timeoutMs / 1000)}s`;
 	}
