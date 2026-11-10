@@ -30,6 +30,18 @@ export interface FindingParts {
 	/** Concrete trigger → observed vs expected; makes the finding test-ready. */
 	repro?: string;
 	suggestion?: string;
+	/** How the reviewer knows: ran the repro, traced the whole path, or inferred. */
+	evidenceKind?: EvidenceKind;
+}
+
+export type EvidenceKind = "executed" | "traced" | "inferred";
+
+export function normalizeEvidenceKind(raw: string): EvidenceKind | undefined {
+	const v = raw.toLowerCase();
+	if (/^(executed|ran|run|reproduced|tested)/.test(v)) return "executed";
+	if (/^(traced|trace|read)/.test(v)) return "traced";
+	if (/^(inferred|infer|suspected|reasoned|partial)/.test(v)) return "inferred";
+	return undefined;
 }
 
 export interface ReviewerRunResult {
@@ -183,7 +195,8 @@ export function parseReviewerJson(rawText: string): ReviewerFinding[] {
 		const evidenceText = pickText(raw, ["evidence", "reasoning", "justification", "trace", "proof"]);
 		const suggestionText = pickText(raw, ["suggestion", "fix", "recommendation", "remediation"]);
 		const reproText = pickText(raw, ["repro", "reproduction", "trigger", "steps", "test_case", "example"]);
-		const evidence = evidenceText ? `\nEvidence: ${evidenceText}` : "";
+		const evidenceKind = normalizeEvidenceKind(pickText(raw, ["evidence_kind", "evidenceKind", "evidence_type"]));
+		const evidence = evidenceText ? `\nEvidence${evidenceKind ? ` (${evidenceKind})` : ""}: ${evidenceText}` : "";
 		const repro = reproText ? `\nRepro: ${reproText}` : "";
 		const suggestion = suggestionText ? `\nSuggestion: ${suggestionText}` : "";
 		const comment = (core + evidence + repro + suggestion).slice(0, 2800);
@@ -197,6 +210,7 @@ export function parseReviewerJson(rawText: string): ReviewerFinding[] {
 				evidence: evidenceText || undefined,
 				repro: reproText || undefined,
 				suggestion: suggestionText || undefined,
+				...(evidenceKind ? { evidenceKind } : {}),
 			},
 		});
 	}

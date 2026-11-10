@@ -197,8 +197,8 @@ sandbox (no root, no user namespaces, ~0.15s per call).
 
 | Who | Tools |
 |-----|-------|
-| Reviewers | `read`, `grep`, `find`, `ls`, `git`, `progress`, `web_search`, and `xref` for C/C++ changes |
-| Verifiers | the same, plus `run` (when the sandbox works) |
+| Reviewers | `read`, `grep`, `find`, `ls`, `git`, `progress`, `web_search`, `xref` for C/C++ changes, and `run` (when the sandbox works) |
+| Verifiers | the same |
 
 - **`git`** runs `log`, `show`, `blame`, or `diff` in the reviewed checkout,
   so reviewers can see why touched code is the way it is and whether a
@@ -207,10 +207,14 @@ sandbox (no root, no user namespaces, ~0.15s per call).
   abbreviated forms (`--cont` for `--contents`) and `-O<file>`. Paths
   outside the repo are refused too, since they'd switch `git diff` into
   no-index mode.
-- **`run`** (verifiers only) runs a bash script to settle a claim by
-  execution: a targeted test, compiling the touched files, or a repro.
-  For C/C++, verifiers are told to compile repros with
-  `-fsanitize=address,undefined`.
+- **`run`** runs a bash script to settle a claim by execution: a targeted
+  test, compiling the touched files, or a repro. Reviewers are told to run
+  each cheap repro before reporting it and to say how they know in
+  `evidence_kind` (`executed`, `traced`, `inferred`); verifiers run code
+  to confirm or refute. Execution is the one check that separates real
+  bugs from plausible ones (Project Naptime, Anthropic's ASan-gated bug
+  pipeline), where self-critique without it doesn't help. For C/C++,
+  sessions are told to compile repros with `-fsanitize=address,undefined`.
 - **Checks** run once before the fan-out, all at the same time (each in
   its own sandbox), inside `checkTimeoutSec` (120s): the brief's `checks`, plus, with `autoChecks`, a built-in one
   per language. Their output goes into every reviewer's prompt and into the
@@ -298,7 +302,7 @@ What the sandbox allows:
   which takes children that `setsid` away too.
 
 Without nono, or with `"sandbox": false`, checks are skipped with a warning
-and verifiers have no `run` tool; everything else works as before.
+and no session has a `run` tool; everything else works as before.
 
 Note that pi's own `read` tool, which every reviewer has, is not sandboxed:
 it can read any file your user can.
@@ -506,8 +510,8 @@ extglob — documented limitation.
 4. **Parallel fan-out** — capped by `multi-review.concurrency` (max 16).
    With `reviewerTools: true` (default) each reviewer is a nested pi agent
    (`createAgentSession`, in-memory, no extensions/skills/context files)
-   with `read`/`grep`/`find`/`ls`/`git` only (verifiers also get the
-   sandboxed `run`; see [Executing code](#executing-code-tools-checks-and-the-sandbox)), so it can trace callers and tests
+   with `read`/`grep`/`find`/`ls`/`git` and the sandboxed `run` (see
+   [Executing code](#executing-code-tools-checks-and-the-sandbox)), so it can trace callers and tests
    instead of guessing from hunks. Otherwise it's a single
    `ctx.modelRegistry.streamSimple()` call. Both paths use registry auth
    (literal keys and custom headers in `models.json`). Each reviewer gets
@@ -560,8 +564,12 @@ extglob — documented limitation.
    execution path, trace security inputs to the sink, no "I'd have done it
    differently", no style padding, and `[]` only after investigating. Output is ONLY a JSON array of
    `{file, line_start, line_end, severity, category, title, comment,
-   evidence, repro, suggestion}`. `repro` is the concrete trigger and the
-   observed vs expected result, which makes every finding test-ready. Category `spec` marks unmet requirements. The
+   evidence, evidence_kind, repro, suggestion}`. `repro` is the concrete trigger and the
+   observed vs expected result, which makes every finding test-ready.
+   `evidence_kind` is how the reviewer knows: `executed` (ran the repro;
+   evidence cites the command and output), `traced`, or `inferred`. The
+   lead view shows it next to the evidence and prefers an executed
+   member as a group's canonical description. Category `spec` marks unmet requirements. The
    parser tolerates fences, prose wrap, and `{"findings": [...]}`; only an
    explicit `[]` means clean.
 
@@ -805,9 +813,8 @@ expose per-row level controls is tracked as future polish.
   registry has API keys for.
 - **Sub-process sharding.** Reviewers run in-process (nested agent
   sessions or registry calls), not as spawned `pi` subprocesses.
-- **Write access for reviewers.** Reviewers get read-only tools and no
-  shell; only verifiers get `run`, and only inside the sandbox, where the
-  repo is read-only.
+- **Write access for reviewers.** Reviewers and verifiers get read-only
+  tools and `run` only inside the sandbox, where the repo is read-only.
 - **Full model configuration UI.** The picker selects reviewer models only.
   Per-reviewer thinking levels and judge choice are still edited directly in
   `multi-review.json`.

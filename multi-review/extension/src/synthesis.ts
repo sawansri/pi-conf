@@ -36,7 +36,8 @@ const DISTINCT_FRAMING_JACCARD = 0.25;
 /** Most actionable member: evidence and repro weigh most, then a fix, then detail. */
 function canonicalMember(g: DedupeGroup): DedupeGroup["members"][number] {
 	const score = (m: DedupeGroup["members"][number]) =>
-		(m.parts?.evidence ? 2 : 0) + (m.parts?.repro ? 2 : 0) + (m.parts?.suggestion ? 1 : 0) + Math.min(1, (m.parts?.core ?? m.comment).length / 1000);
+		(m.parts?.evidence ? 2 : 0) + (m.parts?.repro ? 2 : 0) + (m.parts?.suggestion ? 1 : 0) + Math.min(1, (m.parts?.core ?? m.comment).length / 1000) +
+		(m.parts?.evidenceKind === "executed" ? 3 : m.parts?.evidenceKind === "traced" ? 1 : 0);
 	return g.members.reduce((best, m) => (score(m) > score(best) ? m : best), g.members[0]);
 }
 
@@ -81,7 +82,8 @@ export function synthesizeLeadView(
 		const evidence = canon.parts?.evidence;
 		const repro = canon.parts?.repro ?? g.members.find((m) => m.parts?.repro)?.parts?.repro;
 		const fix = canon.parts?.suggestion ?? g.members.find((m) => m.parts?.suggestion)?.parts?.suggestion;
-		if (evidence) lines.push(`- **Evidence:** ${evidence.replace(/\s+/g, " ")}`);
+		const kind = canon.parts?.evidenceKind;
+		if (evidence) lines.push(`- **Evidence${kind ? ` (${kind})` : ""}:** ${evidence.replace(/\s+/g, " ")}`);
 		if (repro) lines.push(`- **Repro:** ${repro.replace(/\s+/g, " ")}`);
 		if (fix) lines.push(`- **Fix:** ${fix.replace(/\s+/g, " ")}`);
 		// At most one alternative framing: the most distinct from the canonical

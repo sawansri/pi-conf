@@ -518,8 +518,9 @@ async function runReviewPipeline(
 			? opts
 			: { ...opts, timeoutMs: Math.max(MIN_PHASE_MS, Math.min(opts.timeoutMs, deadlineMs - Date.now() - reserveMs)) };
 	// Code only runs sandboxed, and never in quick runs (no tools there). The
-	// probe runs only when something would execute: checks or verification.
-	// A straggler's partial findings get verifiers (with `run`) even without --verify.
+	// probe runs only when something would execute: checks, reviewers'
+	// repros, or verification (a straggler's partial findings get verifiers
+	// even without --verify).
 	const mayExecute = (target.brief?.checks.length ?? 0) > 0 || flags.verify || (prReport?.claims.length ?? 0) > 0 || (!flags.quick && runOpts.useTools);
 	const checkReserve = REVIEW_RESERVE_MS + GROUPING_RESERVE_MS + (flags.verify ? VERIFY_RESERVE_MS : 0) + FINAL_RESERVE_MS;
 	const prep = await prepareExecutionTools(
@@ -538,7 +539,8 @@ async function runReviewPipeline(
 		cfg.temperature,
 		signal,
 		ctx,
-		fit(runOpts, GROUPING_RESERVE_MS + (flags.verify ? VERIFY_RESERVE_MS : 0)),
+		// Reviewers get `run` too, to prove findings by executing their repros.
+		{ ...fit(runOpts, GROUPING_RESERVE_MS + (flags.verify ? VERIFY_RESERVE_MS : 0)), sandbox: sandboxReason === null, sandboxExtras },
 		(done, total, latest) => progress.update({ phase: "reviewers running", done, total, latest: formatReviewerProgressLine(done, total, latest) }),
 	);
 	const failure = allReviewersFailedResult(runs, label);

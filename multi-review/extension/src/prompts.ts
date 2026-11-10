@@ -25,6 +25,7 @@ Output ONLY a JSON array:
     "title": "<≤80 chars>",
     "comment": "<what is wrong, ≤400 chars>",
     "evidence": "<the execution path / spec clause / lines that prove it, ≤400 chars>",
+    "evidence_kind": "executed"|"traced"|"inferred",
     "repro": "<steps someone can run as written: the exact command, test, or call sequence with concrete inputs, driving the changed code itself (not a re-implementation of it), then observed vs expected, e.g. \"cache.set('k', v, 1000); advance clock 500ms; cache.get('k') → undefined; expected v\". Omit only for pure design/docs findings. ≤400 chars>",
     "suggestion": "<optional concrete fix, ≤200 chars>"
   }
@@ -35,6 +36,7 @@ Rules:
 - One finding per concrete issue.
 - line_start/line_end are post-change line numbers in the new file. Use null for file-level findings.
 - category "spec": a requirement that is missing, partially implemented, or contradicted. Quote the requirement in evidence.
+- evidence_kind says how you know: "executed" (you ran the repro and saw the failure; evidence cites the command and its output), "traced" (you followed the whole path in the code), "inferred" (part of the path, or reasoning about code you didn't read). Don't claim more than you did: an honest "inferred" is worth more than a false "executed".
 - Severity: critical (security hole, data loss, spec requirement fundamentally unmet), high (correctness bug, race, broken edge case), medium (perf cliff, fragile design that will bite soon), low (minor correctness/maintainability), info (style, docs).`;
 
 /** Appended when the reviewer runs as a nested agent with read-only tools. */
@@ -81,7 +83,12 @@ export const XREF_ADDENDUM = `
 
 For C/C++ you also have \`xref\` (clangd): the definition, references, callers or callees of a symbol as it appears on a file:line, or a project-wide symbol search by name. It resolves overloads, templates and same-named members that grep conflates; use it to find every caller of a changed function before judging the change's impact.`;
 
-/** Appended for verifiers when the sandbox is available. */
+/** Appended, after VERIFIER_RUN_ADDENDUM, for reviewers when the sandbox is available. */
+export const REVIEWER_REPRO_ADDENDUM = `
+
+Prove findings by running them where you can. Before you report a correctness or security finding whose repro is cheap to run (a targeted existing test, a short script that imports the changed module and calls it, a small program compiled against the changed file), run it: cite the command and the output in evidence and set evidence_kind "executed". If it doesn't fail as you expected, find out why before reporting: your repro may not reach the line, or the finding may be wrong. A finding you can't run cheaply is still worth reporting as "traced" or "inferred".`;
+
+/** Appended for verifiers (and, with REVIEWER_REPRO_ADDENDUM, reviewers) when the sandbox is available. */
 export const VERIFIER_RUN_ADDENDUM = `
 
 You also have \`run\`: a bash script in a sandbox where the repository is read-only, there is no network, and $TMPDIR is a scratch directory deleted after each call. When executing code can settle a claim (a targeted test, building the touched target, a short repro script), run it and cite the command and its result in your evidence. Keep runs short and targeted; never run the full test suite.

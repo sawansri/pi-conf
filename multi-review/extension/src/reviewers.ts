@@ -5,7 +5,7 @@ import { type Model, type ReviewerSpec, type ThinkingLevelAlias, formatReviewerS
 import { type ReviewerFinding, type ReviewerRunResult, parseReviewerJson } from "./findings.ts";
 import { type ModelCallResult, callModel } from "./models.ts";
 import type { MultiReviewRunResult } from "./pipeline.ts";
-import { REVIEWER_TOOLS_ADDENDUM, SOCRATIC_TOOLS_ADDENDUM, VERIFIER_RUN_ADDENDUM, XREF_ADDENDUM, checksRecitation, modelAddendum } from "./prompts.ts";
+import { REVIEWER_REPRO_ADDENDUM, REVIEWER_TOOLS_ADDENDUM, SOCRATIC_TOOLS_ADDENDUM, VERIFIER_RUN_ADDENDUM, XREF_ADDENDUM, checksRecitation, modelAddendum } from "./prompts.ts";
 import type { SandboxExtras } from "./sandbox.ts";
 import { ReviewTrace, type ReviewerActivity } from "./trace.ts";
 import { abortable, lastTurnAssistantText, retryOnError } from "./util.ts";
@@ -224,6 +224,7 @@ export function buildToolPromptAddendum(model: Model, runOpts: ReviewerRunOption
 		(socratic ? SOCRATIC_TOOLS_ADDENDUM : REVIEWER_TOOLS_ADDENDUM) +
 		(runOpts.xref ? XREF_ADDENDUM : "") +
 		(canRun ? VERIFIER_RUN_ADDENDUM : "") +
+		(canRun && !socratic && runOpts.tracePhase !== "verify" ? REVIEWER_REPRO_ADDENDUM : "") +
 		(webSearchAvailable(model, runOpts.webSearch) ? webSearchAddendum() : NO_WEB_ADDENDUM) +
 		modelAddendum(model)
 	);
@@ -436,7 +437,8 @@ export async function runReviewer(
 	const lateSignal = abortSignal ? AbortSignal.any([abortSignal, deadline.end]) : deadline.end;
 	const tracer = runOpts.trace?.start(formatReviewerSpec(reviewerSpec), runOpts.tracePhase ?? "review", runOpts.cwd ?? ctx.cwd);
 	const verifying = runOpts.tracePhase === "verify";
-	const canRun = verifying && Boolean(runOpts.sandbox);
+	// Reviewers run their own repros; verifiers run code to settle claims.
+	const canRun = Boolean(runOpts.sandbox);
 	// Each retry starts a fresh session: an errored one may have dropped its stream mid-turn.
 	const call = await retryOnError(signal, () => runOpts.useTools
 		? runAgenticReviewer(
