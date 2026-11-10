@@ -32,7 +32,7 @@ const FRESH_SHOWN_MS = 15 * 60_000
 /** Tools after which the code may have changed. */
 const CHANGES_CODE = new Set(['Bash', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
 /** `git push` (after any global options, like `-C dir`), not `git stash push`; `gh pr create/ready/merge`. */
-const PUSHES = /\bgit(?:\s+(?:-[Cc]\s+\S+|--?[\w-]+(?:=\S+)?))*\s+push\b|\bgh\s+pr\s+(?:ready|merge|create)\b/
+const PUSHES = /\bgit(?:\s+(?:-[Cc]\s+\S+|--?[\w-]+(?:=\S+)?))*\s+push(?![\w-])|\bgh\s+pr\s+(?:ready|merge|create)(?![\w-])/
 
 /** progress.json's `run`: pi's progress widget state (extension/src/progress.ts RunSnapshot). */
 interface RunSnapshot {
@@ -58,6 +58,7 @@ interface Run {
   /** What the reviewers read, captured as the run started. */
   target?: Promise<Target | undefined>
   isRecorded?: boolean
+  isRecording?: boolean
 }
 
 interface Line {
@@ -79,6 +80,7 @@ export function isPush(command: string): boolean {
   const code = command
     .replace(/<<-?\s*(['"]?)(\w+)\1[^\n]*\n[\s\S]*?\n\s*\2(?=\n|$)/g, '')
     .replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, "''")
+    .replace(/(^|\s)#[^\n]*/g, '$1')
   return PUSHES.test(code)
 }
 
@@ -191,18 +193,29 @@ function refreshSoon($: EngineInterface): void {
 
 /** Keeps an ended run as the branch's last review when its result.json says it succeeded. */
 async function keepReview($: EngineInterface, run: Run): Promise<void> {
-  if (run.isRecorded) return
-  run.isRecorded = true
-  const target = await run.target
-  if (!target || !run.progress) return
-  const result = `${run.progress.slice(0, run.progress.lastIndexOf('/'))}/result.json`
+  if (run.isRecorded || run.isRecording) return
+  run.isRecording = true
   try {
-    if ((JSON.parse(await $.fs.read(result)) as { ok?: unknown }).ok !== true) return
-  } catch {
-    return
+    const target = await run.target
+    if (!target || !run.progress) {
+      run.isRecorded = true
+      return
+    }
+    const result = `${run.progress.slice(0, run.progress.lastIndexOf('/'))}/result.json`
+    let ok: unknown
+    try {
+      ok = (JSON.parse(await $.fs.read(result)) as { ok?: unknown }).ok
+    } catch {
+      // pi marks progress.json finished just before it writes result.json: try again next tick.
+      return
+    }
+    run.isRecorded = true
+    if (ok !== true) return
+    await remember($, { ...target, at: await $.clock.now(), mode: run.snap?.mode ?? 'review', result: result.replace(/\.json$/, '.md') })
+    await refresh($)
+  } finally {
+    run.isRecording = false
   }
-  await remember($, { ...target, at: await $.clock.now(), mode: run.snap?.mode ?? 'review', result: result.replace(/\.json$/, '.md') })
-  await refresh($)
 }
 
 async function tick($: EngineInterface): Promise<void> {

@@ -21,6 +21,9 @@ interface Repo {
   shortstat: string
   /** What `git write-tree` prints: the working tree, untracked files included. */
   tree: string
+  /** Reads of result.json that find nothing yet (pi writes it just after progress.json). */
+  resultMisses?: number
+  resultReads?: number
   /** `git rev-parse HEAD^{tree}`: what a push sends. */
   headTree: string
   /** Objects that exist. */
@@ -42,7 +45,14 @@ function stub(on: On, repo: Repo) {
   on('fs.stat', ($, e) => (e.path === `${DIR}/progress.json` ? { value: { kind: 'file', size: 1, mtimeMs: 1e12, isLink: false } } : { deny: 'ENOENT' }))
   on('fs.read', ($, e) => {
     if (e.path === `${DIR}/brief.json`) return { value: JSON.stringify(repo.brief) }
-    if (e.path === `${DIR}/result.json`) return { value: JSON.stringify(repo.result) }
+    if (e.path === `${DIR}/result.json`) {
+      repo.resultReads = (repo.resultReads ?? 0) + 1
+      if (repo.resultMisses) {
+        repo.resultMisses--
+        return { deny: 'ENOENT' }
+      }
+      return { value: JSON.stringify(repo.result) }
+    }
     if (e.path === `${DIR}/progress.json`) return { value: JSON.stringify({ run: { mode: 'balanced+verify', phase: 'done', events: [], startedAt: 0, finished: true }, activity: [] }) }
     return { deny: 'ENOENT' }
   })
@@ -60,7 +70,7 @@ function stub(on: On, repo: Repo) {
     if (argv === 'git write-tree') return out(`${repo.tree}\n`)
     if (argv.startsWith('git cat-file -e ')) return out('', repo.objects.has(argv.slice(16).replace('^{tree}', '')) ? 0 : 1)
     if (argv.startsWith('git diff --shortstat ')) {
-      const [a, b] = argv.slice(21).split(' ')
+      const [a, b] = argv.slice(21).replace('--diff-filter=d ', '').split(' ')
       return out(a === b ? '' : repo.shortstat)
     }
     if (argv.startsWith('gh pr view 4102')) return out(JSON.stringify({ headRefOid: 'prhead', headRefName: 'feat/x' }))
@@ -188,6 +198,28 @@ test('a push is measured by what it sends: uncommitted edits don\'t count', asyn
   expect(pushed.context).toBeUndefined()
 })
 
+test('a push leaves out untracked files nobody committed', async ($, on) => {
+  const r = repo()
+  const { clock } = stub(on, r)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await $.tool.call({ tool: 'Bash', command: COMMAND })
+  await clock.settle()
+  await $.tool.call({ tool: 'Bash', command: 'git push' })
+  expect(r.argvs).toContain('git diff --shortstat --diff-filter=d tree1 tree1')
+})
+
+test('a run whose result.json lands after progress.json says finished is still recorded', async ($, on) => {
+  const r = repo({ resultMisses: 1 })
+  const { clock } = stub(on, r)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await $.tool.call({ tool: 'Bash', command: COMMAND })
+  expect(r.resultReads).toBe(1)
+  expect(r.argvs.some((a) => a.startsWith('git diff --shortstat'))).toBe(false)
+  await clock.advance(1500)
+  expect(r.resultReads).toBe(2)
+  expect(r.argvs).toContain('git diff --shortstat tree1 tree1')
+})
+
 test('helpers', () => {
   // a rename, a mode change or a binary file changes no lines
   const review = { root: '/w', branch: 'b', sha: 's', at: 0, mode: 'quick' }
@@ -196,6 +228,9 @@ test('helpers', () => {
   expect(isPush("git log --format='%s' && git push")).toBe(true)
   expect(isPush("python3 - <<'EOF'\nrun('git push -u origin x')\nEOF\ngit status")).toBe(false)
   expect(isPush("cat > f <<EOF\nx\nEOF\ngit push")).toBe(true)
+  expect(isPush('git push-to-checkout')).toBe(false)
+  expect(isPush('git log --oneline # git push later')).toBe(false)
+  expect(isPush('git log # note\ngit push')).toBe(true)
   expect(briefPath(COMMAND)).toBe(`${DIR}/brief.json`)
   expect(briefPath('pi -p "/multi-review-run --brief=$D/b.json"')).toBeUndefined()
   expect(parseShortstat(' 1 file changed, 1 insertion(+)')).toEqual({ files: 1, insertions: 1, deletions: 0 })

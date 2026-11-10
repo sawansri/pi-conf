@@ -140,7 +140,9 @@ export async function freshness($: EngineInterface, against: 'worktree' | 'HEAD'
   }
   const now = against === 'HEAD' ? await run($, ['git', 'rev-parse', 'HEAD^{tree}'], here.root) : await snapshot($, here.root)
   if (!now) return undefined
-  const stat = await run($, ['git', 'diff', '--shortstat', review.sha, now], here.root)
+  // At a push, files only the snapshot has are untracked files nobody
+  // committed (scratch notes): not part of what's pushed.
+  const stat = await run($, ['git', 'diff', '--shortstat', ...(against === 'HEAD' ? ['--diff-filter=d'] : []), review.sha, now], here.root)
   if (stat === undefined) return undefined
   return { review, ...parseShortstat(stat) }
 }

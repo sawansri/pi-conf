@@ -415,8 +415,10 @@ covers the code shows a ✓ line for 15 minutes; a stale one shows the warning a
 `git push`, `gh pr create`, `gh pr ready` or `gh pr merge` that sends code
 the review didn't cover (HEAD's tree against the reviewed one, so
 uncommitted edits don't count) gets a toast, and the model gets a note to
-tell you. Any changed file makes a review stale, renames and mode changes
-included; `git push` in quoted text or a heredoc isn't a push. The
+tell you. Untracked files nobody committed (scratch notes) aren't part
+of a push. Any changed file makes a review stale, renames and mode changes
+included; `git push` in quoted text, a heredoc or a shell comment isn't a
+push, and neither is `git push-to-checkout`. The
 recorded tree is unreferenced, so `git gc` may prune it after a couple
 of weeks; the band then says the changes since are unknown.
 
