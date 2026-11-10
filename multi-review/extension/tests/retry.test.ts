@@ -91,3 +91,11 @@ test("status codes count only as the status, and pi's credential and quota error
 		"request id 4013-401a failed: 500",
 	]) assert.equal(isPermanentError(e), false, e);
 });
+
+test("common SDK and gateway formats of 401/403/404 are final", () => {
+	for (const e of [
+		"Request failed with status code 401", "Error: Request failed with status code 404", "Provider returned error 403", "Request failed: 401",
+		"HTTP/1.1 404", "Mistral API error (404): Not Found", 'OpenAI API error (403): {"error":"access denied"}',
+		'error: {"error":{"code":404,"message":"models/gemini-nonexistent is not found","status":"NOT_FOUND"}}',
+	]) assert.equal(isPermanentError(e), true, e);
+});
