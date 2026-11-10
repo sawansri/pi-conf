@@ -1,6 +1,6 @@
 import type { On, ToolCallResult } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
-import { briefPath, describe as describeFresh, isStale, parseShortstat } from '../hooks/freshness.js'
+import { briefPath, describe as describeFresh, isStale, parseNumstat } from '../hooks/freshness.js'
 import { isPush } from '../hooks/register.js'
 
 const DIR = '/tmp/mr-run'
@@ -17,21 +17,26 @@ const BAND = {
 interface Repo {
   brief: unknown
   result: unknown
-  /** `git diff --shortstat <reviewed> <now>` output. */
+  /** The change between the reviewed tree and now, as git's summary; the stub serves it as --numstat. */
   shortstat: string
   /** What `git write-tree` prints: the working tree, untracked files included. */
   tree: string
   /** Reads of result.json that find nothing yet (pi writes it just after progress.json). */
   resultMisses?: number
   resultReads?: number
-  /** Tracked files matching .gitignore, and files deleted from the working tree (real index). */
+  /** Tracked files matching .gitignore ("S path" outside a sparse checkout), and files deleted from disk (real index). */
   trackedIgnored?: string[]
   deleted?: string[]
-  /** What `git add -f` was handed on stdin. */
+  /** Ignored entries in the mod's own index. */
+  ownIgnored?: string[]
+  /** What `git add -f` and `git rm --cached` were handed on stdin. */
   forced?: string[]
-  /** Paths added from HEAD's tree to the reviewed snapshot (untracked when reviewed), and paths the push lacks. */
-  untrackedThen?: string[]
+  dropped?: string[]
+  /** Untracked files when a run starts; changed files the push lacks (the first changed files). */
+  untracked?: string[]
   absentNow?: string[]
+  /** Files outside the sparse checkout; unset: not sparse. */
+  sparseOut?: string[]
   /** `git rev-parse HEAD^{tree}`: what a push sends. */
   headTree: string
   /** Objects that exist. */
@@ -76,22 +81,33 @@ function stub(on: On, repo: Repo) {
     if (argv === 'git add -A') return out('')
     if (argv === 'git rev-parse HEAD^{tree}') return out(`${repo.headTree}\n`)
     const nul = (ps: string[] = []) => out(ps.map((p) => `${p}\0`).join(''))
+    const stdin = () => (e.init?.stdin ?? '').split('\0').filter(Boolean)
     if (argv === 'git ls-files -z -d') return nul(repo.deleted)
-    if (argv === 'git ls-files -z -c -i --exclude-standard') return nul(repo.trackedIgnored)
-    if (argv === 'git add -A -f --pathspec-from-file=- --pathspec-file-nul') {
-      repo.forced = (e.init?.stdin ?? '').split('\0').filter(Boolean)
+    if (argv === 'git ls-files -z -t -c -i --exclude-standard') return nul((repo.trackedIgnored ?? []).map((p) => (/^[A-Z] /.test(p) ? p : `H ${p}`)))
+    if (argv === 'git ls-files -z -c -i --exclude-standard' && ownIndex) return nul(repo.ownIgnored)
+    if (argv === 'git --literal-pathspecs add -A -f --pathspec-from-file=- --pathspec-file-nul' && ownIndex) {
+      repo.forced = stdin()
       return out('')
     }
-    if (argv.startsWith('git diff --name-only -z --no-renames --diff-filter=A ')) return nul(repo.untrackedThen)
+    if (argv === 'git --literal-pathspecs rm --cached -q --ignore-unmatch --pathspec-from-file=- --pathspec-file-nul' && ownIndex) {
+      repo.dropped = stdin()
+      return out('')
+    }
+    if (argv === 'git ls-files -z -o --exclude-standard') return nul(repo.untracked)
     if (argv.startsWith('git diff --name-only -z --no-renames --diff-filter=D ')) return nul(repo.absentNow)
+    if (argv === 'git config --bool core.sparseCheckout') return repo.sparseOut ? out('true\n') : out('', 1)
+    if (argv === 'git ls-files -z -t') return nul([...(repo.sparseOut ?? []).map((p) => `S ${p}`), 'H keep.ts'])
+    if (argv.startsWith('git diff --numstat -z --no-renames ')) {
+      const [a, b] = argv.slice(35).split(' ')
+      if (a === b) return out('')
+      const num = (re: RegExp) => Number(repo.shortstat.match(re)?.[1] ?? 0)
+      const files = num(/(\d+) files? changed/)
+      const names = [...(repo.absentNow ?? []), ...(repo.sparseOut ?? [])]
+      while (names.length < files) names.push(`file${names.length}.ts`)
+      return out(names.slice(0, files).map((p, i) => `${i ? 0 : num(/(\d+) insertions?/)}\t${i ? 0 : num(/(\d+) deletions?/)}\t${p}\0`).join(''))
+    }
     if (argv === 'git write-tree') return out(`${repo.tree}\n`)
     if (argv.startsWith('git cat-file -e ')) return out('', repo.objects.has(argv.slice(16).replace('^{tree}', '')) ? 0 : 1)
-    if (argv.startsWith('git diff --shortstat ')) {
-      const [a, b] = argv.slice(21).split(' ')
-      // the stub's changed files are the absent ones; excluding all of them leaves nothing
-      const excluded = (repo.absentNow ?? []).length > 0 && (repo.absentNow ?? []).every((p) => e.argv.includes(`:(exclude,literal)${p}`))
-      return out(a === b || excluded ? '' : repo.shortstat)
-    }
     if (argv.startsWith('gh pr view 4102')) return out(JSON.stringify({ headRefOid: 'prhead', headRefName: 'feat/x' }))
     return out('', 1)
   })
@@ -116,7 +132,7 @@ test('a successful review covers the code until it changes, and a push after tha
 
   const band = await $.ui.mount(BAND)
   expect(await band.find({ type: 'Text', text: /✓ covers the code here · just now \(balanced\+verify\)/ })).toBeDefined()
-  expect(r.argvs).toContain('git diff --shortstat tree1 tree1')
+  expect(r.argvs).toContain('git diff --numstat -z --no-renames tree1 tree1')
 
   r.tree = 'tree2'
   r.shortstat = ' 2 files changed, 10 insertions(+), 3 deletions(-)\n'
@@ -145,7 +161,7 @@ test('a file created after the review makes it stale, through the mod\'s own ind
   await clock.advance(2500)
   const band = await $.ui.mount(BAND)
   expect(await band.find({ type: 'Text', text: /⚠ \+4 −0 in 1 file since the review/ })).toBeDefined()
-  expect(r.argvs).toContain('git diff --shortstat tree1 tree2')
+  expect(r.argvs).toContain('git diff --numstat -z --no-renames tree1 tree2')
   expect(r.argvs.some((a) => a.startsWith('git stash'))).toBe(false)
   expect(r.onRealIndex).toEqual([])
 })
@@ -156,7 +172,7 @@ test('a PR review is measured from the PR head', async ($, on) => {
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
   await $.tool.call({ tool: 'Bash', command: COMMAND })
   await clock.settle()
-  expect(r.argvs).toContain('git diff --shortstat prhead tree1')
+  expect(r.argvs).toContain('git diff --numstat -z --no-renames prhead tree1')
 })
 
 for (const [name, over] of [
@@ -172,7 +188,7 @@ for (const [name, over] of [
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
     await $.tool.call({ tool: 'Bash', command: COMMAND })
     await clock.advance(5000)
-    expect(r.argvs.some((a) => a.startsWith('git diff --shortstat'))).toBe(false)
+    expect(r.argvs.some((a) => a.startsWith('git diff --numstat'))).toBe(false)
     const band = await $.ui.mount(BAND)
     expect(await band.find({ type: 'Text', text: /covers the code/ })).toBeUndefined()
   })
@@ -224,21 +240,20 @@ test('a push is measured by what it sends: uncommitted edits don\'t count', asyn
 })
 
 test('a push leaves out untracked files nobody committed', async ($, on) => {
-  const r = repo({ untrackedThen: ['notes.txt'], absentNow: ['notes.txt'], shortstat: ' 1 file changed, 3 deletions(-)\n' })
+  const r = repo({ untracked: ['notes.txt'], absentNow: ['notes.txt'], shortstat: ' 1 file changed, 3 deletions(-)\n' })
   const { clock, toasts } = stub(on, r)
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
   await $.tool.call({ tool: 'Bash', command: COMMAND })
   await clock.settle()
   r.headTree = 'tree2'
   const pushed = await $.tool.call({ tool: 'Bash', command: 'git push' })
-  expect(r.argvs.some((a) => a.includes(':(exclude,literal)notes.txt'))).toBe(true)
   expect(toasts).toEqual([])
   expect(pushed.context).toBeUndefined()
 })
 
 test('a push of a file deleted and committed after the review is flagged', async ($, on) => {
   // gone.ts was tracked when reviewed (not added on top of HEAD's tree), and the push lacks it
-  const r = repo({ untrackedThen: ['notes.txt'], absentNow: ['gone.ts'], shortstat: ' 1 file changed, 12 deletions(-)\n' })
+  const r = repo({ untracked: ['notes.txt'], absentNow: ['gone.ts'], shortstat: ' 1 file changed, 12 deletions(-)\n' })
   const { clock, toasts } = stub(on, r)
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
   await $.tool.call({ tool: 'Bash', command: COMMAND })
@@ -258,22 +273,57 @@ test('tracked files matching .gitignore are snapshotted, except ones deleted fro
   expect(r.forced).toEqual(['dist/app.js'])
 })
 
+test('files outside a sparse checkout, or untracked again since, stay out of the snapshot', async ($, on) => {
+  const r = repo({ trackedIgnored: ['dist/app.js', 'S vendor/lib.js'], ownIgnored: ['dist/app.js', 'dist/old.js'] })
+  const { clock } = stub(on, r)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await $.tool.call({ tool: 'Bash', command: COMMAND })
+  await clock.settle()
+  expect(r.forced).toEqual(['dist/app.js'])
+  expect(r.dropped).toEqual(['dist/old.js'])
+})
+
+test('a push of a sparse checkout leaves out the files it never had', async ($, on) => {
+  const r = repo({ untracked: [], sparseOut: ['vendor/lib.js'], shortstat: ' 1 file changed, 40 insertions(+)\n' })
+  const { clock, toasts } = stub(on, r)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await $.tool.call({ tool: 'Bash', command: COMMAND })
+  await clock.settle()
+  r.headTree = 'tree2'
+  await $.tool.call({ tool: 'Bash', command: 'git push' })
+  expect(toasts).toEqual([])
+})
+
+test('a file staged when reviewed, then committed and deleted, makes a push stale', async ($, on) => {
+  // staged, so not among the untracked files when the run started
+  const r = repo({ untracked: ['notes.txt'], absentNow: ['new.txt'], shortstat: ' 1 file changed, 2 deletions(-)\n' })
+  const { clock, toasts } = stub(on, r)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await $.tool.call({ tool: 'Bash', command: COMMAND })
+  await clock.settle()
+  r.headTree = 'tree2'
+  await $.tool.call({ tool: 'Bash', command: 'git push' })
+  expect(toasts).toHaveLength(1)
+})
+
 test('a run whose result.json lands after progress.json says finished is still recorded', async ($, on) => {
   const r = repo({ resultMisses: 1 })
   const { clock } = stub(on, r)
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
   await $.tool.call({ tool: 'Bash', command: COMMAND })
   expect(r.resultReads).toBe(1)
-  expect(r.argvs.some((a) => a.startsWith('git diff --shortstat'))).toBe(false)
+  expect(r.argvs.some((a) => a.startsWith('git diff --numstat'))).toBe(false)
   await clock.advance(1500)
   expect(r.resultReads).toBe(2)
-  expect(r.argvs).toContain('git diff --shortstat tree1 tree1')
+  expect(r.argvs).toContain('git diff --numstat -z --no-renames tree1 tree1')
 })
 
 test('helpers', () => {
   // a rename, a mode change or a binary file changes no lines
   const review = { root: '/w', branch: 'b', sha: 's', at: 0, mode: 'quick' }
-  expect(isStale({ review, ...parseShortstat(' 1 file changed, 0 insertions(+), 0 deletions(-)') })).toBe(true)
+  expect(isStale({ review, files: 1, insertions: 0, deletions: 0 })).toBe(true)
+  // -z keeps a path's leading space; a binary file has no line counts
+  expect(parseNumstat('3\t1\t a.ts\0-\t-\tlogo.png\0')).toEqual([{ path: ' a.ts', insertions: 3, deletions: 1 }, { path: 'logo.png', insertions: 0, deletions: 0 }])
   expect(isPush('git commit -m "remember to git push later"')).toBe(false)
   expect(isPush("git log --format='%s' && git push")).toBe(true)
   expect(isPush("python3 - <<'EOF'\nrun('git push -u origin x')\nEOF\ngit status")).toBe(false)
@@ -283,6 +333,5 @@ test('helpers', () => {
   expect(isPush('git log # note\ngit push')).toBe(true)
   expect(briefPath(COMMAND)).toBe(`${DIR}/brief.json`)
   expect(briefPath('pi -p "/multi-review-run --brief=$D/b.json"')).toBeUndefined()
-  expect(parseShortstat(' 1 file changed, 1 insertion(+)')).toEqual({ files: 1, insertions: 1, deletions: 0 })
   expect(describeFresh({ review, files: 0, insertions: 0, deletions: 0, isMissing: true }, 3 * 3_600_000)).toMatch(/3h ago, but that snapshot is gone/)
 })

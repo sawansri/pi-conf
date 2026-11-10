@@ -12,8 +12,12 @@ export interface Review {
   branch: string
   /** The tree (or PR-head commit) the reviewers read. */
   sha: string
-  /** HEAD's tree when a working tree was reviewed: what of `sha` was committed then. */
-  base?: string
+  /**
+   * Files untracked when a working tree was reviewed: still uncommitted at
+   * a push, they're scratch (notes), not pushed. Unset for PR reviews and
+   * reviews recorded before this was kept.
+   */
+  untracked?: string[]
   pr?: number
   /** When the review finished. */
   at: number
@@ -22,7 +26,7 @@ export interface Review {
   result?: string
 }
 
-export type Target = Pick<Review, 'root' | 'branch' | 'sha' | 'pr' | 'base'>
+export type Target = Pick<Review, 'root' | 'branch' | 'sha' | 'pr' | 'untracked'>
 
 export interface Freshness {
   review: Review
@@ -38,13 +42,23 @@ export interface BriefInfo {
   pr_number?: number
 }
 
-async function run($: EngineInterface, argv: string[], cwd?: string, env?: Record<string, string>, stdin?: string): Promise<string | undefined> {
+interface RunOpts {
+  env?: Record<string, string>
+  stdin?: string
+  /** Keep stdout as is: `-z` output, where a path may start with a space. */
+  raw?: boolean
+}
+
+async function run($: EngineInterface, argv: string[], cwd?: string, opts: RunOpts = {}): Promise<string | undefined> {
+  const { env, stdin, raw } = opts
   const r = await $.process.run(argv, { ...(cwd ? { cwd } : {}), ...(env ? { env } : {}), ...(stdin !== undefined ? { stdin } : {}), timeoutMs: 15_000 }).catch(() => undefined)
-  return r?.exitCode === 0 ? r.stdout.trim() : undefined
+  if (r?.exitCode !== 0) return undefined
+  return raw ? r.stdout : r.stdout.trim()
 }
 
 /** NUL-separated paths (`git … -z`). */
 const paths = (out: string | undefined) => (out ?? '').split('\0').filter(Boolean)
+const nulJoined = (ps: string[]) => ps.map((p) => `${p}\0`).join('')
 
 /**
  * The working tree as git would commit it with `git add -A`: tracked and
@@ -66,19 +80,29 @@ let snapshots: Promise<unknown> = Promise.resolve()
 async function snapshotNow($: EngineInterface, root: string): Promise<string | undefined> {
   const index = await run($, ['git', 'rev-parse', '--path-format=absolute', '--git-path', 'multi-review-index'], root)
   if (!index) return undefined
-  const env = { GIT_INDEX_FILE: index }
-  if ((await run($, ['git', 'add', '-A'], root, env)) === undefined) return undefined
+  const own: RunOpts = { env: { GIT_INDEX_FILE: index } }
+  if ((await run($, ['git', 'add', '-A'], root, own)) === undefined) return undefined
   // Tracked files that match .gitignore (a committed build output): `add -A`
-  // into a fresh index skips them as ignored. Force-add the ones still on
-  // disk; a deleted one is already gone from this index after `add -A`, and
-  // naming it would fail the add.
-  const deleted = new Set(paths(await run($, ['git', 'ls-files', '-z', '-d'], root)))
-  const ignored = paths(await run($, ['git', 'ls-files', '-z', '-c', '-i', '--exclude-standard'], root)).filter((p) => !deleted.has(p))
-  if (ignored.length > 0) {
-    const added = await run($, ['git', 'add', '-A', '-f', '--pathspec-from-file=-', '--pathspec-file-nul'], root, env, ignored.map((p) => `${p}\0`).join(''))
-    if (added === undefined) return undefined
+  // into a fresh index skips them as ignored, so force-add them, by literal
+  // name (`:x` or `a[1]` would be pathspec magic). Not the ones off disk:
+  // deleted (`add -A` already dropped them) or outside a sparse checkout
+  // (tag S); naming a path that isn't there fails the add.
+  const listed = paths(await run($, ['git', 'ls-files', '-z', '-t', '-c', '-i', '--exclude-standard'], root, { raw: true }))
+    .map((e) => ({ tag: e[0], path: e.slice(2) }))
+  const tracked = new Set(listed.map((e) => e.path))
+  const deleted = new Set(paths(await run($, ['git', 'ls-files', '-z', '-d'], root, { raw: true })))
+  const present = listed.filter((e) => e.tag !== 'S' && !deleted.has(e.path)).map((e) => e.path)
+  // Force-added once, an entry stays in this index after the real one stops
+  // tracking it (`git rm --cached`); it's an ignored file again, so drop it.
+  const untracked = paths(await run($, ['git', 'ls-files', '-z', '-c', '-i', '--exclude-standard'], root, { ...own, raw: true })).filter((p) => !tracked.has(p))
+  if (untracked.length > 0) {
+    await run($, ['git', '--literal-pathspecs', 'rm', '--cached', '-q', '--ignore-unmatch', '--pathspec-from-file=-', '--pathspec-file-nul'], root, { ...own, stdin: nulJoined(untracked) })
   }
-  return run($, ['git', 'write-tree'], root, env)
+  // Best effort: a snapshot short of a few build outputs beats none.
+  if (present.length > 0) {
+    await run($, ['git', '--literal-pathspecs', 'add', '-A', '-f', '--pathspec-from-file=-', '--pathspec-file-nul'], root, { ...own, stdin: nulJoined(present) })
+  }
+  return run($, ['git', 'write-tree'], root, own)
 }
 
 /** `--brief=<path>` when it's a plain absolute path. */
@@ -137,20 +161,18 @@ export async function captureTarget($: EngineInterface, brief: BriefInfo): Promi
     }
   }
   const sha = await snapshot($, here.root)
-  const base = await run($, ['git', 'rev-parse', 'HEAD^{tree}'], here.root)
-  return sha ? { ...here, sha, ...(base ? { base } : {}) } : undefined
+  if (!sha) return undefined
+  // Kept for the push check; a list this long is a build tree, not notes.
+  const untracked = paths(await run($, ['git', 'ls-files', '-z', '-o', '--exclude-standard'], here.root, { raw: true }))
+  return { ...here, sha, ...(untracked.length <= MAX_UNTRACKED_KEPT ? { untracked } : {}) }
 }
+
+const MAX_UNTRACKED_KEPT = 2000
 
 export const storeKey = (root: string, branch: string) => `review:${root}:${branch}`
 
 export async function remember($: EngineInterface, review: Review): Promise<void> {
   await $.store.set(storeKey(review.root, review.branch), review).catch(() => undefined)
-}
-
-/** `3 files changed, 40 insertions(+), 2 deletions(-)` */
-export function parseShortstat(out: string): { files: number; insertions: number; deletions: number } {
-  const num = (re: RegExp) => Number(out.match(re)?.[1] ?? 0)
-  return { files: num(/(\d+) files? changed/), insertions: num(/(\d+) insertions?\(\+\)/), deletions: num(/(\d+) deletions?\(-\)/) }
 }
 
 /**
@@ -168,27 +190,51 @@ export async function freshness($: EngineInterface, against: 'worktree' | 'HEAD'
   }
   const now = against === 'HEAD' ? await run($, ['git', 'rev-parse', 'HEAD^{tree}'], here.root) : await snapshot($, here.root)
   if (!now) return undefined
-  const stat = await run($, ['git', 'diff', '--shortstat', review.sha, now, ...(against === 'HEAD' ? await scratchExcludes($, review, now) : [])], here.root)
-  if (stat === undefined) return undefined
-  return { review, ...parseShortstat(stat) }
+  // Per file, so a push can leave some out; no pathspecs (a directory's
+  // exclusion would hide new files under it, and argv has a size limit).
+  const numstat = await run($, ['git', 'diff', '--numstat', '-z', '--no-renames', review.sha, now], here.root, { raw: true })
+  if (numstat === undefined) return undefined
+  let files = parseNumstat(numstat)
+  if (against === 'HEAD') files = await pushedFiles($, here.root, review, now, files)
+  return { review, files: files.length, insertions: sum(files, 'insertions'), deletions: sum(files, 'deletions') }
+}
+
+interface FileStat {
+  path: string
+  insertions: number
+  deletions: number
+}
+
+const sum = (fs: FileStat[], k: 'insertions' | 'deletions') => fs.reduce((n, f) => n + f[k], 0)
+
+/** `git diff --numstat -z --no-renames`: "added\tdeleted\tpath\0"; a binary file is "-\t-\tpath". */
+export function parseNumstat(out: string): FileStat[] {
+  return paths(out).flatMap((entry) => {
+    const m = entry.match(/^(-|\d+)\t(-|\d+)\t([\s\S]*)$/)
+    if (!m) return []
+    const [, ins = '-', del = '-', path = ''] = m
+    return [{ path, insertions: ins === '-' ? 0 : Number(ins), deletions: del === '-' ? 0 : Number(del) }]
+  })
+}
+
+/**
+ * At a push, the changed files that are part of it. Left out: files that
+ * were untracked when reviewed and still aren't committed (scratch notes,
+ * in the snapshot but never pushed), and files outside a sparse checkout
+ * (never on disk, so never reviewed). A review recorded before untracked
+ * files were kept leaves out every deletion instead, as before.
+ */
+async function pushedFiles($: EngineInterface, root: string, review: Review, head: string, files: FileStat[]): Promise<FileStat[]> {
+  if (review.pr !== undefined || files.length === 0) return files
+  const gone = new Set(paths(await run($, ['git', 'diff', '--name-only', '-z', '--no-renames', '--diff-filter=D', review.sha, head], root, { raw: true })))
+  const scratch = review.untracked ? new Set(review.untracked.filter((p) => gone.has(p))) : gone
+  const sparse = (await run($, ['git', 'config', '--bool', 'core.sparseCheckout'], root)) === 'true'
+    ? new Set(paths(await run($, ['git', 'ls-files', '-z', '-t'], root, { raw: true })).filter((e) => e.startsWith('S ')).map((e) => e.slice(2)))
+    : new Set<string>()
+  return files.filter((f) => !scratch.has(f.path) && !sparse.has(f.path))
 }
 
 /** Any file: renames, mode changes and binary files change no lines. */
-/**
- * At a push: pathspecs leaving out files that were untracked when reviewed
- * and still aren't committed (scratch notes). They're in the reviewed
- * snapshot but were never pushed. A file deleted and committed after the
- * review was tracked then (in `base`), so it still counts.
- */
-async function scratchExcludes($: EngineInterface, review: Review, head: string): Promise<string[]> {
-  if (!review.base) return []
-  const untrackedThen = paths(await run($, ['git', 'diff', '--name-only', '-z', '--no-renames', '--diff-filter=A', review.base, review.sha], review.root))
-  if (untrackedThen.length === 0) return []
-  const absentNow = new Set(paths(await run($, ['git', 'diff', '--name-only', '-z', '--no-renames', '--diff-filter=D', review.sha, head], review.root)))
-  const scratch = untrackedThen.filter((p) => absentNow.has(p))
-  return scratch.length ? ['--', '.', ...scratch.map((p) => `:(exclude,literal)${p}`)] : []
-}
-
 export const isStale = (f: Freshness) => f.isMissing === true || f.files > 0
 
 export function age(ms: number): string {
