@@ -45,3 +45,9 @@ test("a short refutation that cites the code keeps its veto", () => {
 	assert.equal(vetoes(group({ verifications: [v("src/cache.ts:12")] })).length, 1);
 	assert.equal(vetoes(group({ verifications: [v("not a bug")] })).length, 0);
 });
+
+test("a short refutation needs a real file:line, not any x:digits", () => {
+	const v = (evidence: string): Verification => ({ spec: "p/x", verdict: "refuted", evidence });
+	for (const e of ["nope:1", "ok:1", "nope 2:1", "ratio 1.5:1", "at 10:30"]) assert.equal(vetoes(group({ verifications: [v(e)] })).length, 0, e);
+	for (const e of ["a.ts:3 guards", "src/cache.ts:12", "Makefile.am:4"]) assert.equal(vetoes(group({ verifications: [v(e)] })).length, 1, e);
+});
