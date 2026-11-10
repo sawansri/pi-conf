@@ -298,9 +298,10 @@ export async function runMultiReviewFromArgs(
 			progress.finish("done");
 			return result;
 		}
-		// Verification runs only with --verify or PR comments. Quick runs have
-		// no tools, so verify-only models (picked for tool use) sit out.
-		const verifies = !flags.quick && (flags.verify || prCommentOpts !== undefined);
+		// Verification runs with --verify or PR comments, and in any tool-using
+		// run for a straggler's partial findings. Quick runs have no tools, so
+		// verify-only models (picked for tool use) sit out.
+		const verifies = !flags.quick && (flags.verify || prCommentOpts !== undefined || runOpts.useTools);
 		const verifyOnly = verifies ? await resolveReviewerPoolStructured(ctx, cfg.verifyOnly) : { entries: [], missing: [] };
 		if (verifyOnly.missing.length > 0) target.warnings.push(`verifyOnly models not in registry, skipped: ${verifyOnly.missing.join(", ")}`);
 		const verifierRows = verifyOnly.entries.map((r) => ({ rs: r.rs, model: r.model, clamped: r.clamped }));
@@ -518,7 +519,8 @@ async function runReviewPipeline(
 			: { ...opts, timeoutMs: Math.max(MIN_PHASE_MS, Math.min(opts.timeoutMs, deadlineMs - Date.now() - reserveMs)) };
 	// Code only runs sandboxed, and never in quick runs (no tools there). The
 	// probe runs only when something would execute: checks or verification.
-	const mayExecute = (target.brief?.checks.length ?? 0) > 0 || flags.verify || (prReport?.claims.length ?? 0) > 0;
+	// A straggler's partial findings get verifiers (with `run`) even without --verify.
+	const mayExecute = (target.brief?.checks.length ?? 0) > 0 || flags.verify || (prReport?.claims.length ?? 0) > 0 || (!flags.quick && runOpts.useTools);
 	const checkReserve = REVIEW_RESERVE_MS + GROUPING_RESERVE_MS + (flags.verify ? VERIFY_RESERVE_MS : 0) + FINAL_RESERVE_MS;
 	const prep = await prepareExecutionTools(
 		ctx, cfg, flags, target, runOpts,
@@ -560,9 +562,13 @@ async function runReviewPipeline(
 	const suspicionGroups = flags.verify ? suspicions.map(suspicionAsGroup) : [];
 	const prClaimGroups = prClaims.map(prClaimAsGroup);
 	const verifyTimeLeft = deadlineMs === undefined ? Number.POSITIVE_INFINITY : deadlineMs - Date.now() - FINAL_RESERVE_MS;
-	const toVerify = [...(flags.verify ? groups : []), ...suspicionGroups, ...prClaimGroups];
+	// A straggler's harvested findings are always verified: it was cut off mid-check.
+	const partialSpecs = new Set(runs.filter((r) => r.partial).map((r) => r.spec));
+	const findingGroups = flags.verify ? groups : groups.filter((g) => g.reviewerSpecs.some((s) => partialSpecs.has(s)));
+	const toVerify = [...findingGroups, ...suspicionGroups, ...prClaimGroups];
 	if (toVerify.length > 0 && verifyTimeLeft < MIN_PHASE_MS) {
-		target.warnings.push(`verification skipped: only ${Math.max(0, Math.round(verifyTimeLeft / 1000))}s left of the run's time budget`);
+		const unverifiedPartial = partialSpecs.size > 0 ? "; partial reviewers' findings are unverified" : "";
+		target.warnings.push(`verification skipped: only ${Math.max(0, Math.round(verifyTimeLeft / 1000))}s left of the run's time budget${unverifiedPartial}`);
 	} else if (toVerify.length > 0) {
 		// One row per model: a duplicate would count as two independent verifiers.
 		const verifierPool = [...rows, ...verifierRows].filter((r, i, all) => all.findIndex((o) => o.rs.spec === r.rs.spec) === i);

@@ -105,6 +105,8 @@ export interface ModelCallResult {
 	/** Tool calls made, for agentic reviewers. */
 	toolCalls?: number;
 	durationMs: number;
+	/** Cut short (the reason): the answer came from the harvest after the cut. */
+	partial?: string;
 }
 
 /**

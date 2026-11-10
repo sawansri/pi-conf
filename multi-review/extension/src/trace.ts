@@ -120,6 +120,14 @@ export class ReviewTrace {
 				} else if ((event as { type: string }).type === "multi_review_filter_retry") {
 					a.lastTool = "retry after content_filter";
 					this.append(a, { kind: "filter_retry" });
+				} else if ((event as { type: string }).type === "multi_review_deadline_warn") {
+					const { secondsLeft, why } = event as unknown as { secondsLeft: number; why: string };
+					a.lastTool = `warned: ${secondsLeft}s left`;
+					this.append(a, { kind: "deadline_warn", secondsLeft, why });
+				} else if ((event as { type: string }).type === "multi_review_harvest") {
+					const { stage, reason } = event as unknown as { stage: string; reason: string };
+					a.lastTool = `harvest: ${stage}`;
+					this.append(a, { kind: "harvest", stage, reason });
 				} else if ((event as { type: string }).type === "multi_review_error_retry") {
 					const { retry, error } = event as unknown as { retry: number; error: string };
 					a.lastTool = `retry ${retry} after error`;

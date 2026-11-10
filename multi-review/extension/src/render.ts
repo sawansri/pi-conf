@@ -95,7 +95,7 @@ export function renderMultiReviewMessage(
 				const specShort = entry.formattedSpec.split("/").pop() ?? entry.formattedSpec;
 				const mark = entry.ok ? theme.fg("success", "✓") : theme.fg("error", "✗");
 				const tools = entry.toolCalls ? `, ${entry.toolCalls} tools` : "";
-				const summary = entry.ok ? summarizeSocraticEntry(entry.text, 100) : (entry.errorMessage ?? "failed");
+				const summary = entry.ok ? `${entry.partial ? "(partial) " : ""}${summarizeSocraticEntry(entry.text, 100)}` : (entry.errorMessage ?? "failed");
 				container.addChild(new Text(
 					`  ${mark} ${theme.fg("muted", `${entry.alias} · ${specShort}`)}${theme.fg("dim", ` (${(entry.durationMs / 1000).toFixed(1)}s${tools}):`)} ${summary}`,
 					0, 0,

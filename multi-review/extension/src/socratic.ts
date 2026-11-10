@@ -19,7 +19,8 @@ import {
 	throwIfAborted,
 } from "./reviewers.ts";
 import type { ReviewTarget } from "./target.ts";
-import { retryOnError, withTimeout } from "./util.ts";
+import { retryOnError } from "./util.ts";
+import { StragglerCutoff, startDeadline } from "./deadline.ts";
 
 // ---------- Socratic discussion ----------
 
@@ -38,6 +39,8 @@ export interface SocraticRoundEntry {
 	usage?: { input: number; output: number; total: number; cost: number };
 	toolCalls?: number;
 	durationMs: number;
+	/** Cut short (the reason); the text came from the harvest. */
+	partial?: string;
 }
 
 export interface SocraticRound {
@@ -66,6 +69,7 @@ Rules of Socratic inquiry:
   - Keep each round focused and concise (≤ 450 words per round).`;
 
 const SOCRATIC_EMPTY_NUDGE = "Your turn ended without a written response. Write your Socratic response now using the section headings requested in the prompt.";
+const SOCRATIC_FINAL_FORMAT = "Write your response using the section headings requested in the prompt; say which points you didn't get to check.";
 
 export function participantAlias(index: number): string {
 	return index < 26 ? String.fromCharCode(65 + index) : `P${index + 1}`;
@@ -178,7 +182,7 @@ export function buildSocraticFollowUpPrompt(
 	prevRound.entries.forEach((entry, idx) => {
 		if (idx === myIndex || !entry.ok || !entry.text.trim()) return;
 		peerCount++;
-		lines.push(`### Participant ${entry.alias}`);
+		lines.push(`### Participant ${entry.alias}${entry.partial ? " (cut off for time; partial)" : ""}`);
 		lines.push(entry.text.trim());
 		lines.push("");
 	});
@@ -215,7 +219,7 @@ export function buildSocraticFollowUpPrompt(
 
 function formatSocraticProgressLine(round: number, totalRounds: number, done: number, total: number, entry: SocraticRoundEntry): string {
 	const verdict = entry.ok ? "✓" : "✗";
-	const detail = entry.ok ? `${entry.text.length} chars` : (entry.errorMessage ?? "error");
+	const detail = entry.ok ? `${entry.text.length} chars${entry.partial ? " (partial)" : ""}` : (entry.errorMessage ?? "error");
 	const tools = entry.toolCalls ? `, ${entry.toolCalls} tool call${entry.toolCalls === 1 ? "" : "s"}` : "";
 	const cost = entry.usage?.cost ? `, $${entry.usage.cost.toFixed(4)}` : "";
 	const clamped = entry.clamped ? " [thinking clamped]" : "";
@@ -306,20 +310,20 @@ export async function runSocraticDiscussion(
 			let done = 0;
 			let okCount = 0;
 
-			// Per-round straggler cutoff so a degraded endpoint cannot stall a round.
+			// Per-round straggler cutoff so a degraded endpoint cannot stall a round;
+			// stragglers are warned when it's set and harvested at the cut.
 			const quorum = stragglerQuorum(total);
-			const straggler = new AbortController();
-			const roundAbort = abortSignal ? AbortSignal.any([abortSignal, straggler.signal]) : straggler.signal;
-			let stragglerTimer: ReturnType<typeof setTimeout> | undefined;
+			const cutoff = new StragglerCutoff();
 			const noteFinished = (ok: boolean) => {
 				if (ok) okCount++;
-				if (stragglerTimer || okCount < quorum || done >= total) return;
+				if (cutoff.cutAt !== undefined || okCount < quorum || done >= total) return;
 				const quorumMs = Date.now() - roundStarted;
 				const graceMs = Math.max(STRAGGLER_MIN_GRACE_MS, quorumMs * STRAGGLER_GRACE_FACTOR, STRAGGLER_MIN_TOTAL_MS - quorumMs);
-				stragglerTimer = setTimeout(() => {
-					straggler.abort(`cut as straggler: ${quorum}/${total} participants finished round ${r} in ${Math.round(quorumMs / 1000)}s, waited ${Math.round(graceMs / 1000)}s more`);
-				}, graceMs);
-				stragglerTimer.unref?.();
+				cutoff.arm(
+					Date.now() + graceMs,
+					`cut as straggler: ${quorum}/${total} participants finished round ${r} in ${Math.round(quorumMs / 1000)}s, waited ${Math.round(graceMs / 1000)}s more`,
+					`${okCount} of ${total} participants have finished this round`,
+				);
 			};
 
 			const prevRound = r > 1 ? rounds[rounds.length - 1] : undefined;
@@ -331,7 +335,9 @@ export async function runSocraticDiscussion(
 					const slot = rows[idx];
 					const alias = participantAlias(idx);
 					const formattedSpec = formatReviewerSpec(slot.rs);
-					const signal = withTimeout(roundAbort, roundTimeoutMs);
+					const deadline = startDeadline(roundTimeoutMs, cutoff);
+					const signal = abortSignal ? AbortSignal.any([abortSignal, deadline.cut]) : deadline.cut;
+					const late = { deadline, userSignal: abortSignal, finalFormat: SOCRATIC_FINAL_FORMAT };
 					const tracer = runOpts.trace?.start(formattedSpec, `round ${r}`, cwd);
 					const ownPrevText = prevRound?.entries[idx]?.ok ? prevRound.entries[idx].text : undefined;
 					// Per attempt: a retry runs in a fresh session, which needs Round 1 again.
@@ -355,6 +361,7 @@ export async function runSocraticDiscussion(
 								signal,
 								tracer?.onEvent,
 								SOCRATIC_EMPTY_NUDGE,
+								late,
 							))
 							: callModel(ctx, slot.model, SOCRATIC_SYSTEM_PROMPT, r === 1 ? userPrompt : `${round1Prompt}\n\n---\n\n${userPrompt}`, {
 								thinking: slot.rs.thinking,
@@ -367,15 +374,12 @@ export async function runSocraticDiscussion(
 							resetSession(idx);
 							tracer?.onEvent({ type: "multi_review_error_retry", retry, error } as unknown as AgentSessionEvent);
 						});
-						if (call.errorMessage && signal.aborted && !abortSignal?.aborted) {
-							call.errorMessage = straggler.signal.aborted
-								? String(straggler.signal.reason)
-								: `timed out after ${Math.round(roundTimeoutMs / 1000)}s`;
-						}
+						deadline.dispose();
+						if (call.errorMessage && deadline.cut.aborted && !abortSignal?.aborted) call.errorMessage = String(deadline.cut.reason);
 						const ok = call.errorMessage === undefined && Boolean(call.text.trim());
 						if (!ok) resetSession(idx);
 						const errorMessage = call.errorMessage ?? (!call.text.trim() ? "empty response" : undefined);
-						tracer?.finish(ok, errorMessage ?? `round ${r} done (${call.toolCalls ?? 0} tools)`);
+						tracer?.finish(ok, errorMessage ?? `round ${r} done (${call.toolCalls ?? 0} tools)${call.partial ? ` (partial: ${call.partial})` : ""}`);
 						const entry: SocraticRoundEntry = {
 							spec: slot.rs.spec,
 							formattedSpec,
@@ -388,12 +392,14 @@ export async function runSocraticDiscussion(
 							usage: call.usage,
 							toolCalls: call.toolCalls,
 							durationMs: call.durationMs,
+							...(call.partial ? { partial: call.partial } : {}),
 						};
 						entries[idx] = entry;
 						done++;
 						noteFinished(ok);
 						progress.update({ phase: phaseLabel, done, total, latest: formatSocraticProgressLine(r, totalRounds, done, total, entry) });
 					} catch (err) {
+						deadline.dispose();
 						resetSession(idx);
 						const errorMessage = err instanceof Error ? err.message : String(err);
 						tracer?.finish(false, errorMessage);
@@ -417,7 +423,6 @@ export async function runSocraticDiscussion(
 			};
 
 			await Promise.all(Array.from({ length: cap }, () => worker()));
-			if (stragglerTimer) clearTimeout(stragglerTimer);
 			throwIfAborted(abortSignal);
 
 			rounds.push({
@@ -485,6 +490,7 @@ export function synthesizeSocraticLeadView(
 			const tools = entry.toolCalls ? ` · ${entry.toolCalls} tool call${entry.toolCalls === 1 ? "" : "s"}` : "";
 			lines.push(`### Participant ${entry.alias} · \`${shortSpec(entry.formattedSpec)}\` (${(entry.durationMs / 1000).toFixed(1)}s${tools})`);
 			if (entry.ok) {
+				if (entry.partial) lines.push(`_Partial: ${entry.partial}; answered from what it had checked._`, "");
 				lines.push(entry.text);
 			} else {
 				lines.push(`_Failed: ${entry.errorMessage ?? "unknown error"}_`);

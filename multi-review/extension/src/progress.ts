@@ -51,7 +51,9 @@ export function shortSpec(spec: string): string {
 
 export function formatReviewerProgressLine(done: number, total: number, latest: ReviewerRunResult): string {
 	const verdict = latest.ok ? "✓" : "✗";
-	const findings = latest.ok ? `${latest.findings.length} finding${latest.findings.length === 1 ? "" : "s"}` : (latest.errorMessage ?? "error");
+	const findings = latest.ok
+		? `${latest.findings.length} finding${latest.findings.length === 1 ? "" : "s"}${latest.partial ? " (partial)" : ""}`
+		: (latest.errorMessage ?? "error");
 	const cost = latest.usage?.cost ? `, $${latest.usage.cost.toFixed(4)}` : "";
 	const tools = latest.toolCalls ? `, ${latest.toolCalls} tool call${latest.toolCalls === 1 ? "" : "s"}` : "";
 	const clamped = latest.clamped ? " [thinking clamped]" : "";

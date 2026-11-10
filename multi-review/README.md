@@ -512,7 +512,26 @@ extglob — documented limitation.
    (⅔ of the pool, at least 2) has answered, the rest get as long again
    as the quorum took (min 45s, and never cut before 300s in total), then
    are cut. A degraded endpoint
-   no longer holds the whole review hostage. Aborts are authoritative: a
+   no longer holds the whole review hostage. **Late sessions are warned,
+   then harvested, not discarded.** At whichever comes first, 75% of the
+   working time (up to the cut) or the straggler cutoff being set, a tool-using session
+   gets a steered message with the seconds it has left, the pool's status,
+   and the plan items to skip. It's delivered after the session's next tool
+   call, so a session already writing its final answer isn't made to
+   redo it; from then on its `progress` calls also report the time left.
+   An error retry's fresh session is warned too. At the cut (the
+   straggler cutoff, or a harvest's length before the timeout) the turn in
+   flight is stopped, tools are switched off, and the session is asked
+   once for its answer from what it has verified (native web search is off
+   too). It gets 60s (a fifth of a short timeout), all inside
+   `reviewerTimeoutSec`. An answer marks the reviewer **partial**, and
+   groups with a partial reviewer's findings are verified even without
+   `--verify`, so tool-using runs always probe the sandbox and resolve
+   `verifyOnly`. A headless run short on time can still skip verification;
+   the warning then says the partial findings are unverified. Socratic participants
+   are warned and harvested per round the same way; their answers are
+   marked partial for peers and in the report. The trace logs
+   `deadline_warn` and `harvest` events. Aborts are authoritative: a
    call returns when its signal fires even if the provider stream hangs.
    Abort is threaded from the tool's signal. **Error retries:** a reviewer,
    verifier or Socratic turn that ends in an error (gateway 5xx, rate

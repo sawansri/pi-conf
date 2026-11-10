@@ -48,7 +48,8 @@ export function installNativeWebSearch(session: AgentSession, onEvent?: (event: 
 	const prevPayload = agent.onPayload;
 	agent.onPayload = async (payload, model) => {
 		const p = ((await prevPayload?.(payload, model)) ?? payload) as { tools?: unknown[] } | undefined;
-		if (!p) return p;
+		// Tools off (a harvest after the deadline's cut): no server-side search either.
+		if (!p || session.getActiveToolNames().length === 0) return p;
 		if (model.api === "anthropic-messages") return { ...p, tools: [...(p.tools ?? []), { type: "web_search_20250305", name: WEB_SEARCH_TOOL }] };
 		if (model.api === "openai-responses") return { ...p, tools: [...(p.tools ?? []), { type: "web_search" }] };
 		return p;

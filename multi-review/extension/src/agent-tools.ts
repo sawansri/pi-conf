@@ -9,7 +9,7 @@ import { PROGRESS_TOOL } from "./trace.ts";
  * item as it's done. The tool only acknowledges; ReviewTrace reads the
  * calls off the session's event stream.
  */
-export function createProgressTool(state: { plan: string[]; done: number; calls: number } = { plan: [], done: 0, calls: 0 }) {
+export function createProgressTool(state: { plan: string[]; done: number; calls: number; secondsLeft?: () => number } = { plan: [], done: 0, calls: 0 }) {
 	return {
 		name: PROGRESS_TOOL,
 		label: "Progress",
@@ -22,7 +22,9 @@ export function createProgressTool(state: { plan: string[]; done: number; calls:
 			state.calls++;
 			if (params.plan?.length) state.plan = params.plan;
 			if (params.done) state.done++;
-			return { content: [{ type: "text" as const, text: `Recorded (${state.done}/${state.plan.length || "?"} done). Continue.` }], details: undefined };
+			// Set once the session is warned it's running late; until then, no clock.
+			const left = state.secondsLeft ? ` About ${state.secondsLeft()}s left: wrap up.` : " Continue.";
+			return { content: [{ type: "text" as const, text: `Recorded (${state.done}/${state.plan.length || "?"} done).${left}` }], details: undefined };
 		},
 	};
 }

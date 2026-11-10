@@ -1,5 +1,6 @@
 import { type AgentSessionEvent, type ExtensionContext, createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager, SettingsManager } from "@mariozechner/pi-coding-agent";
 import { createGitTool, createProgressTool, createRunTool } from "./agent-tools.ts";
+import { type LateSession, StragglerCutoff, armWarning, harvest, startDeadline } from "./deadline.ts";
 import { type Model, type ReviewerSpec, type ThinkingLevelAlias, formatReviewerSpec } from "./config.ts";
 import { type ReviewerFinding, type ReviewerRunResult, parseReviewerJson } from "./findings.ts";
 import { type ModelCallResult, callModel } from "./models.ts";
@@ -7,7 +8,7 @@ import type { MultiReviewRunResult } from "./pipeline.ts";
 import { REVIEWER_TOOLS_ADDENDUM, SOCRATIC_TOOLS_ADDENDUM, VERIFIER_RUN_ADDENDUM, XREF_ADDENDUM } from "./prompts.ts";
 import type { SandboxExtras } from "./sandbox.ts";
 import { ReviewTrace, type ReviewerActivity } from "./trace.ts";
-import { abortable, retryOnError, withTimeout } from "./util.ts";
+import { abortable, lastTurnAssistantText, retryOnError } from "./util.ts";
 import { type WebSearchOptions, NO_WEB_ADDENDUM, createWebSearchTool, installNativeWebSearch, searchesNatively, webSearchAddendum, webSearchAvailable } from "./web-search.ts";
 import { XrefService, createXrefTool } from "./xref.ts";
 
@@ -65,6 +66,8 @@ export interface AgenticExtras {
 	webSearch?: WebSearchOptions;
 	/** Nudge once when the reply is [] after fewer non-progress tool calls than this. */
 	minToolCalls?: number;
+	/** Warn, then harvest, a straggling session; see deadline.ts. */
+	late?: LateSession;
 }
 
 export interface ReviewerSession {
@@ -73,19 +76,11 @@ export interface ReviewerSession {
 		signal: AbortSignal,
 		onEvent?: (event: AgentSessionEvent) => void,
 		nudgeIfEmptyPrompt?: string,
+		late?: LateSession,
 	): Promise<ModelCallResult>;
 	dispose(): void;
 }
 
-function lastTurnAssistantText(turnMessages: readonly unknown[]): string {
-	for (let i = turnMessages.length - 1; i >= 0; i--) {
-		const m = turnMessages[i] as { role?: string; content?: Array<{ type?: string; text?: string }> } | undefined;
-		if (m?.role !== "assistant" || !Array.isArray(m.content)) continue;
-		const text = m.content.filter((c) => c.type === "text").map((c) => c.text ?? "").join("").trim();
-		if (text) return text;
-	}
-	return "";
-}
 
 /**
  * Create a nested pi agent session with the review toolset (read, grep, find,
@@ -102,7 +97,7 @@ export async function createReviewerSession(
 	cwd: string = ctx.cwd,
 	extras: AgenticExtras = {},
 ): Promise<ReviewerSession> {
-	const progressState = { plan: [] as string[], done: 0, calls: 0 };
+	const progressState: NonNullable<Parameters<typeof createProgressTool>[0]> = { plan: [], done: 0, calls: 0 };
 	const customTools: Array<ReturnType<typeof createProgressTool> | ReturnType<typeof createGitTool> | ReturnType<typeof createRunTool> | ReturnType<typeof createXrefTool> | ReturnType<typeof createWebSearchTool>> = [
 		createProgressTool(progressState),
 		createGitTool(cwd),
@@ -139,12 +134,29 @@ export async function createReviewerSession(
 	if (nativeSearch) installNativeWebSearch(session, (ev) => activeOnEvent?.(ev));
 
 	return {
-		async promptTurn(userPrompt, signal, onEvent, nudgeIfEmptyPrompt) {
+		async promptTurn(userPrompt, signal, onEvent, nudgeIfEmptyPrompt, late) {
 			const started = Date.now();
 			progressState.plan = [];
 			progressState.done = 0;
+			progressState.secondsLeft = undefined;
+			const unwarn = armWarning(session, late, progressState, onEvent);
 			const statsBefore = session.getSessionStats();
 			const msgCountBefore = session.messages.length;
+			const turnResult = (text: string): ModelCallResult => {
+				const statsAfter = session.getSessionStats();
+				return {
+					text,
+					stopReason: "stop",
+					usage: {
+						input: Math.max(0, statsAfter.tokens.input - statsBefore.tokens.input),
+						output: Math.max(0, statsAfter.tokens.output - statsBefore.tokens.output),
+						total: Math.max(0, statsAfter.tokens.total - statsBefore.tokens.total),
+						cost: Math.max(0, statsAfter.cost - statsBefore.cost),
+					},
+					toolCalls: Math.max(0, statsAfter.toolCalls - statsBefore.toolCalls),
+					durationMs: Date.now() - started,
+				};
+			};
 			activeOnEvent = onEvent;
 			const onAbort = () => void session.abort();
 			signal.addEventListener("abort", onAbort, { once: true });
@@ -165,8 +177,11 @@ export async function createReviewerSession(
 					| undefined;
 				const stopReason = last?.stopReason ?? "stop";
 				let errorMessage: string | undefined;
-				if (signal.aborted) errorMessage = `aborted: ${String(signal.reason ?? "cancelled")}`;
-				else if (stopReason === "error" || stopReason === "aborted") errorMessage = `${stopReason}: ${last?.errorMessage ?? "(no message)"}`;
+				if (signal.aborted) {
+					const harvested = await harvest(session, late, onEvent);
+					if (harvested) return { ...turnResult(harvested), partial: String(late!.deadline.cut.reason) };
+					errorMessage = `aborted: ${String(signal.reason ?? "cancelled")}`;
+				} else if (stopReason === "error" || stopReason === "aborted") errorMessage = `${stopReason}: ${last?.errorMessage ?? "(no message)"}`;
 				else if (!text.trim()) errorMessage = "empty response";
 				return {
 					text,
@@ -182,6 +197,8 @@ export async function createReviewerSession(
 					durationMs: Date.now() - started,
 				};
 			} catch (err) {
+				const harvested = signal.aborted ? await harvest(session, late, onEvent) : undefined;
+				if (harvested) return { ...turnResult(harvested), partial: String(late!.deadline.cut.reason) };
 				return {
 					text: "",
 					stopReason: "error",
@@ -189,6 +206,7 @@ export async function createReviewerSession(
 					durationMs: Date.now() - started,
 				};
 			} finally {
+				unwarn();
 				activeOnEvent = undefined;
 				signal.removeEventListener("abort", onAbort);
 				unsubscribe?.();
@@ -228,7 +246,7 @@ async function runAgenticReviewer(
 	extras: AgenticExtras = {},
 ): Promise<ModelCallResult> {
 	const started = Date.now();
-	const progressState = { plan: [] as string[], done: 0, calls: 0 };
+	const progressState: NonNullable<Parameters<typeof createProgressTool>[0]> = { plan: [], done: 0, calls: 0 };
 	const customTools: Array<ReturnType<typeof createProgressTool> | ReturnType<typeof createGitTool> | ReturnType<typeof createRunTool> | ReturnType<typeof createXrefTool> | ReturnType<typeof createWebSearchTool>> = [
 		createProgressTool(progressState),
 		createGitTool(cwd),
@@ -263,6 +281,7 @@ async function runAgenticReviewer(
 		sessionManager: SessionManager.inMemory(cwd),
 	});
 	if (nativeSearch) installNativeWebSearch(session, onEvent);
+	const unwarn = armWarning(session, extras.late, progressState, onEvent);
 	const onAbort = () => void session.abort();
 	signal.addEventListener("abort", onAbort, { once: true });
 	const unsubscribe = onEvent ? session.subscribe(onEvent) : undefined;
@@ -296,6 +315,9 @@ async function runAgenticReviewer(
 			} catch {
 				// Timed out mid-nudge: fall through to the fallback below.
 			}
+			// Cut mid-nudge: what it found since may still come out in the harvest.
+			const harvested = signal.aborted ? await harvest(session, extras.late, onEvent) : undefined;
+			if (harvested?.includes("[")) return harvestedResult(session, harvested, extras.late!, started);
 			// The nudge only adds; a timeout or a non-answer during it must not
 			// cost the reviewer the valid [] it already gave.
 			const after = session.getLastAssistantText() ?? "";
@@ -316,8 +338,11 @@ async function runAgenticReviewer(
 			| undefined;
 		const stopReason = last?.stopReason ?? "stop";
 		let errorMessage: string | undefined;
-		if (signal.aborted) errorMessage = `aborted: ${String(signal.reason ?? "cancelled")}`;
-		else if (stopReason === "error" || stopReason === "aborted") errorMessage = `${stopReason}: ${last?.errorMessage ?? "(no message)"}`;
+		if (signal.aborted) {
+			const harvested = await harvest(session, extras.late, onEvent);
+			if (harvested) return harvestedResult(session, harvested, extras.late!, started);
+			errorMessage = `aborted: ${String(signal.reason ?? "cancelled")}`;
+		} else if (stopReason === "error" || stopReason === "aborted") errorMessage = `${stopReason}: ${last?.errorMessage ?? "(no message)"}`;
 		return {
 			text: session.getLastAssistantText() ?? "",
 			stopReason,
@@ -327,6 +352,8 @@ async function runAgenticReviewer(
 			durationMs: Date.now() - started,
 		};
 	} catch (err) {
+		const harvested = signal.aborted ? await harvest(session, extras.late, onEvent) : undefined;
+		if (harvested) return harvestedResult(session, harvested, extras.late!, started);
 		return {
 			text: "",
 			stopReason: "error",
@@ -334,11 +361,32 @@ async function runAgenticReviewer(
 			durationMs: Date.now() - started,
 		};
 	} finally {
+		unwarn();
 		signal.removeEventListener("abort", onAbort);
 		unsubscribe?.();
 		session.dispose();
 	}
 }
+
+function harvestedResult(
+	session: { getSessionStats(): { tokens: { input: number; output: number; total: number }; cost: number; toolCalls: number } },
+	text: string,
+	late: LateSession,
+	started: number,
+): ModelCallResult {
+	const stats = session.getSessionStats();
+	return {
+		text,
+		stopReason: "stop",
+		usage: { input: stats.tokens.input, output: stats.tokens.output, total: stats.tokens.total, cost: stats.cost },
+		toolCalls: stats.toolCalls,
+		durationMs: Date.now() - started,
+		partial: String(late.deadline.cut.reason),
+	};
+}
+
+/** The reply format a harvested review or verify session must use. */
+const JSON_FINAL_FORMAT = "Output ONLY the JSON your instructions describe, with no prose around it.";
 
 const JSON_REPAIR_PROMPT = `The text below should contain a JSON array of code-review findings but fails to parse. Output ONLY the corrected JSON array with the same findings and wording — escape quotes, backslashes, and newlines inside strings. Do not add, drop, or change findings.`;
 
@@ -363,6 +411,8 @@ export interface ReviewerRunOptions {
 	cleanups?: Array<() => void>;
 	/** Review phase only: see AgenticExtras.minToolCalls. */
 	minToolCalls?: number;
+	/** The fan-out's straggler cutoff; set by runAllReviewers. */
+	cutoff?: StragglerCutoff;
 }
 
 export async function runReviewer(
@@ -376,7 +426,10 @@ export async function runReviewer(
 	runOpts: ReviewerRunOptions,
 	parse: (text: string) => ReviewerFinding[] = parseReviewerJson,
 ): Promise<Omit<ReviewerRunResult, "formattedSpec" | "spec" | "thinking" | "clamped">> {
-	const signal = withTimeout(abortSignal, runOpts.timeoutMs);
+	const deadline = startDeadline(runOpts.timeoutMs, runOpts.cutoff);
+	const signal = abortSignal ? AbortSignal.any([abortSignal, deadline.cut]) : deadline.cut;
+	// Late work (the harvest, a JSON repair after it) runs to the hard end.
+	const lateSignal = abortSignal ? AbortSignal.any([abortSignal, deadline.end]) : deadline.end;
 	const tracer = runOpts.trace?.start(formatReviewerSpec(reviewerSpec), runOpts.tracePhase ?? "review", runOpts.cwd ?? ctx.cwd);
 	const verifying = runOpts.tracePhase === "verify";
 	const canRun = verifying && Boolean(runOpts.sandbox);
@@ -393,6 +446,7 @@ export async function runReviewer(
 				xref: runOpts.xref,
 				webSearch: runOpts.webSearch,
 				minToolCalls: verifying ? undefined : runOpts.minToolCalls,
+				late: { deadline, userSignal: abortSignal, finalFormat: JSON_FINAL_FORMAT },
 			},
 		)
 		: callModel(ctx, model, systemPrompt, userPrompt, {
@@ -400,9 +454,7 @@ export async function runReviewer(
 			temperature,
 			signal,
 		}), (retry, error) => tracer?.onEvent({ type: "multi_review_error_retry", retry, error } as unknown as AgentSessionEvent));
-	if (call.errorMessage && signal.aborted && !abortSignal?.aborted) {
-		call.errorMessage = `timed out after ${Math.round(runOpts.timeoutMs / 1000)}s`;
-	}
+	if (call.errorMessage && deadline.cut.aborted && !abortSignal?.aborted) call.errorMessage = String(deadline.cut.reason);
 	if (process.env.MULTI_REVIEW_DEBUG === "2") console.error(`[raw ${formatReviewerSpec(reviewerSpec)}] ${call.text.slice(0, 4000)}`);
 	let findings: ReviewerFinding[] = [];
 	let errorMessage = call.errorMessage;
@@ -413,11 +465,11 @@ export async function runReviewer(
 			const first = err instanceof Error ? err.message : String(err);
 			// Minutes of review shouldn't be lost to one malformed character the
 			// repair scan couldn't fix: ask the same model to re-emit valid JSON.
-			const fixed = call.text.includes("[") && !signal.aborted
+			const fixed = call.text.includes("[") && !lateSignal.aborted
 				? await callModel(ctx, model, JSON_REPAIR_PROMPT, `Parse error: ${first}\n\n${call.text}`, {
 					thinking: "low",
 					temperature: 0,
-					signal,
+					signal: lateSignal,
 				})
 				: undefined;
 			try {
@@ -429,7 +481,9 @@ export async function runReviewer(
 			}
 		}
 	}
-	tracer?.finish(errorMessage === undefined, errorMessage ?? (runOpts.tracePhase === "verify" ? "done" : `${findings.length} findings`));
+	deadline.dispose();
+	const partial = call.partial ? ` (partial: ${call.partial})` : "";
+	tracer?.finish(errorMessage === undefined, errorMessage ?? `${runOpts.tracePhase === "verify" ? "done" : `${findings.length} findings`}${partial}`);
 	return {
 		model,
 		ok: errorMessage === undefined,
@@ -440,6 +494,7 @@ export async function runReviewer(
 		usage: call.usage,
 		toolCalls: call.toolCalls,
 		durationMs: call.durationMs,
+		...(call.partial ? { partial: call.partial } : {}),
 	};
 }
 
@@ -492,21 +547,22 @@ export async function runAllReviewers(
 	// again as the quorum took (min STRAGGLER_MIN_GRACE_MS, and never before
 	// STRAGGLER_MIN_TOTAL_MS overall). A degraded endpoint otherwise holds
 	// the whole review hostage until its full timeout.
+	// Each session is warned when this is set, and harvested at the cut.
 	const started = Date.now();
 	const quorum = stragglerQuorum(total);
-	const straggler = new AbortController();
-	const reviewerSignal = abortSignal ? AbortSignal.any([abortSignal, straggler.signal]) : straggler.signal;
+	const cutoff = new StragglerCutoff();
+	const phaseOpts: ReviewerRunOptions = { ...runOpts, cutoff };
 	let okCount = 0;
-	let stragglerTimer: ReturnType<typeof setTimeout> | undefined;
 	const noteFinished = (ok: boolean) => {
 		if (ok) okCount++;
-		if (stragglerTimer || okCount < quorum || done >= total) return;
+		if (cutoff.cutAt !== undefined || okCount < quorum || done >= total) return;
 		const quorumMs = Date.now() - started;
 		const graceMs = Math.max(STRAGGLER_MIN_GRACE_MS, quorumMs * STRAGGLER_GRACE_FACTOR, STRAGGLER_MIN_TOTAL_MS - quorumMs);
-		stragglerTimer = setTimeout(() => {
-			straggler.abort(`cut as straggler: ${quorum}/${total} reviewers finished in ${Math.round(quorumMs / 1000)}s, waited ${Math.round(graceMs / 1000)}s more`);
-		}, graceMs);
-		stragglerTimer.unref?.();
+		cutoff.arm(
+			Date.now() + graceMs,
+			`cut as straggler: ${quorum}/${total} reviewers finished in ${Math.round(quorumMs / 1000)}s, waited ${Math.round(graceMs / 1000)}s more`,
+			`${okCount} of ${total} reviewers have finished`,
+		);
 	};
 
 	// Worker slot: pulls next reviewer, runs, stores result. We launch `cap`
@@ -518,7 +574,7 @@ export async function runAllReviewers(
 			if (idx >= resolved.length) return;
 			const slot = resolved[idx];
 			try {
-				const partial = await runReviewer(slot.model, slot.rs, ctx, systemPrompt, userPrompt, temperature, reviewerSignal, runOpts);
+				const partial = await runReviewer(slot.model, slot.rs, ctx, systemPrompt, userPrompt, temperature, abortSignal, phaseOpts);
 				const full: ReviewerRunResult = {
 					formattedSpec: formatReviewerSpec(slot.rs),
 					spec: slot.rs.spec,
@@ -553,7 +609,6 @@ export async function runAllReviewers(
 	};
 
 	await Promise.all(Array.from({ length: cap }, () => worker()));
-	if (stragglerTimer) clearTimeout(stragglerTimer);
 	throwIfAborted(abortSignal);
 	return results;
 }

@@ -48,6 +48,8 @@ export interface ReviewerRunResult {
 	usage?: { input: number; output: number; total: number; cost: number };
 	toolCalls?: number;
 	durationMs: number;
+	/** Cut short as a straggler or at the timeout (the reason); findings come from the harvest. */
+	partial?: string;
 }
 
 /**

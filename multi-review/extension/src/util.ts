@@ -90,3 +90,14 @@ export async function mapWithConcurrency<T, R>(items: T[], cap: number, fn: (ite
 	await Promise.all(Array.from({ length: Math.max(1, Math.min(cap, items.length)) }, worker));
 	return results;
 }
+
+/** The text of the last assistant message with any, among a turn's messages. */
+export function lastTurnAssistantText(turnMessages: readonly unknown[]): string {
+	for (let i = turnMessages.length - 1; i >= 0; i--) {
+		const m = turnMessages[i] as { role?: string; content?: Array<{ type?: string; text?: string }> } | undefined;
+		if (m?.role !== "assistant" || !Array.isArray(m.content)) continue;
+		const text = m.content.filter((c) => c.type === "text").map((c) => c.text ?? "").join("").trim();
+		if (text) return text;
+	}
+	return "";
+}

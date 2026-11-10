@@ -65,7 +65,7 @@ export function synthesizeLeadView(
 		`Scope: \`${target.label}\` · ${groups.length} issue${groups.length === 1 ? "" : "s"} from ${ok.length} reviewer${ok.length === 1 ? "" : "s"} · ` +
 			`${groups.filter((g) => g.consensus).length} raised independently by ≥2`,
 	);
-	lines.push(`Reviewers: ${runs.map((r) => `${shortSpec(r.formattedSpec)} ${r.ok ? `(${r.findings.length})` : `FAILED: ${r.errorMessage?.slice(0, 100) ?? "?"}`}`).join(" · ")}`);
+	lines.push(`Reviewers: ${runs.map((r) => `${shortSpec(r.formattedSpec)} ${r.ok ? `(${r.findings.length}${r.partial ? ", partial" : ""})` : `FAILED: ${r.errorMessage?.slice(0, 100) ?? "?"}`}`).join(" · ")}`);
 	// Scope notes (PR worktree, spec source) — they change how findings read.
 	for (const note of target.metaLines.filter((l) => l.startsWith("("))) lines.push(`Note: ${note.slice(1, -1)}`);
 	if (detailHint) lines.push(detailHint);
@@ -222,7 +222,7 @@ export function synthesizeNoFindingsMarkdown(target: ReviewTarget, reviewerRuns:
 	lines.push("");
 	lines.push("## Reviewer coverage");
 	for (const r of reviewerRuns) {
-		const status = r.ok ? "ok" : `failed: ${r.errorMessage?.slice(0, 160) ?? "unknown"}`;
+		const status = r.ok ? (r.partial ? `ok, partial (${r.partial})` : "ok") : `failed: ${r.errorMessage?.slice(0, 160) ?? "unknown"}`;
 		lines.push(`- \`${r.formattedSpec}\`${r.clamped ? " (thinking clamped by provider)" : ""} — ${status}; ${(r.durationMs / 1000).toFixed(1)}s`);
 	}
 	if (failed.length > 0) {
@@ -280,7 +280,7 @@ export function synthesizeMarkdownFromGroups(
 	lines.push("## Reviewers");
 	for (const r of reviewerRuns) {
 		const status = r.ok
-			? `${r.findings.length} finding${r.findings.length === 1 ? "" : "s"}`
+			? `${r.findings.length} finding${r.findings.length === 1 ? "" : "s"}${r.partial ? `, partial (${r.partial})` : ""}`
 			: `FAILED — ${r.errorMessage?.slice(0, 160) ?? "(unknown)"}`;
 		const tools = r.toolCalls ? `, ${r.toolCalls} tool calls` : "";
 		lines.push(`- \`${r.formattedSpec}\`${r.clamped ? " (thinking clamped)" : ""}: ${status} (${(r.durationMs / 1000).toFixed(1)}s${tools})`);
