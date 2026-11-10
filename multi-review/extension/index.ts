@@ -54,6 +54,7 @@
  *   util        abortable, withTimeout, mapWithConcurrency
  */
 
+import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Text } from "@mariozechner/pi-tui";
@@ -64,6 +65,7 @@ import { DEFAULTS, cacheConfigForFreshRead, loadConfig } from "./src/config.ts";
 import { runAgentLedReview, runHeadless } from "./src/headless.ts";
 import { buildHandoffPrompt, buildSocraticHandoffPrompt } from "./src/lead.ts";
 import { describePool } from "./src/models.ts";
+import { recordOutcomes } from "./src/outcomes.ts";
 import { persistReviewerChoices, pickReviewersViaTUI } from "./src/picker.ts";
 import { runMultiReviewFromArgs, setTransientReviewers } from "./src/pipeline.ts";
 import { setStatus } from "./src/progress.ts";
@@ -211,6 +213,23 @@ export default function (pi: ExtensionAPI) {
 			"Brief fields mirror the multi_review tool. Writes findings + lead instructions to <out> and <out>.md.",
 		handler: async (args, ctx) => {
 			await runHeadless(pi, args, ctx);
+		},
+	});
+
+	pi.registerCommand("multi-review-outcomes", {
+		description:
+			"Record the lead's verdicts for a headless review: /multi-review-outcomes --dir=<run dir>. " +
+			"Joins <dir>/outcomes.json ({\"g1\": \"act_on\"|\"consider\"|\"noted\"|\"dismissed\"}) with <dir>/result.json into the outcomes log the lead view's track record reads.",
+		handler: async (args, ctx) => {
+			const dir = parseValueFlag(args, "dir").value;
+			const out = dir ? recordOutcomes(path.resolve(ctx.cwd, dir)) : { error: "missing --dir=<run dir>" };
+			if ("error" in out) {
+				console.error(`multi-review-outcomes: ${out.error}`);
+				process.exitCode = 1;
+				return;
+			}
+			const skipped = out.skipped.length ? `; no bucket for ${out.skipped.join(", ")}` : "";
+			console.error(`multi-review-outcomes: recorded ${out.recorded} findings${skipped}`);
 		},
 	});
 

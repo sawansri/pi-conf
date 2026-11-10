@@ -127,6 +127,20 @@ Review: <dir>/result.md
 <one line each>
 ```
 
+Then record which bucket each issue went in, so later reviews can show each model's track record. Write `<dir>/outcomes.json`, one entry per issue id (`g1`, …; not suspicions or PR claims) with `"act_on"`, `"consider"`, `"noted"` or `"dismissed"`:
+
+```json
+{"g1": "act_on", "g2": "dismissed", "g3": "consider"}
+```
+
+and run, exactly in this form:
+
+```bash
+pi -p "/multi-review-outcomes --dir=<dir>" < /dev/null
+```
+
+It appends to `~/.local/share/multi-review/outcomes.jsonl` and prints how many findings it recorded. Record a run once, after your verdict is final. If the result has a **Reviewer track record** section, use it as a prior for how far to trust each model's findings, never as a reason to skip checking one.
+
 ### With `--pr-comments`: triage and draft replies
 
 The result has an **Existing PR review comments** section. Each checkable claim extracted from the comments shows whether the independent reviewers found the same defect, plus verifier verdicts with evidence. Questions and preferences come after the claims. Resolved threads are used only as context; they're not re-checked.

@@ -632,6 +632,25 @@ extglob — documented limitation.
    side effects of fixing each real one. The output lands as
    a `multi-review` custom message.
 
+8. **Outcome log and track record** — after a headless review, the lead
+   (the Claude Code skill) writes `<dir>/outcomes.json`, the bucket each
+   issue went in (`{"g1": "act_on", "g2": "dismissed"}`), and runs
+   `pi -p "/multi-review-outcomes --dir=<dir>" < /dev/null`. That joins
+   it with `result.json` and appends one line per finding to
+   `~/.local/share/multi-review/outcomes.jsonl` (`$XDG_DATA_HOME`): the
+   model and pass, category, severity, `evidence_kind`, verification
+   tally, veto, and bucket. A run is recorded once; suspicions and PR
+   claims aren't a model's findings and are left out. Once a model has
+   10 judged findings, the lead view gets a **Reviewer track record**
+   section: how often its findings were acted on or dismissed, its most
+   dismissed categories (5+ findings), and its act-on rate by
+   `evidence_kind`. Production reviewers learn the same way (Greptile's
+   feedback filter took addressed comments from 19% to 55%; Uber's
+   uReview and Google's AutoCommenter keep per-category thresholds), but
+   one person's reviews are too few to filter on, so it's shown as a
+   prior and the lead still judges every finding on its evidence.
+   Leads in pi (the `multi_review` tool) don't record outcomes yet.
+
 ## Model choice
 
 The default pool comes from an internal benchmark, not vendor numbers. The

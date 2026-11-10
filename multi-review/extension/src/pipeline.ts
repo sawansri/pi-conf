@@ -16,6 +16,7 @@ import type { MultiReviewDetails } from "./render.ts";
 import { type ReviewerRunOptions, allReviewersFailedResult, runAllReviewers, throwIfAborted } from "./reviewers.ts";
 import { type SandboxExtras, sandboxUnavailable } from "./sandbox.ts";
 import { DEFAULT_SOCRATIC_ROUNDS, MAX_SOCRATIC_ROUNDS, runSocraticDiscussion, runSocraticJudge, synthesizeSocraticLeadView } from "./socratic.ts";
+import { readOutcomes, trackRecordLines } from "./outcomes.ts";
 import { prClaimAsGroup, prCommentsMarkdown, suspicionAsGroup, suspicionMarkdown, synthesizeLeadView, synthesizeMarkdownFromGroups, synthesizeNoFindingsMarkdown } from "./synthesis.ts";
 import { type ReviewTarget, buildReviewTarget, exec, preparePrCheckout } from "./target.ts";
 import { ReviewTrace } from "./trace.ts";
@@ -598,6 +599,8 @@ async function runReviewPipeline(
 	let judgeUsage: JudgeResult["usage"];
 	if (agentLead) {
 		markdown = synthesizeLeadView(target, groups, runs, `${label} · you judge`, detailHint);
+		const track = trackRecordLines(readOutcomes(), [...new Set(runs.map((r) => r.spec))]);
+		if (track.length) markdown += `\n${track.join("\n")}`;
 	} else if (groups.length === 0) {
 		markdown = synthesizeNoFindingsMarkdown(target, runs, label);
 	} else if (judge) {
