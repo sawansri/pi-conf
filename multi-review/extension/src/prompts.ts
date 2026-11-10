@@ -52,6 +52,27 @@ You have read-only tools (read, grep, find, ls, git) on the repository. Use them
 
 Report progress with the progress tool so the moderator can see how far along you are: first call it with \`plan\`, the 3–6 specific things you will check (files, functions, or claims), then call it with \`done\` naming each one as you finish it.`;
 
+/**
+ * Up front for models whose provider checks for recitation (Gemini): it ends
+ * a reply in content_filter when the output repeats public text verbatim, and
+ * code quoted from a public repository does. Argon hit it in about 1 in 4
+ * sessions, nearly always in the final JSON's evidence; the in-place retry
+ * (reviewers.ts CONTENT_FILTER_RETRY_PROMPT) recovers, at the cost of a turn.
+ */
+export const NO_QUOTE_ADDENDUM = `
+
+Never quote source code verbatim, in prose or in any JSON field (evidence, repro, comment): your provider blocks replies that repeat public text, and code from this repository counts. Cite file:line and describe what the code does in your own words. Name identifiers freely; quote at most one short line, and only when the exact text is the point.`;
+
+/** Whether `model`'s provider blocks replies that recite public text. */
+export function checksRecitation(model: { id: string }): boolean {
+	return /gemini/i.test(model.id);
+}
+
+/** The model-specific part of a system prompt. */
+export function modelAddendum(model: { id: string }): string {
+	return checksRecitation(model) ? NO_QUOTE_ADDENDUM : "";
+}
+
 /** Appended when the review touches C/C++ and clangd is available. */
 export const XREF_ADDENDUM = `
 

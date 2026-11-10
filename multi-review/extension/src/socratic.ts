@@ -6,7 +6,7 @@ import { callModel } from "./models.ts";
 import type { MultiReviewRunResult } from "./pipeline.ts";
 import type { PrCommentsReport } from "./pr-comments.ts";
 import { type MultiReviewProgressReporter, shortSpec } from "./progress.ts";
-import { budgetDiff } from "./prompts.ts";
+import { budgetDiff, modelAddendum } from "./prompts.ts";
 import {
 	type ReviewerRunOptions,
 	type ReviewerSession,
@@ -363,7 +363,7 @@ export async function runSocraticDiscussion(
 								SOCRATIC_EMPTY_NUDGE,
 								late,
 							))
-							: callModel(ctx, slot.model, SOCRATIC_SYSTEM_PROMPT, r === 1 ? userPrompt : `${round1Prompt}\n\n---\n\n${userPrompt}`, {
+							: callModel(ctx, slot.model, SOCRATIC_SYSTEM_PROMPT + modelAddendum(slot.model), r === 1 ? userPrompt : `${round1Prompt}\n\n---\n\n${userPrompt}`, {
 								thinking: slot.rs.thinking,
 								temperature: cfg.temperature,
 								signal,

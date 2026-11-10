@@ -649,13 +649,20 @@ Findings:
   with the pool on two findings, and raised one real bug no one else did
   (ThinkSound/ACE-Step report a deleted main `.gguf` as downloaded).
   `@low` was no faster (313s, more tool calls). It's back in the pool at
-  `@medium`. About 1 in 4 of its verifier runs end in Google's
-  `content_filter` (likely recitation of quoted code). Any session that
-  hits it is re-prompted once in place, keeping what it has read, and asked
-  to describe code and cite `file:line` instead of quoting it; if the retry
-  is blocked too, the session starts over under the error retries (up to 3,
-  15s apart), and after those that reviewer is reported as failed and the
-  rest of the pool carries on.
+  `@medium`. About 1 in 4 of its sessions ended in Google's
+  `content_filter` (5 of 20 after Nov 7; 9 failed verifier runs before
+  that), nearly always while writing the final JSON, whose `evidence`
+  quotes code. That is Gemini's recitation check: it blocks output that
+  repeats public text, these repositories are public, and no safety
+  setting turns it off. So Gemini models are told up front, in every
+  review, verify and Socratic system prompt, to cite `file:line` and
+  describe code instead of quoting it (`NO_QUOTE_ADDENDUM` in
+  `prompts.ts`), and the JSON-repair re-emit replaces quoted code with
+  `file:line`. A session that is blocked anyway is re-prompted once in
+  place, keeping what it has read; if the retry is blocked too, the
+  session starts over under the error retries (up to 3, 15s apart), and
+  after those that reviewer is reported as failed and the rest of the pool
+  carries on.
 - **DeepSeek V4.1 Flash** (the gateway's pre-1017 checkpoint) works with
   tools and thinking but was too slow to review: cut as a straggler at
   `@high`, timed out at 900s at `@max` after ~200k characters of reasoning.

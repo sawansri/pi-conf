@@ -5,7 +5,7 @@ import { type Model, type ReviewerSpec, type ThinkingLevelAlias, formatReviewerS
 import { type ReviewerFinding, type ReviewerRunResult, parseReviewerJson } from "./findings.ts";
 import { type ModelCallResult, callModel } from "./models.ts";
 import type { MultiReviewRunResult } from "./pipeline.ts";
-import { REVIEWER_TOOLS_ADDENDUM, SOCRATIC_TOOLS_ADDENDUM, VERIFIER_RUN_ADDENDUM, XREF_ADDENDUM } from "./prompts.ts";
+import { REVIEWER_TOOLS_ADDENDUM, SOCRATIC_TOOLS_ADDENDUM, VERIFIER_RUN_ADDENDUM, XREF_ADDENDUM, checksRecitation, modelAddendum } from "./prompts.ts";
 import type { SandboxExtras } from "./sandbox.ts";
 import { ReviewTrace, type ReviewerActivity } from "./trace.ts";
 import { abortable, lastTurnAssistantText, retryOnError } from "./util.ts";
@@ -224,7 +224,8 @@ export function buildToolPromptAddendum(model: Model, runOpts: ReviewerRunOption
 		(socratic ? SOCRATIC_TOOLS_ADDENDUM : REVIEWER_TOOLS_ADDENDUM) +
 		(runOpts.xref ? XREF_ADDENDUM : "") +
 		(canRun ? VERIFIER_RUN_ADDENDUM : "") +
-		(webSearchAvailable(model, runOpts.webSearch) ? webSearchAddendum() : NO_WEB_ADDENDUM)
+		(webSearchAvailable(model, runOpts.webSearch) ? webSearchAddendum() : NO_WEB_ADDENDUM) +
+		modelAddendum(model)
 	);
 }
 
@@ -390,6 +391,9 @@ const JSON_FINAL_FORMAT = "Output ONLY the JSON your instructions describe, with
 
 const JSON_REPAIR_PROMPT = `The text below should contain a JSON array of code-review findings but fails to parse. Output ONLY the corrected JSON array with the same findings and wording — escape quotes, backslashes, and newlines inside strings. Do not add, drop, or change findings.`;
 
+/** Re-emitting quoted code verbatim is exactly what trips a recitation check. */
+const JSON_REPAIR_NO_QUOTE = " Exception: replace any source code quoted verbatim with its file:line.";
+
 export interface ReviewerRunOptions {
 	/** Nested agent with read-only repo tools instead of a single completion. */
 	useTools: boolean;
@@ -449,7 +453,7 @@ export async function runReviewer(
 				late: { deadline, userSignal: abortSignal, finalFormat: JSON_FINAL_FORMAT },
 			},
 		)
-		: callModel(ctx, model, systemPrompt, userPrompt, {
+		: callModel(ctx, model, systemPrompt + modelAddendum(model), userPrompt, {
 			thinking: reviewerSpec.thinking,
 			temperature,
 			signal,
@@ -466,7 +470,7 @@ export async function runReviewer(
 			// Minutes of review shouldn't be lost to one malformed character the
 			// repair scan couldn't fix: ask the same model to re-emit valid JSON.
 			const fixed = call.text.includes("[") && !lateSignal.aborted
-				? await callModel(ctx, model, JSON_REPAIR_PROMPT, `Parse error: ${first}\n\n${call.text}`, {
+				? await callModel(ctx, model, JSON_REPAIR_PROMPT + (checksRecitation(model) ? JSON_REPAIR_NO_QUOTE : ""), `Parse error: ${first}\n\n${call.text}`, {
 					thinking: "low",
 					temperature: 0,
 					signal: lateSignal,
