@@ -534,7 +534,12 @@ extglob — documented limitation.
    straggler cutoff, or a harvest's length before the timeout) the turn in
    flight is stopped, tools are switched off, and the session is asked
    once for its answer from what it has verified (native web search is off
-   too). It gets 60s (a fifth of a short timeout), all inside
+   too), in plain words: "your tools are now disabled, do not try to call
+   any" ended gpt-6.1-sol's reply in `content_filter` every time. Only
+   the harvest's own reply counts, and a turn cut before it produced
+   anything (a Socratic round that never started) isn't harvested.
+   Single completions (quick runs) have nothing to harvest and work right
+   up to the timeout. It gets 60s (a fifth of a short timeout), all inside
    `reviewerTimeoutSec`. An answer marks the reviewer **partial**, and
    groups with a partial reviewer's findings are verified even without
    `--verify`, so tool-using runs always probe the sandbox and resolve

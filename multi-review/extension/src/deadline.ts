@@ -64,9 +64,10 @@ export interface SessionDeadline {
 	dispose(): void;
 }
 
-export function startDeadline(timeoutMs: number, cutoff?: StragglerCutoff): SessionDeadline {
+/** `harvest: false` (a single completion, no session to harvest): work right up to the timeout. */
+export function startDeadline(timeoutMs: number, cutoff?: StragglerCutoff, opts: { harvest?: boolean } = {}): SessionDeadline {
 	const start = Date.now();
-	const harvestMs = Math.min(HARVEST_MS, Math.floor(timeoutMs * HARVEST_MAX_FRACTION));
+	const harvestMs = opts.harvest === false ? 0 : Math.min(HARVEST_MS, Math.floor(timeoutMs * HARVEST_MAX_FRACTION));
 	const hardEnd = start + timeoutMs;
 	let cutAt = hardEnd - harvestMs;
 	const cut = new AbortController();
@@ -137,11 +138,18 @@ export function warningText(w: DeadlineWarning, plan: { items: string[]; done: n
 	);
 }
 
-/** The prompt after the cut: tools are off, answer from what was verified. */
+/**
+ * The prompt after the cut (tools are off): answer from what was verified.
+ * Plain and polite on purpose: "Time is up: your tools are now disabled. Do
+ * not try to call any. …" ended gpt-6.1-sol's reply in content_filter 4 of
+ * 4 times (twice in real reviews, as "I'm sorry, but I cannot assist with
+ * that request"), likely the gateway's prompt-injection check; this
+ * wording passed 4 of 4, and on Gemini.
+ */
 export function harvestPrompt(finalFormat: string): string {
 	return (
-		"Time is up: your tools are now disabled. Do not try to call any. " +
-		"Give your final answer now from what you have already verified; leave out anything you didn't get to check. " +
+		"The review's time budget has run out, so please stop investigating and write your final answer now, based on what you have already checked. " +
+		"Leave out anything you didn't get to check. " +
 		finalFormat
 	);
 }
@@ -198,22 +206,30 @@ export function armWarning(
 /**
  * After the deadline's cut: stop the turn in flight, switch tools off, and
  * ask once for the answer from what the session has already verified, inside
- * the harvest's budget. Undefined when the caller aborted, the session never
- * got going (cut before its first answer), or nothing came back.
+ * the harvest's budget. Undefined when the caller aborted, the turn never got
+ * going (no assistant message since `turnStart`, e.g. a Socratic round cut
+ * before it started: earlier rounds' work isn't this round's), or nothing
+ * came back.
  */
-export async function harvest(session: HarvestableSession, late: LateSession | undefined, onEvent?: (event: AgentSessionEvent) => void): Promise<string | undefined> {
+export async function harvest(
+	session: HarvestableSession,
+	late: LateSession | undefined,
+	onEvent?: (event: AgentSessionEvent) => void,
+	turnStart = 0,
+): Promise<string | undefined> {
 	if (!late?.deadline.cut.aborted || late.userSignal?.aborted || late.deadline.end.aborted) return undefined;
-	if (!session.messages.some((m) => (m as { role?: string }).role === "assistant")) return undefined;
+	if (!session.messages.slice(turnStart).some((m) => (m as { role?: string }).role === "assistant")) return undefined;
 	const signal = late.userSignal ? AbortSignal.any([late.userSignal, late.deadline.end]) : late.deadline.end;
 	const stage = (stage: string) => onEvent?.({ type: "multi_review_harvest", stage, reason: String(late.deadline.cut.reason) } as unknown as AgentSessionEvent);
 	stage("stopping");
 	const aborted = () => { throw new Error("aborted"); };
 	const onAbort = () => void session.abort();
 	const tools = session.getActiveToolNames();
-	const before = session.messages.length;
 	signal.addEventListener("abort", onAbort, { once: true });
 	try {
 		await abortable(session.abort().then(() => session.waitForIdle()), signal, aborted);
+		// After the stopped turn settles: its last words aren't the answer.
+		const before = session.messages.length;
 		// An undelivered warning would land after the harvest prompt and contradict it.
 		session.clearQueue();
 		session.setActiveToolsByName([]);

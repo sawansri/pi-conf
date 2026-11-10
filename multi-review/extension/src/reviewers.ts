@@ -178,7 +178,7 @@ export async function createReviewerSession(
 				const stopReason = last?.stopReason ?? "stop";
 				let errorMessage: string | undefined;
 				if (signal.aborted) {
-					const harvested = await harvest(session, late, onEvent);
+					const harvested = await harvest(session, late, onEvent, msgCountBefore);
 					if (harvested) return { ...turnResult(harvested), partial: String(late!.deadline.cut.reason) };
 					errorMessage = `aborted: ${String(signal.reason ?? "cancelled")}`;
 				} else if (stopReason === "error" || stopReason === "aborted") errorMessage = `${stopReason}: ${last?.errorMessage ?? "(no message)"}`;
@@ -197,7 +197,7 @@ export async function createReviewerSession(
 					durationMs: Date.now() - started,
 				};
 			} catch (err) {
-				const harvested = signal.aborted ? await harvest(session, late, onEvent) : undefined;
+				const harvested = signal.aborted ? await harvest(session, late, onEvent, msgCountBefore) : undefined;
 				if (harvested) return { ...turnResult(harvested), partial: String(late!.deadline.cut.reason) };
 				return {
 					text: "",
@@ -431,7 +431,7 @@ export async function runReviewer(
 	runOpts: ReviewerRunOptions,
 	parse: (text: string) => ReviewerFinding[] = parseReviewerJson,
 ): Promise<Omit<ReviewerRunResult, "formattedSpec" | "spec" | "thinking" | "clamped">> {
-	const deadline = startDeadline(runOpts.timeoutMs, runOpts.cutoff);
+	const deadline = startDeadline(runOpts.timeoutMs, runOpts.cutoff, { harvest: runOpts.useTools });
 	const signal = abortSignal ? AbortSignal.any([abortSignal, deadline.cut]) : deadline.cut;
 	// Late work (the harvest, a JSON repair after it) runs to the hard end.
 	const lateSignal = abortSignal ? AbortSignal.any([abortSignal, deadline.end]) : deadline.end;

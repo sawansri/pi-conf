@@ -335,7 +335,7 @@ export async function runSocraticDiscussion(
 					const slot = rows[idx];
 					const alias = participantAlias(idx);
 					const formattedSpec = formatReviewerSpec(slot.rs);
-					const deadline = startDeadline(roundTimeoutMs, cutoff);
+					const deadline = startDeadline(roundTimeoutMs, cutoff, { harvest: runOpts.useTools });
 					const signal = abortSignal ? AbortSignal.any([abortSignal, deadline.cut]) : deadline.cut;
 					const late = { deadline, userSignal: abortSignal, finalFormat: SOCRATIC_FINAL_FORMAT };
 					const tracer = runOpts.trace?.start(formattedSpec, `round ${r}`, cwd);

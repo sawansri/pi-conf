@@ -97,6 +97,14 @@ test("an error retry's new session is warned too, with the time left now", () =>
 	assert.equal(first.length, 1);
 });
 
+test("without a session to harvest (a single completion), the cut is at the timeout", () => {
+	const d = startDeadline(10 * MIN, undefined, { harvest: false });
+	mock.timers.tick(10 * MIN - 1);
+	assert.equal(d.cut.aborted, false);
+	mock.timers.tick(1);
+	assert.equal(d.cut.aborted, true);
+});
+
 test("dispose stops every timer", () => {
 	const d = startDeadline(10 * MIN);
 	const seen = warnings(d);
@@ -178,6 +186,26 @@ test("after the cut, the harvest asks once with tools off and gives them back", 
 	assert.deepEqual(s.tools, ["read", "grep", "progress"]);
 });
 
+test("the harvest answer is the harvest's own reply, never the stopped turn's last words", async () => {
+	const d = startDeadline(10 * MIN);
+	mock.timers.tick(9 * MIN);
+	const s = fakeSession("");
+	// the stopped turn's text lands while it settles; the harvest gets no reply
+	s.waitForIdle = async () => { s.messages.push({ role: "assistant", content: [{ type: "text", text: "Let me check x[0]" }] }); };
+	assert.equal(await harvest(s, lateFor(d)), undefined);
+});
+
+test("a turn that never started (a Socratic round cut before it began) isn't harvested from earlier rounds", async () => {
+	const d = startDeadline(10 * MIN);
+	mock.timers.tick(9 * MIN);
+	const s = fakeSession("an answer from round 1's context");
+	assert.equal(await harvest(s, lateFor(d), undefined, s.messages.length), undefined);
+	assert.deepEqual(s.prompts, []);
+	// cut mid-turn: there is this turn's work to harvest
+	s.messages.push({ role: "user" }, { role: "assistant", content: [{ type: "text", text: "reading…" }] });
+	assert.equal(await harvest(s, lateFor(d), undefined, s.messages.length - 2), "an answer from round 1's context");
+});
+
 test("no harvest before the cut, after the caller's abort, or for a session that never answered", async () => {
 	const before = startDeadline(10 * MIN);
 	assert.equal(await harvest(fakeSession("[]"), lateFor(before)), undefined);
@@ -190,6 +218,14 @@ test("no harvest before the cut, after the caller's abort, or for a session that
 	assert.equal(await harvest(s, lateFor(d, user.signal)), undefined);
 	assert.equal(await harvest(fakeSession("[]", false), lateFor(d)), undefined);
 	assert.deepEqual(s.prompts, []);
+});
+
+test("the harvest prompt doesn't read like a prompt injection", () => {
+	// gpt-6.1-sol's gateway blocked "your tools are now disabled. Do not try to call any." every time.
+	const p = harvestPrompt("Output ONLY the JSON.");
+	assert.doesNotMatch(p, /disabled|do not try/i);
+	assert.match(p, /final answer now, based on what you have already checked/);
+	assert.match(p, /Output ONLY the JSON\.$/);
 });
 
 test("a harvest that doesn't answer in time gives up at the hard end", async () => {
