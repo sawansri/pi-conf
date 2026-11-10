@@ -486,7 +486,7 @@ extglob — documented limitation.
    instead of guessing from hunks. Otherwise it's a single
    `ctx.modelRegistry.streamSimple()` call. Both paths use registry auth
    (literal keys and custom headers in `models.json`). Each reviewer gets
-   `reviewerTimeoutSec` (default 420). **Straggler cutoff:** once a quorum
+   `reviewerTimeoutSec` (default 600). **Straggler cutoff:** once a quorum
    (⅔ of the pool, at least 2) has answered, the rest get as long again
    as the quorum took (min 45s, and never cut before 300s in total), then
    are cut. A degraded endpoint
@@ -669,7 +669,7 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
     "amd-gateway/gemini-3.8-flash@low"
   ],
   "reviewerTools": true,
-  "reviewerTimeoutSec": 420,
+  "reviewerTimeoutSec": 600,
   "dedupeModel": "amd-gateway-anthropic/Claude-Opus-5.5@low",
   "sandbox": true,
   "checkTimeoutSec": 120,

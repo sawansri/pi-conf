@@ -190,7 +190,7 @@ export const DEFAULTS: MultiReviewConfig = {
 		"amd-gateway/gemini-3.8-flash@low",
 	],
 	reviewerTools: true,
-	reviewerTimeoutSec: 420,
+	reviewerTimeoutSec: 600,
 	sandbox: true,
 	checkTimeoutSec: 120,
 	// Not all of ~/.cargo: it holds credentials.toml.

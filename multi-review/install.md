@@ -117,7 +117,7 @@ cat > ~/.pi/agent/multi-review.json << 'EOF'
     "amd-gateway/gemini-3.8-flash@low"
   ],
   "reviewerTools": true,
-  "reviewerTimeoutSec": 420,
+  "reviewerTimeoutSec": 600,
   "sandbox": true,
   "checkTimeoutSec": 120,
   "autoChecks": true,
@@ -290,7 +290,7 @@ via tool updates so the pending tool row changes as reviewers complete.
 | Symptom | What to do |
 |---------|-----------|
 | `no reviewers configured` | Add `multi-review.json` per step 2 |
-| A reviewer shows `timed out after 420s` or `cut as straggler` | Straggler: the rest of the pool finished long before it (often a degraded endpoint; check the gateway status page). Timeout: raise `reviewerTimeoutSec` or lower that reviewer's `@level` (higher levels didn't improve results in testing) |
+| A reviewer shows `timed out after 600s` or `cut as straggler` | Straggler: the rest of the pool finished long before it (often a degraded endpoint; check the gateway status page). Timeout: raise `reviewerTimeoutSec` or lower that reviewer's `@level` (higher levels didn't improve results in testing) |
 | `checks not run: nono is not installed` / `verifiers can't execute code` | Install nono (Prereqs), or set `"sandbox": false` to silence it |
 | `C/C++ files changed but no compile_commands.json` | Configure with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON` (it is looked for at the repo root, `build*/`, `build*/*/`, `out/*/`) |
 | A check fails with "Permission denied" | The repo is read-only in the sandbox; brief checks that don't write into it (type-checks, tests that write to `$TMPDIR`) |
