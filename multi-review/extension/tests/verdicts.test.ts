@@ -38,3 +38,10 @@ test("one refutation with evidence is a veto, whatever the majority says", () =>
 	assert.equal(vetoes(group({ verifications: [v("refuted", "(no evidence given)"), v("refuted", "nope")] })).length, 0);
 	assert.equal(vetoes(group({ verifications: [v("confirmed", "node t.js -> undefined, expected v")] })).length, 0);
 });
+
+test("a short refutation that cites the code keeps its veto", () => {
+	const v = (evidence: string): Verification => ({ spec: "p/x", verdict: "refuted", evidence });
+	assert.equal(vetoes(group({ verifications: [v("a.ts:3 guards null")] })).length, 1);
+	assert.equal(vetoes(group({ verifications: [v("src/cache.ts:12")] })).length, 1);
+	assert.equal(vetoes(group({ verifications: [v("not a bug")] })).length, 0);
+});

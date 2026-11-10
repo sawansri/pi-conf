@@ -93,7 +93,8 @@ const NO_EVIDENCE = "(no evidence given)";
  * a minority veto cut the worst-case error from 17.6% to 2.8%).
  */
 export function vetoes(g: Pick<DedupeGroup, "verifications">): Verification[] {
-	return (g.verifications ?? []).filter((v) => v.verdict === "refuted" && v.evidence !== NO_EVIDENCE && v.evidence.trim().length >= 20);
+	// Evidence is something to check: a file:line, or a sentence of it.
+	return (g.verifications ?? []).filter((v) => v.verdict === "refuted" && v.evidence !== NO_EVIDENCE && (/\S:\d+/.test(v.evidence) || v.evidence.trim().length >= 20));
 }
 
 /** One-line verification summary for a group, e.g. "✓2 ✗1 ?0". */
