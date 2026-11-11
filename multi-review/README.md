@@ -808,24 +808,28 @@ planted defects, the default four-reviewer pool):
 
 | Component | Share of the bill |
 |---|---|
-| **Output tokens** (thinking + findings JSON + tool-call args) | **44–67%** |
-| Fresh (uncached) input | the rest |
-| Cache reads and cache writes | **$0** — billed free on this gateway |
+| Fresh (uncached) input — every tool result, once, at full price | **dominant** |
+| Output tokens (thinking + findings JSON + tool-call args) | 20–60% |
+| Cache reads | 0.05× the input rate |
+| Cache writes | 1.25× the input rate |
 | Grouping call (Opus → Haiku) | 2% → 0.05% |
 
-Two consequences, both counter-intuitive:
+Two things follow, and both cost real money if you get them wrong:
 
-- **Re-sent history is free; NEW content is not.** The gateway caches
-  automatically (`cached_tokens` came back populated for every model tried,
-  with no cache key sent) and bills cache reads and writes at $0. So the
-  ~13.5M cumulative prompt tokens a five-session review generates cost
-  nothing to re-send. But every tool result enters the context as *fresh*
-  input exactly once, at full price, and that is not cached by anything. On
-  a real $2.90 run (272 tool calls) the split was **~$1.9 of fresh input
-  from tool results, ~$0.1 for the prompts, ~$0.3 of output**: roughly 90%
-  of the bill was content the reviewers *pulled into* context, at ~3.5k
-  fresh tokens (~14KB) per tool call. Shrinking what a review reads — fewer
-  and smaller tool calls — is therefore where the money is.
+- **NEW content is what you pay for.** Re-sent history bills at the cache
+  read rate (5% of input), so re-sending is cheap but *not* free; every tool
+  result, by contrast, enters the context as fresh input exactly once at
+  full price. On a real $2.90 run (272 tool calls) fresh tool output was
+  ~90% of the bill at ~3.5k tokens per call. Shrinking what a review reads —
+  fewer and smaller tool calls — is where the money is.
+
+- **`models.json` under-reports cached spend.** Its `cacheRead` and
+  `cacheWrite` are both `0`, so the roll-up prices cached tokens as free,
+  while the gateway actually bills 1.25× for a write and 0.05× for a read.
+  Measured on the real runs here, that makes a heavily cached run look ~1.7×
+  cheaper than it is (a review reported as $4.23 was ~$7.14). The multipliers
+  are in `cost.ts` (`CACHE_WRITE_MULTIPLIER`, `CACHE_READ_MULTIPLIER`); put
+  the real rates into `models.json` to get exact figures.
 - **`--verify` roughly doubles a run** ($0.63–0.83 against $0.52–0.67
   without), because it adds four more tool-using sessions, each with its own
   output tokens. The verify round re-sends the brief, but re-sending is
