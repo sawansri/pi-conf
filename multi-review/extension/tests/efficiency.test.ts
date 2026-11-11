@@ -181,6 +181,10 @@ test("the cache-hit rate is the cached share of the prompt, or undefined with no
 
 // ---------- routing knobs ----------
 
+test("the read cap is on by default: fresh tool output is what a run pays for", () => {
+	assert.ok(DEFAULTS.readMaxChars > 0);
+});
+
 test("the tool-call floor shrinks with the diff but never below 2", () => {
 	assert.equal(scaledMinToolCalls(10, 20), 2);
 	assert.equal(scaledMinToolCalls(10, 100), 5);

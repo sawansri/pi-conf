@@ -144,10 +144,15 @@ export interface MultiReviewConfig {
 	/** Output-token cap for the judge (its synthesis is a few thousand tokens); 0 = pi's default. */
 	judgeMaxTokens: number;
 	/**
-	 * Cap on a single tool result's size in reviewer/verifier sessions, in
-	 * characters. Every byte stays in the session's history and is re-sent on
-	 * every later turn, so a long tool-using review amplifies it ~10x. 0
-	 * leaves pi's default (50KB) in place.
+	 * Cap on a single `read`/`grep` result in reviewer/verifier sessions, in
+	 * characters. 0 leaves pi's default (2000 lines / 50KB) in place.
+	 *
+	 * This is the biggest cost lever on a large review. Re-sent history is
+	 * cached and free on this gateway, but every tool result enters the context
+	 * as FRESH input exactly once and is billed at full price. A real $2.90
+	 * run (272 tool calls) spent ~90% of its bill that way, at ~3.5k fresh
+	 * tokens per call. Capping read output at 24k chars (~400 lines) cut fresh
+	 * input 19% on the benchmark with no loss of findings.
 	 */
 	readMaxChars: number;
 	/**
@@ -268,7 +273,7 @@ export const DEFAULTS: MultiReviewConfig = {
 	verifierThinking: null,
 	verifierTimeoutSec: 180,
 	judgeMaxTokens: 8_000,
-	readMaxChars: 0,
+	readMaxChars: 24_000,
 	verifyNarrowContext: false,
 	secondPassMinLines: 0,
 };

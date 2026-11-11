@@ -815,14 +815,17 @@ planted defects, the default four-reviewer pool):
 
 Two consequences, both counter-intuitive:
 
-- **Prompt size is nearly free; output is not.** The gateway caches
+- **Re-sent history is free; NEW content is not.** The gateway caches
   automatically (`cached_tokens` came back populated for every model tried,
-  with no cache key sent) and bills both cache reads and cache writes at $0
-  on the catalog's `cacheRead: 0`/`cacheWrite: 0`. A reviewer's prompt grows
-  to ~1M cumulative tokens over a 26-turn session and costs nothing for it.
-  So effort spent shrinking prompts — dropping the diff from a verify
-  prompt, capping tool output — buys latency and context headroom, not
-  dollars. Cutting *thinking* and *tool-call count* is what cuts the bill.
+  with no cache key sent) and bills cache reads and writes at $0. So the
+  ~13.5M cumulative prompt tokens a five-session review generates cost
+  nothing to re-send. But every tool result enters the context as *fresh*
+  input exactly once, at full price, and that is not cached by anything. On
+  a real $2.90 run (272 tool calls) the split was **~$1.9 of fresh input
+  from tool results, ~$0.1 for the prompts, ~$0.3 of output**: roughly 90%
+  of the bill was content the reviewers *pulled into* context, at ~3.5k
+  fresh tokens (~14KB) per tool call. Shrinking what a review reads — fewer
+  and smaller tool calls — is therefore where the money is.
 - **`--verify` roughly doubles a run** ($0.63–0.83 against $0.52–0.67
   without), because it adds four more tool-using sessions, each with its own
   output tokens. The verify round re-sends the brief, but re-sending is
@@ -870,7 +873,7 @@ What each lever is actually worth:
 | `judgeMaxTokens` | bounds judge output; scales up with the finding count so a large review is not truncated | Keep. Opus 5.5 uses adaptive thinking, so this does *not* shrink its thinking budget — only the output ceiling |
 | `verifierThinking: "low"` | acts on the verify round's output (~9% of a run) | Worth trying; needs ~14 runs to confirm |
 | `secondPassMinLines` | a second pass is ~10% of a run | Set it above your typical diff unless you want the recall |
-| `readMaxChars` | shrinks prompts, which are already free | **Latency/headroom only**; costs money if it makes reviewers re-read |
+| `readMaxChars` (on, 24k chars) | caps the NEW content each read adds to context — the line item that dominates a big run | **The biggest lever on a large diff.** Measured: fresh input −19%, cost −7.4%, findings unchanged |
 | `verifyNarrowContext` | cuts ~70% of the verify prompt — but those tokens are free | **Measured +18% cost** on real runs: without the diff in hand, verifiers ran 1.5–2x more tool calls, and tool-call output is billed. Off by default; turn it on when the brief strains a verifier's context window, not to save money |
 
 ## Defaults file
@@ -910,7 +913,7 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
   "verifierThinking": null,
   "verifierTimeoutSec": 180,
   "judgeMaxTokens": 8000,
-  "readMaxChars": 0,
+  "readMaxChars": 24000,
   "verifyNarrowContext": false,
   "secondPassMinLines": 0,
   "webSearch": true,
@@ -928,8 +931,9 @@ behaviour of grouping on the judge.
 model's own). `verifierTimeoutSec` is the verify round's own limit, separate
 from `reviewerTimeoutSec`, since verifying is a fraction of the work.
 `judgeMaxTokens` caps the judge's output; 0 uses pi's default.
-`readMaxChars` caps one `read`/`grep` result in a reviewer session; 0 keeps pi's
-2000-line/50KB default. `verifyNarrowContext` sends each verifier only the diff
+`readMaxChars` caps one `read`/`grep` result in a reviewer session (default
+24k chars, ~400 lines); 0 keeps pi's 2000-line/50KB default. Reviewers can
+still page with `offset`, and the clip notice tells them how. `verifyNarrowContext` sends each verifier only the diff
 hunks of the files its findings name, plus intent and requirements, instead of
 the whole brief (off by default: see [Cost](#cost)). `secondPassMinLines` runs a `secondPass` model only when the
 diff has at least that many changed lines (0 always runs it).
