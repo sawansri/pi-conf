@@ -162,9 +162,13 @@ export function describeFlags(flags: ReviewFlags): string {
  * timed out at 344s while Kimi finished first (121s, 3 of 4 findings
  * confirmed, one high-severity bug no other reviewer found) and verified
  * 6/6 in 59s. It is also a third model family next to Claude and GPT.
- * Opus 5.5@high joined the pool as a fifth reviewer so reviews and Socratic
- * discussions also hear from the strongest Claude model, not only from the
- * judge synthesizing everyone else.
+ * Opus 5.5@high was a fifth reviewer for a while, so reviews and Socratic
+ * discussions also heard from the strongest Claude model directly, not only
+ * from the judge synthesizing everyone else. It was dropped again: as the
+ * judge (and your main model) it writes the synthesis and weighs every
+ * finding anyway, so its review pass mostly restated findings the other four
+ * already raised, at the cost of the slowest seat in the pool. It still
+ * judges, groups and answers web searches.
  * gpt-6.1-sol@high replaced gpt-6-sol@xhigh: about as fast (153s vs 125s on
  * a narrow area review) and it caught both models' unique findings; at
  * @xhigh it took 386s. Grok-4.7 and GLM-5.3-Flash were too slow (900s
@@ -178,7 +182,6 @@ export function describeFlags(flags: ReviewFlags): string {
  */
 export const DEFAULTS: MultiReviewConfig = {
 	reviewers: [
-		"amd-gateway-anthropic/Claude-Opus-5.5@high",
 		"amd-gateway-anthropic/Claude-Sonnet-5.5@high",
 		"amd-gateway/gpt-6.1-sol@high",
 		"amd-gateway/Kimi-K3.1-Pro@high",
@@ -186,8 +189,8 @@ export const DEFAULTS: MultiReviewConfig = {
 	],
 	judge: "amd-gateway-anthropic/Claude-Opus-5.5",
 	judgeThinking: "high",
-	// The 5 reviewers plus Sonnet's second pass, all at once.
-	concurrency: 6,
+	// The 4 reviewers plus Sonnet's second pass, all at once.
+	concurrency: 5,
 	temperature: 0.2,
 	verify: false,
 	verifiersPerFinding: 2,
