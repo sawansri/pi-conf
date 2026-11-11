@@ -449,7 +449,7 @@ its own option:
 | Option | What it does | When | Cost / time (4-reviewer pool) |
 |--------|-------------|------|------------------------------|
 | *(default)* | Sonnet 5.5 + gpt-6.1-sol + Kimi K3.1 Pro + Gemini 4 Argon with read-only tools → grouping → the main agent judges | Most reviews | ~1× · ~2–3 min on a 700-line diff |
-| `--verify` | Adds a cross-check round: each issue goes to `verifiersPerFinding` (2) reviewers **who did not raise it**, plus any `verifyOnly` models. With tools, they reply confirmed / refuted / uncertain plus code evidence | High-stakes changes; when false positives are expensive | ~1.5–2× |
+| `--verify` | Adds a cross-check round: each issue goes to `verifiersPerFinding` (1) reviewer **who did not raise it**, plus any `verifyOnly` models. With tools, they reply confirmed / refuted / uncertain plus code evidence | High-stakes changes; when false positives are expensive | ~1.5–2× |
 | `--quick` | `quickReviewers` pool (gpt-6-luna@low, Haiku 5.5, Gemini Flash@low), single completions, no tools | Small diffs, a cheap first look | ~0.2× · 10–50s |
 | `--direct` | No agent hand-off: the configured judge writes the synthesis (print/RPC modes always do this) | Scripting, or when you don't want the agent involved | +1 judge call |
 
@@ -898,7 +898,7 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
   "concurrency": 5,
   "temperature": 0.2,
   "verify": false,
-  "verifiersPerFinding": 2,
+  "verifiersPerFinding": 1,
   "verifyOnly": [],
   "secondPass": ["amd-gateway-anthropic/Claude-Sonnet-5.5"],
   "quickReviewers": [
@@ -927,6 +927,15 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
 }
 ```
 
+`verifiersPerFinding` defaults to 1: a run that paid for two per finding got
+one, because both alternate verifiers timed out and returned no verdicts, so
+k=1 delivers what the run achieved for half the verify bill. Raise it when the
+pool is healthy and false positives are expensive.
+`readMaxCharsByModel` overrides `readMaxChars` per model (`provider/id`; the
+`@level`, `#2` and `(verify)` suffixes are normalized away, so one entry covers
+a model's every session). Kimi defaults to 12k against the pool's 24k: in one
+real review it made 194 tool calls to Sonnet's 64 at the same list price and
+cost 8x, re-reading the same files up to 6 times.
 `dedupeDefaultModel` is who groups findings when `dedupeModel` is unset
 (default Haiku 5.5: clustering is semantic bookkeeping, not discovery, and the
 answer is validated into a partition either way). `null` restores the old
