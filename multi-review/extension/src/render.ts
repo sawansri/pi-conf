@@ -4,6 +4,7 @@ import type { ModelSpec } from "./config.ts";
 import type { ReviewerFinding } from "./findings.ts";
 import type { DedupeGroup, SuspicionResult, Verification } from "./grouping.ts";
 import type { PrCommentsReport } from "./pr-comments.ts";
+import { type RunCost, type ModelUsage, formatRunCost, runCostBreakdown } from "./cost.ts";
 import { type SocraticDetails, summarizeSocraticEntry } from "./socratic.ts";
 import { formatRange } from "./synthesis.ts";
 import type { ReviewTarget } from "./target.ts";
@@ -23,7 +24,9 @@ export interface MultiReviewDetails {
 	failedSpecs: ModelSpec[];
 	judge: string;
 	judgeDurationMs: number;
-	judgeUsage?: { input: number; output: number; total: number; cost: number };
+	judgeUsage?: ModelUsage;
+	/** Whole-run token and cost roll-up (reviewers, verify round, grouping, judge). */
+	cost?: RunCost;
 	consensusCount: number;
 	totalFindings: number;
 	/** Review markdown, kept apart from tool-result text (which adds lead instructions). */
@@ -129,6 +132,13 @@ export function renderMultiReviewMessage(
 		theme.fg("dim", `judge: ${details.judge} · ${(details.judgeDurationMs / 1000).toFixed(1)}s`),
 		0, 0,
 	));
+	if (details.cost) {
+		container.addChild(new Text(theme.fg("dim", `cost: ${formatRunCost(details.cost)}`), 0, 0));
+		// Expanded shows where the money went, most expensive first.
+		if (options.expanded) {
+			for (const line of runCostBreakdown(details.cost)) container.addChild(new Text(theme.fg("dim", `  ${line}`), 0, 0));
+		}
+	}
 
 	// Per-group brief (always shown)
 	for (const g of details.groups) {

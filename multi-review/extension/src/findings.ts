@@ -1,4 +1,5 @@
 import type { Model, ModelSpec, ThinkingLevelAlias } from "./config.ts";
+import type { ModelUsage } from "./cost.ts";
 
 // ---------- parallel fan-out ----------
 
@@ -57,7 +58,7 @@ export interface ReviewerRunResult {
 	rawText: string;
 	stopReason: string;
 	errorMessage?: string;
-	usage?: { input: number; output: number; total: number; cost: number };
+	usage?: ModelUsage;
 	toolCalls?: number;
 	durationMs: number;
 	/** Cut short as a straggler or at the timeout (the reason); findings come from the harvest. */

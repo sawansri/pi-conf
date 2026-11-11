@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { type Model, type ModelSpec, type MultiReviewConfig, type ReviewerSpec, formatReviewerSpec } from "./config.ts";
+import type { ModelUsage } from "./cost.ts";
 import type { DedupeGroup, Verification } from "./grouping.ts";
 import { type MultiReviewProgressReporter, shortSpec } from "./progress.ts";
 import { type ReviewerRunOptions, runReviewer, throwIfAborted } from "./reviewers.ts";
@@ -45,7 +46,7 @@ export async function runVerification(
 	runOpts: ReviewerRunOptions,
 	signal: AbortSignal | undefined,
 	progress?: MultiReviewProgressReporter,
-): Promise<{ failures: string[] }> {
+): Promise<{ failures: string[]; runs: Array<{ spec: string; usage?: ModelUsage }> }> {
 	// Every reviewer can verify — including ones whose own review failed:
 	// having raised nothing, they're the most independent checkers. `rows`
 	// also carries the verify-only models, after the reviewers.
@@ -53,6 +54,9 @@ export async function runVerification(
 	const assignments = [...assignVerifiers(groups, pool, cfg.verifiersPerFinding)];
 	const byId = new Map(groups.map((g) => [g.id, g]));
 	const failures: string[] = [];
+	// Verification re-sends the whole brief to every verifier, so it is often
+	// the second-biggest line item; its usage has to reach the run total.
+	const runs: Array<{ spec: string; usage?: ModelUsage }> = [];
 	let done = 0;
 	progress?.update({ phase: "verifying findings", done: 0, total: assignments.length });
 	await mapWithConcurrency(assignments, cfg.concurrency, async ([spec, ids]) => {
@@ -69,6 +73,7 @@ export async function runVerification(
 				error = err instanceof Error ? err.message : String(err);
 			}
 		}
+		runs.push({ spec: row.rs.spec, usage: run.usage });
 		if (error) failures.push(`${formatReviewerSpec(row.rs)}: ${error.slice(0, 160)}`);
 		for (const [id, v] of verdicts) {
 			const g = byId.get(id)!;
@@ -86,7 +91,7 @@ export async function runVerification(
 		});
 	});
 	throwIfAborted(signal);
-	return { failures };
+	return { failures, runs };
 }
 
 export { verificationTally, vetoes } from "./verdicts.ts";

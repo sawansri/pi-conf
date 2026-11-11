@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { Model, ModelSpec, ThinkingLevelAlias } from "./config.ts";
+import type { ModelUsage } from "./cost.ts";
 import type { DedupeGroup } from "./grouping.ts";
 import { callModel } from "./models.ts";
 import { budgetDiff } from "./prompts.ts";
@@ -54,7 +55,7 @@ export interface JudgeResult {
 	markdown: string;
 	stopReason: string;
 	errorMessage?: string;
-	usage?: { input: number; output: number; total: number; cost: number };
+	usage?: ModelUsage;
 	durationMs: number;
 }
 

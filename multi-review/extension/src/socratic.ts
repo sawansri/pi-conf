@@ -1,5 +1,6 @@
 import type { AgentSessionEvent, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { checkLines, checkPromptLines } from "./checks.ts";
+import type { ModelUsage } from "./cost.ts";
 import { type Model, type ModelSpec, type MultiReviewConfig, type ReviewerSpec, type ThinkingLevelAlias, formatReviewerSpec } from "./config.ts";
 import type { JudgeResult } from "./judge.ts";
 import { callModel } from "./models.ts";
@@ -36,7 +37,7 @@ export interface SocraticRoundEntry {
 	text: string;
 	stopReason: string;
 	errorMessage?: string;
-	usage?: { input: number; output: number; total: number; cost: number };
+	usage?: ModelUsage;
 	toolCalls?: number;
 	durationMs: number;
 	/** Cut short (the reason); the text came from the harvest. */

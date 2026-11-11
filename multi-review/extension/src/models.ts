@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { type Model, type ModelSpec, type MultiReviewConfig, type ReviewerSpec, type ThinkingLevelAlias, parseReviewerSpec } from "./config.ts";
+import type { ModelUsage } from "./cost.ts";
 import { abortable } from "./util.ts";
 
 /**
@@ -101,7 +102,7 @@ export interface ModelCallResult {
 	stopReason: string;
 	/** Set when the call failed outright (auth, HTTP, abort) or was truncated. */
 	errorMessage?: string;
-	usage?: { input: number; output: number; total: number; cost: number };
+	usage?: ModelUsage;
 	/** Tool calls made, for agentic reviewers. */
 	toolCalls?: number;
 	durationMs: number;

@@ -6,6 +6,7 @@ import { type ParsedReviewArgs, parseAuthorFlags, parseBoolFlag, parseReviewArgs
 import { type BriefInput, buildBrief, hasBriefInput, readSpecFile } from "./brief.ts";
 import { CXX_FILE, cxxAutoCheck, runChecks } from "./checks.ts";
 import { type Model, type ModelSpec, type MultiReviewConfig, type ReviewFlags, type ReviewerSpec, describeFlags, loadConfig, parseReviewerSpec, reviewerRunOptions } from "./config.ts";
+import { type RunCost, addUsage, emptyRunCost, formatRunCost, runCostLine } from "./cost.ts";
 import { type HiddenClaim, type SuspicionResult, groupFindings } from "./grouping.ts";
 import { type JudgeResult, runJudge } from "./judge.ts";
 import { describeResolved, findModel, resolveJudge, resolveReviewerPoolStructured } from "./models.ts";
@@ -460,6 +461,12 @@ async function runSocraticPipeline(
 	}
 	if (prReport) markdown += `\n\n${prCommentsMarkdown(prReport, []).join("\n")}`;
 
+	// Same roll-up as a review: every participant turn (across all rounds) plus
+	// the moderator. Each round resends the whole history, so rounds dominate.
+	const cost: RunCost = emptyRunCost();
+	for (const round of socratic.rounds) for (const e of round.entries) addUsage(cost, e.formattedSpec, e.usage);
+	if (judgeUsage) addUsage(cost, cfg.judge, judgeUsage);
+
 	const r1 = socratic.rounds[0]?.entries ?? [];
 	const failedSpecs = rows
 		.filter((_, idx) => !socratic.rounds.some((r) => r.entries[idx]?.ok))
@@ -477,13 +484,16 @@ async function runSocraticPipeline(
 		totalFindings: 0,
 		prComments: prReport,
 		socratic,
+		cost,
 	};
+	markdown += runCostLine(cost);
 	return {
 		kind: "inject",
 		notifyMessage:
 			`multi-review · ${label} · done\n` +
 			`topic: ${topic.slice(0, 100)}${topic.length > 100 ? "…" : ""}\n` +
 			`participants: ${rows.length}   rounds: ${socratic.rounds.length}/${totalRounds}   tool calls: ${totalTools}` +
+			`\ncost: ${formatRunCost(cost)}` +
 			(target.warnings.length ? `\nwarnings: ${target.warnings.length} (see discussion)` : ""),
 		notifyLevel: "info",
 		injectMessage: { customType: "multi-review", content: markdown, details },
@@ -551,6 +561,11 @@ async function runReviewPipeline(
 	);
 	const failure = allReviewersFailedResult(runs, label);
 	if (failure) return failure;
+	// One roll-up for the whole run: reviewers (both passes), the grouping
+	// call, the verify round, and the judge. Nested sessions are in-memory, so
+	// this is the only place a run's real spend becomes visible.
+	const cost: RunCost = emptyRunCost();
+	for (const r of runs) addUsage(cost, r.formattedSpec, r.usage);
 
 	const suspicionTexts = target.brief?.suspicions ?? [];
 	const prClaims = prReport?.claims ?? [];
@@ -558,7 +573,8 @@ async function runReviewPipeline(
 		...suspicionTexts.map((text, i) => ({ key: `S:${i}`, label: "lead hypothesis", text })),
 		...prClaims.map((c, i) => ({ key: `P:${i}`, label: `PR comment by @${c.author}`, text: `${c.path ? `${c.path}: ` : ""}${c.claim}` })),
 	];
-	const { groups, matches } = await groupFindings(ctx, cfg, runs, signal, progress, hidden);
+	const { groups, matches, usage: groupingUsage } = await groupFindings(ctx, cfg, runs, signal, progress, hidden);
+	addUsage(cost, cfg.dedupeModel === "lexical" ? "grouping (lexical)" : (cfg.dedupeModel ?? cfg.judge), groupingUsage);
 	// Grouping and judge calls turn an abort into an error + fallback; a
 	// cancelled run must stop here, not publish a fallback review.
 	throwIfAborted(signal);
@@ -583,7 +599,8 @@ async function runReviewPipeline(
 		// One row per model: a duplicate would count as two independent verifiers.
 		const verifierPool = [...rows, ...verifierRows].filter((r, i, all) => all.findIndex((o) => o.rs.spec === r.rs.spec) === i);
 		if (sandboxReason && cfg.sandbox && !flags.quick && runOpts.useTools) target.warnings.push(`verifiers can't execute code: ${sandboxReason}`);
-		const { failures } = await runVerification(ctx, cfg, verifierPool, toVerify, userPrompt, { ...fit(runOpts, FINAL_RESERVE_MS), sandbox: sandboxReason === null, sandboxExtras }, signal, progress);
+		const { failures, runs: verifierRuns } = await runVerification(ctx, cfg, verifierPool, toVerify, userPrompt, { ...fit(runOpts, FINAL_RESERVE_MS), sandbox: sandboxReason === null, sandboxExtras }, signal, progress);
+		for (const r of verifierRuns) addUsage(cost, `${r.spec} (verify)`, r.usage);
 		for (const f of failures) target.warnings.push(`verifier failed (its claims stay unverified): ${f}`);
 		suspicionGroups.forEach((g, i) => {
 			suspicions[i].verifications = g.verifications;
@@ -612,6 +629,7 @@ async function runReviewPipeline(
 		judgeLabel = cfg.judge;
 		judgeDurationMs = jr.durationMs;
 		judgeUsage = jr.usage;
+		addUsage(cost, cfg.judge, jr.usage);
 		markdown = jr.markdown.trim()
 			? jr.markdown
 			: `# Multi-Model Code Review (judge returned nothing)\n\nJudge \`${cfg.judge}\` failed (${jr.errorMessage ?? `stopReason=${jr.stopReason}`}); deterministic synthesis follows.\n\n` +
@@ -621,6 +639,7 @@ async function runReviewPipeline(
 	}
 	if (suspicions.length > 0) markdown += `\n\n${suspicionMarkdown(suspicions, groups, flags.verify).join("\n")}`;
 	if (prReport) markdown += `\n\n${prCommentsMarkdown(prReport, groups).join("\n")}`;
+	markdown += runCostLine(cost);
 
 	const details: MultiReviewDetails = {
 		target,
@@ -630,6 +649,7 @@ async function runReviewPipeline(
 		judge: judgeLabel,
 		judgeDurationMs,
 		judgeUsage,
+		cost,
 		consensusCount: groups.filter((g) => g.consensus).length,
 		totalFindings: groups.reduce((s, g) => s + g.members.length, 0),
 		suspicions: suspicions.length > 0 ? suspicions : undefined,
@@ -645,6 +665,7 @@ async function runReviewPipeline(
 			(flags.verify ? `   verified: ${verified}/${groups.length}` : "") +
 			(suspicions.length ? `   suspicions raised independently: ${suspicions.filter((x) => x.raisedBy.length).length}/${suspicions.length}` : "") +
 			(prReport ? `   PR claims: ${prClaims.length} (${prClaims.filter((c) => c.verifications?.some((v) => v.verdict === "confirmed")).length} confirmed)` : "") +
+			`\ncost: ${formatRunCost(cost)}` +
 			(target.warnings.length ? `\nwarnings: ${target.warnings.length} (see review)` : ""),
 		notifyLevel: "info",
 		injectMessage: { customType: "multi-review", content: markdown, details },

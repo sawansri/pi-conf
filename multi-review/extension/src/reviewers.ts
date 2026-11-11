@@ -2,6 +2,7 @@ import { type AgentSessionEvent, type ExtensionContext, createAgentSession, Defa
 import { createGitTool, createProgressTool, createRunTool } from "./agent-tools.ts";
 import { type LateSession, StragglerCutoff, armWarning, harvest, startDeadline } from "./deadline.ts";
 import { type Model, type ReviewerSpec, type ThinkingLevelAlias, formatReviewerSpec } from "./config.ts";
+import type { ModelUsage } from "./cost.ts";
 import { type ReviewerFinding, type ReviewerRunResult, parseReviewerJson } from "./findings.ts";
 import { type ModelCallResult, callModel } from "./models.ts";
 import type { MultiReviewRunResult } from "./pipeline.ts";
@@ -218,6 +219,28 @@ export async function createReviewerSession(
 	};
 }
 
+/** The stats shape both `AgentSession`s and the test doubles expose. */
+interface SessionStatsLike {
+	tokens: { input: number; output: number; total: number; cacheRead?: number; cacheWrite?: number };
+	cost: number;
+	toolCalls: number;
+}
+
+/**
+ * Cache tokens matter for cost: on these providers a cache read bills at a
+ * fraction of fresh input, so a run's price is not input+output alone.
+ */
+function sessionUsage(stats: SessionStatsLike): ModelUsage {
+	return {
+		input: stats.tokens.input,
+		output: stats.tokens.output,
+		total: stats.tokens.total,
+		cost: stats.cost,
+		cacheRead: stats.tokens.cacheRead ?? 0,
+		cacheWrite: stats.tokens.cacheWrite ?? 0,
+	};
+}
+
 /** Tool instructions appended to the system prompt for tool-using sessions. */
 export function buildToolPromptAddendum(model: Model, runOpts: ReviewerRunOptions, canRun: boolean, socratic = false): string {
 	return (
@@ -328,7 +351,7 @@ async function runAgenticReviewer(
 				return {
 					text: before,
 					stopReason: "stop",
-					usage: { input: stats.tokens.input, output: stats.tokens.output, total: stats.tokens.total, cost: stats.cost },
+					usage: sessionUsage(stats),
 					toolCalls: stats.toolCalls,
 					durationMs: Date.now() - started,
 				};
@@ -349,7 +372,7 @@ async function runAgenticReviewer(
 			text: session.getLastAssistantText() ?? "",
 			stopReason,
 			errorMessage,
-			usage: { input: stats.tokens.input, output: stats.tokens.output, total: stats.tokens.total, cost: stats.cost },
+			usage: sessionUsage(stats),
 			toolCalls: stats.toolCalls,
 			durationMs: Date.now() - started,
 		};
@@ -371,7 +394,7 @@ async function runAgenticReviewer(
 }
 
 function harvestedResult(
-	session: { getSessionStats(): { tokens: { input: number; output: number; total: number }; cost: number; toolCalls: number } },
+	session: { getSessionStats(): SessionStatsLike },
 	text: string,
 	late: LateSession,
 	started: number,
@@ -380,7 +403,7 @@ function harvestedResult(
 	return {
 		text,
 		stopReason: "stop",
-		usage: { input: stats.tokens.input, output: stats.tokens.output, total: stats.tokens.total, cost: stats.cost },
+		usage: sessionUsage(stats),
 		toolCalls: stats.toolCalls,
 		durationMs: Date.now() - started,
 		partial: String(late.deadline.cut.reason),

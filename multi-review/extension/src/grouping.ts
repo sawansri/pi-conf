@@ -1,6 +1,7 @@
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { type Model, type ModelSpec, type MultiReviewConfig, type ThinkingLevelAlias, parseReviewerSpec } from "./config.ts";
 import type { EvidenceKind, FindingParts, ReviewerFinding, ReviewerRunResult } from "./findings.ts";
+import type { ModelUsage } from "./cost.ts";
 import { callModel, findModel } from "./models.ts";
 import { type MultiReviewProgressReporter, shortSpec } from "./progress.ts";
 import { formatRange } from "./synthesis.ts";
@@ -277,7 +278,7 @@ async function clusterFindingsWithModel(
 	signal: AbortSignal | undefined,
 	timeoutMs: number,
 	hidden: HiddenClaim[] = [],
-): Promise<{ clusters: FindingKey[][] } | { error: string }> {
+): Promise<{ clusters: FindingKey[][]; usage?: ModelUsage } | { error: string; usage?: ModelUsage }> {
 	const items: string[] = [];
 	const known = new Set<FindingKey>();
 	for (const h of hidden) {
@@ -300,16 +301,16 @@ async function clusterFindingsWithModel(
 		signal: withTimeout(signal, timeoutMs),
 		maxTokens: 8_000,
 	});
-	if (call.errorMessage) return { error: call.errorMessage };
+	if (call.errorMessage) return { error: call.errorMessage, usage: call.usage };
 	let parsed: unknown;
 	try {
 		const start = call.text.indexOf("[");
 		const end = call.text.lastIndexOf("]");
 		parsed = JSON.parse(call.text.slice(start, end + 1));
 	} catch (err) {
-		return { error: `cluster JSON: ${err instanceof Error ? err.message : String(err)}` };
+		return { error: `cluster JSON: ${err instanceof Error ? err.message : String(err)}`, usage: call.usage };
 	}
-	if (!Array.isArray(parsed)) return { error: "cluster reply is not an array" };
+	if (!Array.isArray(parsed)) return { error: "cluster reply is not an array", usage: call.usage };
 	const seen = new Set<FindingKey>();
 	const clusters: FindingKey[][] = [];
 	for (const raw of parsed) {
@@ -332,7 +333,7 @@ async function clusterFindingsWithModel(
 		if (cluster.length > 0) clusters.push(cluster);
 	}
 	for (const key of known) if (!seen.has(key)) clusters.push([key]);
-	return { clusters };
+	return { clusters, usage: call.usage };
 }
 
 /** A claim checked against independent findings without being shown to reviewers. */
@@ -355,7 +356,7 @@ export async function groupFindings(
 	signal: AbortSignal | undefined,
 	progress?: MultiReviewProgressReporter,
 	hidden: HiddenClaim[] = [],
-): Promise<{ groups: DedupeGroup[]; matches: Map<string, string[]> }> {
+): Promise<{ groups: DedupeGroup[]; matches: Map<string, string[]>; usage?: ModelUsage }> {
 	const lexical = () => {
 		const groups = dedupeReviewerFindings(results);
 		return { groups, matches: new Map(hidden.map((h) => [h.key, matchSuspicionLexically(h.text, groups)])) };
@@ -368,7 +369,8 @@ export async function groupFindings(
 	const out = await clusterFindingsWithModel(ctx, model, parsedSpec.thinking, results, signal, 120_000, hidden);
 	if ("error" in out) {
 		progress?.update({ phase: "grouping fell back to lexical", latest: `grouping model failed: ${out.error.slice(0, 120)}` });
-		return lexical();
+		// A failed grouping call was still billed; keep it in the total.
+		return { ...lexical(), usage: out.usage };
 	}
 	const groups = dedupeReviewerFindings(results, out.clusters);
 	const groupOfKey = new Map<FindingKey, string>();
@@ -377,7 +379,7 @@ export async function groupFindings(
 		const cluster = out.clusters.find((c) => c.includes(h.key)) ?? [];
 		return [h.key, [...new Set(cluster.map((k) => groupOfKey.get(k)).filter((id): id is string => Boolean(id)))]];
 	}));
-	return { groups, matches };
+	return { groups, matches, usage: out.usage };
 }
 
 /** Fallback suspicion matching: shared distinctive vocabulary with a group's text. */

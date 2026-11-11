@@ -776,6 +776,34 @@ cuts the pool's per-run cost now that it no longer reviews. Public
 code-review benchmarks (Qodo, Macroscope) point the same way: Claude
 models lead on recall, while gpt-6-astra leads on precision but is slow.
 
+## Cost
+
+Every run reports what it spent, on the review itself and in the completion
+notification:
+
+```
+cost: $0.412 · 211k in / 18k out, 94k cached across 12 calls
+```
+
+`Ctrl+O` breaks it down per model, most expensive first, which is where to
+look before reaching for `--quick`.
+
+Reviewer and verifier sessions are created in memory, so their spend never
+reaches pi's own `/cost` totals — this roll-up is the only place a run's
+real price is visible. It covers both reviewer passes, the grouping call,
+the verify round, the judge, and every Socratic participant turn plus the
+moderator. A failed grouping call was still billed, so its tokens count
+too.
+
+Prices come from `models.json`, which mirrors the AMD gateway catalog
+(`llm.amd.com/api/models`, `cost_per_1m_input_tokens` /
+`cost_per_1m_output_tokens`). The gateway's billed `total_cost` matches
+those rates exactly, so the reported figure is what was actually charged.
+A model with no `cost` entry reports `$0`; token counts stay accurate.
+Cache reads and writes are tracked separately because they bill at
+fractions of fresh input and dominate long runs — a run's price is not
+derivable from input+output alone.
+
 ## Defaults file
 
 `$PI_CODING_AGENT_DIR/multi-review.json` (drop-in; missing file falls back to
