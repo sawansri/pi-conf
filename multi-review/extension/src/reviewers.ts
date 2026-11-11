@@ -456,6 +456,13 @@ export interface ReviewerRunOptions {
 	minToolCalls?: number;
 	/** Cap on one read/grep result's text (tool-budget.ts); 0 = pi's default. */
 	readMaxChars?: number;
+	/**
+	 * Per-spec overrides for `readMaxChars`, looked up by the reviewer's spec
+	 * (see config.readMaxCharsFor). A pool-wide cap would either be too tight
+	 * for a precise model or too loose for one that ranges over the tree, so
+	 * the cap follows the model.
+	 */
+	readMaxCharsBySpec?: Record<string, number>;
 	/** The fan-out's straggler cutoff; set by runAllReviewers. */
 	cutoff?: StragglerCutoff;
 	/** The session's name in the trace when not just its spec (a second pass's "#2"). */
@@ -478,6 +485,9 @@ export async function runReviewer(
 	// Late work (the harvest, a JSON repair after it) runs to the hard end.
 	const lateSignal = abortSignal ? AbortSignal.any([abortSignal, deadline.end]) : deadline.end;
 	const tracer = runOpts.trace?.start(runOpts.traceName ?? formatReviewerSpec(reviewerSpec), runOpts.tracePhase ?? "review", runOpts.cwd ?? ctx.cwd);
+	// The cap follows the model: a bare spec key covers its review, second pass
+	// and verify sessions alike.
+	const readMaxChars = runOpts.readMaxCharsBySpec?.[reviewerSpec.spec] ?? runOpts.readMaxChars;
 	const verifying = runOpts.tracePhase === "verify";
 	// Reviewers run their own repros; verifiers run code to settle claims.
 	const canRun = Boolean(runOpts.sandbox);
@@ -495,7 +505,7 @@ export async function runReviewer(
 				webSearch: runOpts.webSearch,
 				minToolCalls: verifying ? undefined : runOpts.minToolCalls,
 				late: { deadline, userSignal: abortSignal, finalFormat: JSON_FINAL_FORMAT },
-				readMaxChars: runOpts.readMaxChars,
+				readMaxChars,
 			},
 		)
 		: callModel(ctx, model, systemPrompt + modelAddendum(model), userPrompt, {
@@ -606,14 +616,25 @@ export async function runAllReviewers(
 	const cutoff = new StragglerCutoff();
 	const phaseOpts: ReviewerRunOptions = { ...runOpts, cutoff };
 	let okCount = 0;
+	let failCount = 0;
 	const noteFinished = (ok: boolean) => {
 		if (ok) okCount++;
-		if (cutoff.cutAt !== undefined || okCount < quorum || done >= total) return;
+		else failCount++;
+		if (cutoff.cutAt !== undefined || done >= total) return;
+		// See shouldArmStragglerCutoff: the quorum is a hope, not a guarantee.
+		// A real run had 2 of 5 reviewers time out, putting the quorum of 4 out
+		// of reach; the cutoff never armed and the survivors burned 355s each
+		// to a useless harvest.
+		const decision = shouldArmStragglerCutoff(total, okCount, failCount);
+		if (!decision.arm) return;
 		const quorumMs = Date.now() - started;
 		const graceMs = Math.max(STRAGGLER_MIN_GRACE_MS, quorumMs * STRAGGLER_GRACE_FACTOR, STRAGGLER_MIN_TOTAL_MS - quorumMs);
+		const waited = Math.round(graceMs / 1000);
 		cutoff.arm(
 			Date.now() + graceMs,
-			`cut as straggler: ${quorum}/${total} reviewers finished in ${Math.round(quorumMs / 1000)}s, waited ${Math.round(graceMs / 1000)}s more`,
+			decision.reason === "impossible"
+				? `cut as straggler: only ${total - failCount}/${total} reviewers can still finish (${okCount} ok, ${failCount} failed), waited ${waited}s more`
+				: `cut as straggler: ${quorum}/${total} reviewers finished in ${Math.round(quorumMs / 1000)}s, waited ${waited}s more`,
 			`${okCount} of ${total} reviewers have finished`,
 		);
 	};
@@ -688,4 +709,20 @@ export const STRAGGLER_MIN_TOTAL_MS = 300_000;
 export function stragglerQuorum(total: number): number {
 	if (total <= 2) return Number.POSITIVE_INFINITY;
 	return Math.max(2, Math.ceil((total * 2) / 3));
+}
+
+/**
+ * Whether the straggler cutoff should arm, given the pool's progress.
+ *
+ * Two ways to be done waiting: the quorum answered, or enough reviewers failed
+ * that the quorum can no longer be reached — in which case whatever finished
+ * IS the answer and the rest must not burn their full timeout for nothing.
+ * A pool of ≤2 has an infinite quorum ("wait for everyone") and can never fall
+ * short of it, so its cutoff stays the plain timeout.
+ */
+export function shouldArmStragglerCutoff(total: number, ok: number, failed: number): { arm: boolean; reason: "quorum" | "impossible" | "wait" } {
+	const quorum = stragglerQuorum(total);
+	if (ok >= quorum) return { arm: true, reason: "quorum" };
+	if (Number.isFinite(quorum) && total - failed < quorum) return { arm: true, reason: "impossible" };
+	return { arm: false, reason: "wait" };
 }

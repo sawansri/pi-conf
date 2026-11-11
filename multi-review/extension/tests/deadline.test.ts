@@ -2,6 +2,7 @@ import type { AgentSessionEvent } from "@mariozechner/pi-coding-agent";
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, mock, test } from "node:test";
 import { type DeadlineWarning, HARVEST_MS, type HarvestableSession, type LateSession, StragglerCutoff, armWarning, harvest, harvestPrompt, startDeadline, warningText } from "../src/deadline.ts";
+import { shouldArmStragglerCutoff, stragglerQuorum } from "../src/reviewers.ts";
 
 const MIN = 60_000;
 
@@ -249,4 +250,22 @@ test("a harvest that doesn't answer in time gives up at the hard end", async () 
 	mock.timers.tick(HARVEST_MS);
 	assert.equal(await result, undefined);
 	assert.deepEqual(s.tools, ["read", "grep", "progress"]);
+});
+
+// ---------- unreachable straggler quorum ----------
+
+test("a quorum that can no longer be reached still arms the cutoff", () => {
+	// Regression: with 5 reviewers, quorum is 4. In a real run 2 timed out, so
+	// the quorum became unreachable, the cutoff never armed, and the survivors
+	// each burned their full 355s timeout to a useless harvest.
+	assert.equal(stragglerQuorum(5), 4);
+	assert.deepEqual(shouldArmStragglerCutoff(5, 2, 2), { arm: true, reason: "impossible" });
+	// Still waiting while the quorum is genuinely reachable.
+	assert.deepEqual(shouldArmStragglerCutoff(5, 1, 1), { arm: false, reason: "wait" });
+	// Fires the normal way once the quorum is met.
+	assert.deepEqual(shouldArmStragglerCutoff(5, 4, 0), { arm: true, reason: "quorum" });
+	// A pool of ≤2 has an infinite quorum ("wait for everyone"), so a failure
+	// can never make it unreachable: its cutoff stays the plain timeout.
+	assert.equal(stragglerQuorum(2), Number.POSITIVE_INFINITY);
+	assert.deepEqual(shouldArmStragglerCutoff(2, 1, 1), { arm: false, reason: "wait" });
 });

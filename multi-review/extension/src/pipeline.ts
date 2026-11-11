@@ -43,10 +43,19 @@ export interface MultiReviewRunResult {
 /** Time-budget reserves for deadline-capped (headless) runs. */
 const MIN_PHASE_MS = 45_000;
 const GROUPING_RESERVE_MS = 30_000;
-const VERIFY_RESERVE_MS = 150_000;
 const FINAL_RESERVE_MS = 20_000;
 /** What checks leave the reviewers under a deadline: tool-using reviews typically take 2–5 minutes. */
 const REVIEW_RESERVE_MS = 180_000;
+/**
+ * The verify round's share of a headless budget. This is carved out of the
+ * REVIEW phase (`fit` below), so it is the number that decides how long the
+ * reviewers get. It was 150s, which on a 540s budget left reviewers 355s —
+ * less than a healthy pool needs — while the verify round it protected was
+ * itself clipped. With `verifiersPerFinding` at 1 and only unraised
+ * suspicions to check, a verify round is now a fraction of the review, so the
+ * reserve is a fraction of it too.
+ */
+export const VERIFY_RESERVE_MS = 75_000;
 
 /**
  * Shared entry point used by both `/multi-review` and the `multi_review` tool.
@@ -204,7 +213,11 @@ export async function runMultiReviewFromArgs(
 		const runOpts: ReviewerRunOptions = {
 			...(flags.quick
 				? { useTools: false, timeoutMs: cfg.reviewerTimeoutSec * 1000 }
-				: { ...reviewerRunOptions(cfg), minToolCalls: scaledMinToolCalls(cfg.minReviewToolCalls, whichChangedLines(target.diffText)) }),
+				: {
+					...reviewerRunOptions(cfg),
+					minToolCalls: scaledMinToolCalls(cfg.minReviewToolCalls, whichChangedLines(target.diffText)),
+					readMaxCharsBySpec: cfg.readMaxCharsByModel,
+				}),
 			cleanups,
 		};
 		trace = new ReviewTrace(runOptions.traceDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "multi-review-")), (lines) => progress.activity(lines));

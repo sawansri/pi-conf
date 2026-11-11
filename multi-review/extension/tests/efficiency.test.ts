@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { DEFAULTS, classifierTarget, dedupeTarget, scaledMinToolCalls } from "../src/config.ts";
+import { DEFAULTS, classifierTarget, dedupeTarget, readMaxCharsFor, scaledMinToolCalls } from "../src/config.ts";
 import { cacheHitRate } from "../src/cost.ts";
+import { applyCliFlags } from "../src/headless.ts";
 import { judgeOutputCap } from "../src/judge.ts";
 import { whichChangedLines } from "../src/pipeline.ts";
 import { capGrepOutput, capReadOutput, capToolResult } from "../src/tool-budget.ts";
@@ -202,6 +203,33 @@ test("a failing session still reports the tokens it was billed for", async () =>
 
 test("the read cap is on by default: fresh tool output is what a run pays for", () => {
 	assert.ok(DEFAULTS.readMaxChars > 0);
+	// The model that ranges widest gets a tighter cap than the pool default.
+	const kimi = readMaxCharsFor(DEFAULTS, "amd-gateway/Kimi-K3.1-Pro@high");
+	assert.ok(kimi > 0 && kimi < DEFAULTS.readMaxChars);
+	assert.equal(readMaxCharsFor(DEFAULTS, "amd-gateway-anthropic/Claude-Sonnet-5.5@high"), DEFAULTS.readMaxChars);
+});
+
+test("one verifier per finding by default: k=2 paid double for one verdict", () => {
+	// On a real run the second slot returned 0 verdicts for all 31 groups
+	// because both alternate verifiers timed out.
+	assert.equal(DEFAULTS.verifiersPerFinding, 1);
+});
+
+test("a per-model read cap overrides the pool default, ignoring @level and role suffixes", () => {
+	const cfg = {
+		...DEFAULTS,
+		readMaxChars: 24_000,
+		readMaxCharsByModel: { "p/kimi": 8_000 },
+	};
+	assert.equal(readMaxCharsFor(cfg, "p/kimi"), 8_000);
+	// The same model reviews, reviews a second pass, and verifies.
+	assert.equal(readMaxCharsFor(cfg, "p/kimi@high"), 8_000);
+	assert.equal(readMaxCharsFor(cfg, "p/kimi@high #2"), 8_000);
+	assert.equal(readMaxCharsFor(cfg, "p/kimi (verify)"), 8_000);
+	// Unlisted models keep the pool default.
+	assert.equal(readMaxCharsFor(cfg, "p/sonnet@high"), 24_000);
+	// 0 is a real value (disable the cap for this model), not "unset".
+	assert.equal(readMaxCharsFor({ ...cfg, readMaxCharsByModel: { "p/kimi": 0 } }, "p/kimi"), 0);
 });
 
 test("the tool-call floor shrinks with the diff but never below 2", () => {
@@ -253,4 +281,18 @@ test("the second-pass gate skips the pass below its threshold and keeps it at 0"
 	assert.equal(runs(0), true, "the default keeps the unconditional second pass");
 	assert.equal(runs(lines), true, "a diff exactly at the threshold still qualifies");
 	assert.equal(runs(lines + 1), false, "below the threshold the extra session is skipped");
+});
+
+test("--verify and --quick on the headless command line override the brief", () => {
+	// Regression: runHeadless read verify only from the brief, so
+	// `/multi-review-run --brief=b.json --verify` silently ran without
+	// verification -- the benchmark measured non-verify runs for a while.
+	const brief = { intent: "x" };
+	assert.deepEqual(applyCliFlags(brief, ""), { intent: "x" });
+	assert.equal(applyCliFlags(brief, "--verify").verify, true);
+	assert.equal(applyCliFlags(brief, "--quick").quick, true);
+	// Both compose, and a false brief is escalated by the flag.
+	const both = applyCliFlags({ ...brief, verify: false }, "--quick --verify");
+	assert.equal(both.quick, true);
+	assert.equal(both.verify, true);
 });

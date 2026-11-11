@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { type ParsedReviewArgs, parseValueFlag } from "./args.ts";
+import { type ParsedReviewArgs, parseBoolFlag, parseValueFlag } from "./args.ts";
 import { leadJudgmentInstructions } from "./lead.ts";
 import { TRANSIENT_REVIEWERS, runMultiReviewFromArgs } from "./pipeline.ts";
 import { normalizeAuthorFilter } from "./pr-comments.ts";
@@ -216,6 +216,22 @@ function announceRun(progressPath: string, cwd: string): void {
 	}
 }
 
+/**
+ * Apply the boolean run-shape flags given on the command line over a parsed
+ * brief. `--verify` / `--quick` are what a caller reaches for; everything else
+ * stays a brief field so the brief remains the record of what was asked.
+ */
+export function applyCliFlags(req: ReviewRequest, args: string): ReviewRequest {
+	const out: ReviewRequest = { ...req };
+	const verify = parseBoolFlag(args, "verify");
+	if (verify.present) out.verify = true;
+	const quick = parseBoolFlag(verify.rest, "quick");
+	if (quick.present) out.quick = true;
+	// Both compose, as they do on the slash command: a fast pass that still
+	// cross-checks.
+	return out;
+}
+
 export async function runHeadless(pi: ExtensionAPI, args: string, ctx: ExtensionContext): Promise<void> {
 	process.env.MULTI_REVIEW_DEBUG ||= "1";
 	const started = Date.now();
@@ -242,6 +258,10 @@ export async function runHeadless(pi: ExtensionAPI, args: string, ctx: Extension
 	const req = parseReviewRequest(raw);
 	if ("error" in req) return fail(`invalid brief: ${req.error}`);
 	if (!Number.isFinite(maxSeconds) || maxSeconds < 60) return fail("--max-seconds must be a number ≥ 60");
+	// Flags on the command line win over the brief, so a caller can escalate a
+	// saved brief (`--verify`) without rewriting it. The brief alone was the
+	// only source before, which meant `--verify` was silently ignored here.
+	const effectiveReq = applyCliFlags(req, args);
 	// The trace sits next to the result so the caller can watch the run live.
 	const traceDir = path.dirname(outPath);
 	console.error(`TRACE ${path.join(traceDir, "progress.json")} ${path.join(traceDir, "trace.jsonl")}`);
@@ -249,8 +269,8 @@ export async function runHeadless(pi: ExtensionAPI, args: string, ctx: Extension
 	let out: Awaited<ReturnType<typeof runAgentLedReview>>;
 	try {
 		out = await runAgentLedReview(
-			pi, ctx, req, undefined, undefined, started + maxSeconds * 1000,
-			req.socratic
+			pi, ctx, effectiveReq, undefined, undefined, started + maxSeconds * 1000,
+			effectiveReq.socratic
 				? `Full per-round Socratic transcript: ${outPath} → details.socratic.rounds`
 				: `Verbatim per-reviewer text, by issue id: ${outPath} → details.groups[].members`,
 			traceDir,

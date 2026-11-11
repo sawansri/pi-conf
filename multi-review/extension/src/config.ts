@@ -74,7 +74,13 @@ export interface MultiReviewConfig {
 	temperature: number;
 	/** Run the verification round by default (`--verify` per run). */
 	verify: boolean;
-	/** Independent verifiers per finding in the verification round. */
+	/**
+	 * Independent verifiers per finding in the verification round. 1 is the
+	 * default: on a real run where the pool was saturated, the second slot
+	 * returned zero verdicts for all 31 groups (both alternate verifiers timed
+	 * out), so k=2 cost double and delivered exactly the one verdict k=1 would
+	 * have. Raise it when the pool is healthy and false positives are costly.
+	 */
 	verifiersPerFinding: number;
 	/**
 	 * Models that never review, only verify: they join the verification
@@ -155,6 +161,14 @@ export interface MultiReviewConfig {
 	 * input 19% on the benchmark with no loss of findings.
 	 */
 	readMaxChars: number;
+	/**
+	 * Per-model overrides for `readMaxChars`, keyed by `provider/id` (the
+	 * `@level` suffix is ignored). A model that ranges over the tree and
+	 * re-reads files gets a tighter cap than the pool default; a model whose
+	 * value is precise slicing gets a looser one. Longest matching key wins,
+	 * so `"p/id"` and `"@high"` forms both work.
+	 */
+	readMaxCharsByModel: Record<string, number>;
 	/**
 	 * Send only the hunks a verifier needs (its findings' files' diff, plus
 	 * intent and requirements) instead of the whole reviewer brief; falls back
@@ -244,7 +258,7 @@ export const DEFAULTS: MultiReviewConfig = {
 	concurrency: 5,
 	temperature: 0.2,
 	verify: false,
-	verifiersPerFinding: 2,
+	verifiersPerFinding: 1,
 	verifyOnly: [],
 	// Sonnet: the best recall per second in the pool.
 	secondPass: ["amd-gateway-anthropic/Claude-Sonnet-5.5"],
@@ -274,17 +288,35 @@ export const DEFAULTS: MultiReviewConfig = {
 	verifierTimeoutSec: 180,
 	judgeMaxTokens: 8_000,
 	readMaxChars: 24_000,
+	// Kimi ranges over the tree: 194 tool calls against Sonnet's 64 in one real
+	// review, re-reading the same files up to 6 times. Same list price, 8x the
+	// bill, so its reads are capped harder than the pool default.
+	readMaxCharsByModel: { "amd-gateway/Kimi-K3.1-Pro": 12_000 },
 	verifyNarrowContext: false,
 	secondPassMinLines: 0,
 };
 
-export function reviewerRunOptions(cfg: MultiReviewConfig): ReviewerRunOptions {
+/**
+ * The read cap for one model: its own entry in `readMaxCharsByModel`, else the
+ * pool default. Keys are matched after stripping `@level`, so a single entry
+ * covers a model whether it reviews, reviews a second pass, or verifies.
+ */
+export function readMaxCharsFor(cfg: MultiReviewConfig, spec: string): number {
+	const bare = spec
+		.replace(/\s*\(verify\)$/, "")
+		.replace(/\s*#\d+$/, "")
+		.replace(/@[a-z]+$/, "");
+	const byModel = cfg.readMaxCharsByModel[bare];
+	return byModel === undefined ? cfg.readMaxChars : byModel;
+}
+
+export function reviewerRunOptions(cfg: MultiReviewConfig, spec?: string): ReviewerRunOptions {
 	return {
 		useTools: cfg.reviewerTools,
 		timeoutMs: cfg.reviewerTimeoutSec * 1000,
 		sandboxHomeDirs: cfg.sandboxHomeDirs,
 		minToolCalls: cfg.minReviewToolCalls,
-		readMaxChars: cfg.readMaxChars,
+		readMaxChars: spec === undefined ? cfg.readMaxChars : readMaxCharsFor(cfg, spec),
 	};
 }
 
@@ -397,6 +429,18 @@ export function loadConfig(): MultiReviewConfig {
 		}
 		if (typeof parsed.readMaxChars === "number" && parsed.readMaxChars >= 0 && parsed.readMaxChars <= 400_000) {
 			cachedConfig.readMaxChars = Math.floor(parsed.readMaxChars);
+		}
+		if (parsed.readMaxCharsByModel && typeof parsed.readMaxCharsByModel === "object" && !Array.isArray(parsed.readMaxCharsByModel)) {
+			const map: Record<string, number> = {};
+			for (const [key, value] of Object.entries(parsed.readMaxCharsByModel)) {
+				if (typeof key !== "string" || !key.trim()) continue;
+				if (typeof value !== "number" || value < 0 || value > 400_000) continue;
+				// Keys may be bare (`p/id`) or use one of the names formattedSpec
+				// produces (`p/id@high`, `p/id #2`, `p/id (verify)`); normalize to
+				// the bare provider/id so one entry covers a model's every run.
+				map[key.replace(/\s*#\d+$/, "").replace(/\s*\(verify\)$/, "").replace(/@[a-z]+$/, "").trim()] = Math.floor(value);
+			}
+			cachedConfig.readMaxCharsByModel = map;
 		}
 		if (typeof parsed.verifyNarrowContext === "boolean") cachedConfig.verifyNarrowContext = parsed.verifyNarrowContext;
 		if (typeof parsed.secondPassMinLines === "number" && parsed.secondPassMinLines >= 0) {
