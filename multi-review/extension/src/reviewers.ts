@@ -7,7 +7,8 @@ import { type ReviewerFinding, type ReviewerRunResult, parseReviewerJson } from 
 import { type ModelCallResult, callModel } from "./models.ts";
 import type { MultiReviewRunResult } from "./pipeline.ts";
 import { REVIEWER_REPRO_ADDENDUM, REVIEWER_TOOLS_ADDENDUM, SOCRATIC_TOOLS_ADDENDUM, VERIFIER_RUN_ADDENDUM, XREF_ADDENDUM, checksRecitation, modelAddendum } from "./prompts.ts";
-import type { SandboxExtras } from "./sandbox.ts";
+import { type SandboxExtras } from "./sandbox.ts";
+import { createBudgetedReadTools } from "./session-tools.ts";
 import { ReviewTrace, type ReviewerActivity } from "./trace.ts";
 import { abortable, lastTurnAssistantText, retryOnError } from "./util.ts";
 import { type WebSearchOptions, NO_WEB_ADDENDUM, createWebSearchTool, installNativeWebSearch, searchesNatively, webSearchAddendum, webSearchAvailable } from "./web-search.ts";
@@ -69,6 +70,8 @@ export interface AgenticExtras {
 	minToolCalls?: number;
 	/** Warn, then harvest, a straggling session; see deadline.ts. */
 	late?: LateSession;
+	/** Cap on one read/grep result's text; see tool-budget.ts. 0 = pi's default. */
+	readMaxChars?: number;
 }
 
 export interface ReviewerSession {
@@ -107,8 +110,7 @@ export async function createReviewerSession(
 	if (extras.xref) customTools.push(createXrefTool(extras.xref));
 	const ws = extras.webSearch;
 	const nativeSearch = searchesNatively(model, ws);
-	if (ws?.proxyModel && !nativeSearch) customTools.push(createWebSearchTool(ctx, ws.proxyModel));
-	const settingsManager = SettingsManager.inMemory({});
+	if (ws?.proxyModel && !nativeSearch) customTools.push(createWebSearchTool(ctx, ws.proxyModel));	const settingsManager = SettingsManager.inMemory({});
 	const resourceLoader = new DefaultResourceLoader({
 		cwd,
 		agentDir: getAgentDir(),
@@ -126,7 +128,7 @@ export async function createReviewerSession(
 		model,
 		thinkingLevel: thinking,
 		tools: ["read", "grep", "find", "ls", ...customTools.map((t) => t.name)],
-		customTools,
+		customTools: [...customTools, ...(extras.readMaxChars ? (createBudgetedReadTools(cwd, extras.readMaxChars) as never[]) : [])],
 		resourceLoader,
 		settingsManager,
 		sessionManager: SessionManager.inMemory(cwd),
@@ -143,17 +145,28 @@ export async function createReviewerSession(
 			const unwarn = armWarning(session, late, progressState, onEvent);
 			const statsBefore = session.getSessionStats();
 			const msgCountBefore = session.messages.length;
+			// Cache tokens belong in the delta: dropping them reports a long
+			// tool-using turn as tiny when most of it was a cached resend. Shared
+			// by the normal and harvested returns so neither path loses them.
+			const deltaUsage = (): ModelUsage => {
+				const after = session.getSessionStats();
+				const d = (k: "input" | "output" | "cacheRead" | "cacheWrite" | "total") =>
+					Math.max(0, (after.tokens[k] ?? 0) - (statsBefore.tokens[k] ?? 0));
+				return {
+					input: d("input"),
+					output: d("output"),
+					total: d("total"),
+					cost: Math.max(0, after.cost - statsBefore.cost),
+					cacheRead: d("cacheRead"),
+					cacheWrite: d("cacheWrite"),
+				};
+			};
 			const turnResult = (text: string): ModelCallResult => {
 				const statsAfter = session.getSessionStats();
 				return {
 					text,
 					stopReason: "stop",
-					usage: {
-						input: Math.max(0, statsAfter.tokens.input - statsBefore.tokens.input),
-						output: Math.max(0, statsAfter.tokens.output - statsBefore.tokens.output),
-						total: Math.max(0, statsAfter.tokens.total - statsBefore.tokens.total),
-						cost: Math.max(0, statsAfter.cost - statsBefore.cost),
-					},
+					usage: deltaUsage(),
 					toolCalls: Math.max(0, statsAfter.toolCalls - statsBefore.toolCalls),
 					durationMs: Date.now() - started,
 				};
@@ -188,12 +201,7 @@ export async function createReviewerSession(
 					text,
 					stopReason,
 					errorMessage,
-					usage: {
-						input: Math.max(0, statsAfter.tokens.input - statsBefore.tokens.input),
-						output: Math.max(0, statsAfter.tokens.output - statsBefore.tokens.output),
-						total: Math.max(0, statsAfter.tokens.total - statsBefore.tokens.total),
-						cost: Math.max(0, statsAfter.cost - statsBefore.cost),
-					},
+					usage: deltaUsage(),
 					toolCalls: Math.max(0, statsAfter.toolCalls - statsBefore.toolCalls),
 					durationMs: Date.now() - started,
 				};
@@ -300,7 +308,7 @@ async function runAgenticReviewer(
 		model,
 		thinkingLevel: thinking,
 		tools: ["read", "grep", "find", "ls", ...customTools.map((t) => t.name)],
-		customTools,
+		customTools: [...customTools, ...(extras.readMaxChars ? (createBudgetedReadTools(cwd, extras.readMaxChars) as never[]) : [])],
 		resourceLoader,
 		settingsManager,
 		sessionManager: SessionManager.inMemory(cwd),
@@ -439,6 +447,8 @@ export interface ReviewerRunOptions {
 	cleanups?: Array<() => void>;
 	/** Review phase only: see AgenticExtras.minToolCalls. */
 	minToolCalls?: number;
+	/** Cap on one read/grep result's text (tool-budget.ts); 0 = pi's default. */
+	readMaxChars?: number;
 	/** The fan-out's straggler cutoff; set by runAllReviewers. */
 	cutoff?: StragglerCutoff;
 	/** The session's name in the trace when not just its spec (a second pass's "#2"). */
@@ -478,6 +488,7 @@ export async function runReviewer(
 				webSearch: runOpts.webSearch,
 				minToolCalls: verifying ? undefined : runOpts.minToolCalls,
 				late: { deadline, userSignal: abortSignal, finalFormat: JSON_FINAL_FORMAT },
+				readMaxChars: runOpts.readMaxChars,
 			},
 		)
 		: callModel(ctx, model, systemPrompt + modelAddendum(model), userPrompt, {

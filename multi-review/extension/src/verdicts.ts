@@ -1,5 +1,6 @@
 import { normalizeEvidenceKind, parseJsonLenient, pickText } from "./findings.ts";
 import type { DedupeGroup, Verification } from "./grouping.ts";
+import { budgetDiff } from "./prompts.ts";
 import { formatRange } from "./util.ts";
 
 // The verify round's prompt and verdicts: pure, so tests can load them
@@ -23,6 +24,13 @@ Output ONLY a JSON array, one entry per finding:
 
 export function buildVerifyPrompt(basePrompt: string, groups: DedupeGroup[]): string {
 	const lines = [basePrompt, "", "## Findings to verify"];
+	appendVerifyFindings(lines, groups);
+	lines.push("Output ONLY the JSON array of verdicts per the system prompt.");
+	return lines.join("\n");
+}
+
+/** The findings section alone, so a narrow prompt can place the diff after it. */
+function appendVerifyFindings(lines: string[], groups: DedupeGroup[]): void {
 	for (const g of groups) {
 		if (g.category === "suspicion") {
 			lines.push(`### ${g.id} — unconfirmed hypothesis (no location given; find it yourself)`);
@@ -48,6 +56,74 @@ export function buildVerifyPrompt(basePrompt: string, groups: DedupeGroup[]): st
 		});
 		lines.push("");
 	}
+}
+
+/** One `diff --git` section of a unified diff, keyed by the b/ path. */
+export function splitDiffByFile(diffText: string): Map<string, string> {
+	const out = new Map<string, string>();
+	const parts = diffText.split(/^(?=diff --git )/m);
+	for (const part of parts) {
+		if (!part.startsWith("diff --git ")) continue;
+		// "diff --git a/x b/x": the b/ path survives renames, quoting stripped.
+		const m = part.match(/^diff --git a\/.+? b\/(.+?)\n/);
+		if (!m) continue;
+		const file = m[1].replace(/^"|"$/g, "");
+		out.set(file, part.endsWith("\n") ? part : `${part}\n`);
+	}
+	return out;
+}
+
+/**
+ * A verifier's prompt with only the hunks its assigned findings touch.
+ *
+ * The full reviewer brief re-sends the brief's spec, every context file and
+ * the whole (up to 200k character) diff to each verifier, and verification is
+ * often the second-biggest line item of a run. A verifier needs the intent
+ * and requirements to know what was promised, plus the diffs of the files its
+ * findings are in; it has read-only tools for anything else.
+ *
+ * Returns undefined when no diff is available, so the caller keeps the full
+ * brief: a file-level or free-text review has nothing narrower to offer.
+ */
+export function buildNarrowVerifyPrompt(
+	target: { diffText: string; focusHint?: string },
+	brief: { intent: string; requirements: string[]; spec?: { path: string; text: string } } | undefined,
+	groups: DedupeGroup[],
+): string | undefined {
+	if (!target.diffText.trim()) return undefined;
+	const lines: string[] = [];
+	if (brief?.intent) {
+		lines.push("## Intent (from the author)", brief.intent, "");
+	}
+	// A "spec" finding is judged against the spec, so it has to travel; the
+	// brief's spec is the source of truth and may exist only here.
+	const specNeeded = Boolean(brief?.spec) && groups.some((g) => g.category === "spec" || g.category === "spec-gap");
+	if (specNeeded && brief?.spec) {
+		lines.push(`## Spec — source of truth (${brief.spec.path})`, brief.spec.text, "");
+	}
+	if (brief && brief.requirements.length > 0) {
+		lines.push("## Requirements to verify");
+		brief.requirements.forEach((r, i) => lines.push(`${i + 1}. ${r}`));
+		lines.push("");
+	}
+	if (target.focusHint?.trim()) lines.push("## Focus", target.focusHint.trim(), "");
+	lines.push("## Findings to verify");
+	appendVerifyFindings(lines, groups);
+
+	// Only the files the assigned findings name. A hypothesis with no file
+	// gets the whole diff, since it could be anywhere.
+	const byFile = splitDiffByFile(target.diffText);
+	const wanted = [...new Set(groups.map((g) => g.file).filter(Boolean))];
+	const anywhere = groups.some((g) => g.category === "suspicion" || !g.file);
+	if (anywhere || wanted.some((f) => !byFile.has(f))) {
+		// Same budget as the reviewer prompt: a wide fallback must not be the
+		// one path that can overflow a verifier's context window.
+		lines.push("## Diff under review", budgetDiff(target.diffText), "");
+	} else if (wanted.length > 0) {
+		lines.push("## Diff for the files under discussion");
+		for (const f of wanted) lines.push(byFile.get(f)!);
+	}
+	lines.push("Use your read/grep tools for the surrounding code, callers and tests.");
 	lines.push("Output ONLY the JSON array of verdicts per the system prompt.");
 	return lines.join("\n");
 }

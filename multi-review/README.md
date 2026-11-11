@@ -800,9 +800,78 @@ Prices come from `models.json`, which mirrors the AMD gateway catalog
 `cost_per_1m_output_tokens`). The gateway's billed `total_cost` matches
 those rates exactly, so the reported figure is what was actually charged.
 A model with no `cost` entry reports `$0`; token counts stay accurate.
-Cache reads and writes are tracked separately because they bill at
-fractions of fresh input and dominate long runs — a run's price is not
-derivable from input+output alone.
+
+### What a run actually spends it on
+
+Measured over 16 real runs (a 52-changed-line, 7-file fixture with 10
+planted defects, the default four-reviewer pool):
+
+| Component | Share of the bill |
+|---|---|
+| **Output tokens** (thinking + findings JSON + tool-call args) | **44–67%** |
+| Fresh (uncached) input | the rest |
+| Cache reads and cache writes | **$0** — billed free on this gateway |
+| Grouping call (Opus → Haiku) | 2% → 0.05% |
+
+Two consequences, both counter-intuitive:
+
+- **Prompt size is nearly free; output is not.** The gateway caches
+  automatically (`cached_tokens` came back populated for every model tried,
+  with no cache key sent) and bills both cache reads and cache writes at $0
+  on the catalog's `cacheRead: 0`/`cacheWrite: 0`. A reviewer's prompt grows
+  to ~1M cumulative tokens over a 26-turn session and costs nothing for it.
+  So effort spent shrinking prompts — dropping the diff from a verify
+  prompt, capping tool output — buys latency and context headroom, not
+  dollars. Cutting *thinking* and *tool-call count* is what cuts the bill.
+- **`--verify` roughly doubles a run** ($0.63–0.83 against $0.52–0.67
+  without), because it adds four more tool-using sessions, each with its own
+  output tokens. The verify round re-sends the brief, but re-sending is
+  free; the sessions' thinking is not.
+
+Run-to-run variance is large: cost ranged $0.52–$0.83 on the *same* code, a
+coefficient of variation near 50%. An A/B on whole-run totals therefore needs
+~50 runs per arm to resolve a 15% effect, which is why the levers below are
+argued from per-call token arithmetic (`tests/bench/lever-cost.ts`) rather
+than from a handful of runs. Recall on the planted defects stayed 10/10
+across every variant tried.
+
+What the controlled A/B (3–4 runs per arm, same fixture, parallel) showed for
+everything shipped together: **mean $0.6537 → $0.6446 (−1.4%), median
++0.9%** — i.e. no measurable change in total, with the spread narrowing
+(sd/mean 20% → 12%). That is the honest result: only the grouping swap is
+deterministically cheaper (2.0% → 0.05% of a run); the rest either trade
+prompt size (free) for tool calls (billed), or move a fraction that the
+variance swallows. The value that *is* certain is behavioral: the cost line
+now reports cache tokens correctly, and the review states what was skipped
+and why.
+
+One operational finding from running the benchmark: 8 concurrent reviews
+against the gateway returned `402 — prepaid credits required` for one of
+them, i.e. the failure is a rate/credit limit rather than a pipeline bug. A
+run that hits it fails loudly with the provider message in `run.log`; there
+is no retry-and-resume, so the work is lost.
+
+### Efficiency levers
+
+`tests/bench/` holds the harness that produced the numbers above
+(`fixture-setup.sh` builds the fixture: a committed baseline with a
+known-defect patch in the working tree):
+`run.sh` does a real headless review of a fixture with planted defects and
+prints cost and recall; `lever-cost.ts` reprices one run's tokens under each
+lever; `prompt-size.ts` counts the exact characters each kind of prompt
+sends; `cache-probe.ts` asks the gateway what it reports for a repeated
+prompt.
+
+What each lever is actually worth:
+
+| Lever | Effect | Verdict |
+|---|---|---|
+| `dedupeDefaultModel` → Haiku | 2.0% → 0.05% of a run, exactly | **Keep.** Free, validated the same way |
+| `judgeMaxTokens` | bounds judge output; scales up with the finding count so a large review is not truncated | Keep. Opus 5.5 uses adaptive thinking, so this does *not* shrink its thinking budget — only the output ceiling |
+| `verifierThinking: "low"` | acts on the verify round's output (~9% of a run) | Worth trying; needs ~14 runs to confirm |
+| `secondPassMinLines` | a second pass is ~10% of a run | Set it above your typical diff unless you want the recall |
+| `readMaxChars` | shrinks prompts, which are already free | **Latency/headroom only**; costs money if it makes reviewers re-read |
+| `verifyNarrowContext` | cuts ~70% of the verify prompt — but those tokens are free | **Measured +18% cost** on real runs: without the diff in hand, verifiers ran 1.5–2x more tool calls, and tool-call output is billed. Off by default; turn it on when the brief strains a verifier's context window, not to save money |
 
 ## Defaults file
 
@@ -837,6 +906,13 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
   "checkTimeoutSec": 120,
   "autoChecks": true,
   "minReviewToolCalls": 10,
+  "dedupeDefaultModel": "amd-gateway-anthropic/Claude-Haiku-5.5",
+  "verifierThinking": null,
+  "verifierTimeoutSec": 180,
+  "judgeMaxTokens": 8000,
+  "readMaxChars": 0,
+  "verifyNarrowContext": false,
+  "secondPassMinLines": 0,
   "webSearch": true,
   "webSearchProxyModel": "amd-gateway-anthropic/Claude-Haiku-5.5",
   "webSearchNativeApis": ["anthropic-messages"],
@@ -844,6 +920,19 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
 }
 ```
 
+`dedupeDefaultModel` is who groups findings when `dedupeModel` is unset
+(default Haiku 5.5: clustering is semantic bookkeeping, not discovery, and the
+answer is validated into a partition either way). `null` restores the old
+behaviour of grouping on the judge.
+`verifierThinking` overrides every verifier's thinking level (`null` keeps each
+model's own). `verifierTimeoutSec` is the verify round's own limit, separate
+from `reviewerTimeoutSec`, since verifying is a fraction of the work.
+`judgeMaxTokens` caps the judge's output; 0 uses pi's default.
+`readMaxChars` caps one `read`/`grep` result in a reviewer session; 0 keeps pi's
+2000-line/50KB default. `verifyNarrowContext` sends each verifier only the diff
+hunks of the files its findings name, plus intent and requirements, instead of
+the whole brief (off by default: see [Cost](#cost)). `secondPassMinLines` runs a `secondPass` model only when the
+diff has at least that many changed lines (0 always runs it).
 `reviewerTools: false` makes reviewers single completions (faster, diff-only).
 `sandbox`, `checkTimeoutSec`, `autoChecks`, `minReviewToolCalls` and
 `sandboxHomeDirs` are described under

@@ -276,6 +276,7 @@ export async function runSocraticDiscussion(
 			sandboxExtras: runOpts.sandboxExtras,
 			xref: runOpts.xref,
 			webSearch: runOpts.webSearch,
+			readMaxChars: runOpts.readMaxChars,
 		});
 		sessions[idx] = sess;
 		return sess;
@@ -546,6 +547,8 @@ export async function runSocraticJudge(
 	abortSignal: AbortSignal | undefined,
 	temperature: number,
 	thinking: ThinkingLevelAlias,
+	/** Output cap; see runJudge. */
+	maxTokens?: number,
 ): Promise<JudgeResult> {
 	const transcript = synthesizeSocraticLeadView(target, socratic, "transcript");
 	const call = await callModel(
@@ -553,7 +556,7 @@ export async function runSocraticJudge(
 		judgeModel,
 		SOCRATIC_JUDGE_SYSTEM_PROMPT,
 		`${transcript}\n\nNow produce the moderator synthesis per the system prompt. Output ONLY markdown.`,
-		{ thinking, temperature, signal: abortSignal },
+		{ thinking, temperature, signal: abortSignal, ...(maxTokens && maxTokens > 0 ? { maxTokens } : {}) },
 	);
 	const truncated = call.stopReason === "length";
 	return {

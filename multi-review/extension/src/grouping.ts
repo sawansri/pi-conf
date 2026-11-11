@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { type Model, type ModelSpec, type MultiReviewConfig, type ThinkingLevelAlias, parseReviewerSpec } from "./config.ts";
+import { type Model, type ModelSpec, type MultiReviewConfig, type ThinkingLevelAlias, dedupeTarget, parseReviewerSpec } from "./config.ts";
 import type { EvidenceKind, FindingParts, ReviewerFinding, ReviewerRunResult } from "./findings.ts";
 import type { ModelUsage } from "./cost.ts";
 import { callModel, findModel } from "./models.ts";
@@ -361,8 +361,9 @@ export async function groupFindings(
 		const groups = dedupeReviewerFindings(results);
 		return { groups, matches: new Map(hidden.map((h) => [h.key, matchSuspicionLexically(h.text, groups)])) };
 	};
-	if (cfg.dedupeModel === "lexical") return lexical();
-	const parsedSpec = parseReviewerSpec(cfg.dedupeModel ?? cfg.judge, "low");
+	const target = dedupeTarget(cfg);
+	if (!target) return lexical();
+	const parsedSpec = parseReviewerSpec(target, "low");
 	const model = parsedSpec ? findModel(ctx, parsedSpec.spec) : null;
 	if (!parsedSpec || !model) return lexical();
 	progress?.update({ phase: `grouping findings (${shortSpec(parsedSpec.spec)})`, done: undefined, total: undefined });

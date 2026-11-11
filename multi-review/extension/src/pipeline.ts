@@ -5,7 +5,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { type ParsedReviewArgs, parseAuthorFlags, parseBoolFlag, parseReviewArgs, parseReviewFlags, parseSocraticFlags, parseValueFlag } from "./args.ts";
 import { type BriefInput, buildBrief, hasBriefInput, readSpecFile } from "./brief.ts";
 import { CXX_FILE, cxxAutoCheck, runChecks } from "./checks.ts";
-import { type Model, type ModelSpec, type MultiReviewConfig, type ReviewFlags, type ReviewerSpec, describeFlags, loadConfig, parseReviewerSpec, reviewerRunOptions } from "./config.ts";
+import { type Model, type ModelSpec, type MultiReviewConfig, type ReviewFlags, type ReviewerSpec, dedupeTarget, describeFlags, loadConfig, parseReviewerSpec, reviewerRunOptions, scaledMinToolCalls } from "./config.ts";
 import { type RunCost, addUsage, emptyRunCost, formatRunCost, runCostLine } from "./cost.ts";
 import { type HiddenClaim, type SuspicionResult, groupFindings } from "./grouping.ts";
 import { type JudgeResult, runJudge } from "./judge.ts";
@@ -21,6 +21,7 @@ import { readOutcomes, trackRecordLines } from "./outcomes.ts";
 import { prClaimAsGroup, prCommentsMarkdown, suspicionAsGroup, suspicionMarkdown, synthesizeLeadView, synthesizeMarkdownFromGroups, synthesizeNoFindingsMarkdown } from "./synthesis.ts";
 import { type ReviewTarget, buildReviewTarget, exec, preparePrCheckout } from "./target.ts";
 import { ReviewTrace } from "./trace.ts";
+import { buildNarrowVerifyPrompt } from "./verdicts.ts";
 import { runVerification } from "./verify.ts";
 import { createXrefService } from "./xref.ts";
 
@@ -201,7 +202,9 @@ export async function runMultiReviewFromArgs(
 			target.focusHint = target.focusHint ? `${target.focusHint}\n\n${runOptions.focus.trim()}` : runOptions.focus.trim();
 		}
 		const runOpts: ReviewerRunOptions = {
-			...(flags.quick ? { useTools: false, timeoutMs: cfg.reviewerTimeoutSec * 1000 } : reviewerRunOptions(cfg)),
+			...(flags.quick
+				? { useTools: false, timeoutMs: cfg.reviewerTimeoutSec * 1000 }
+				: { ...reviewerRunOptions(cfg), minToolCalls: scaledMinToolCalls(cfg.minReviewToolCalls, whichChangedLines(target.diffText)) }),
 			cleanups,
 		};
 		trace = new ReviewTrace(runOptions.traceDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "multi-review-")), (lines) => progress.activity(lines));
@@ -318,6 +321,19 @@ export async function runMultiReviewFromArgs(
 		for (const cleanup of cleanups) cleanup();
 		await cleanupCheckout?.();
 	}
+}
+
+/**
+ * Changed lines in a unified diff: added/removed lines plus hunk headers
+ * (a hunk header means a region moved even with no added or removed line).
+ * Cheap context for the second-pass gate; the diff is already in memory.
+ */
+export function whichChangedLines(diffText: string): number {
+	let n = 0;
+	for (const l of diffText.split("\n")) {
+		if (l.startsWith("@@") || /^[+-][^+-]/.test(l)) n++;
+	}
+	return n;
 }
 
 function stripUndefined<T extends object>(o: T): Partial<T> {
@@ -447,7 +463,7 @@ async function runSocraticPipeline(
 		markdown = synthesizeSocraticLeadView(target, socratic, `${label} · you moderate`, detailHint);
 	} else if (judge) {
 		progress.update({ phase: `synthesizing discussion (${shortSpec(cfg.judge)})`, done: undefined, total: undefined });
-		const jr = await runSocraticJudge(judge, socratic, target, ctx, signal, cfg.temperature, cfg.judgeThinking);
+		const jr = await runSocraticJudge(judge, socratic, target, ctx, signal, cfg.temperature, cfg.judgeThinking, cfg.judgeMaxTokens);
 		throwIfAborted(signal);
 		judgeLabel = cfg.judge;
 		judgeDurationMs = jr.durationMs;
@@ -544,7 +560,20 @@ async function runReviewPipeline(
 	// secondPass models review twice, the second time with the diff's files
 	// reversed. Quick runs (single completions) keep one pass each.
 	const twice = new Set(cfg.secondPass.map((raw) => parseReviewerSpec(raw)?.spec));
-	const passes = flags.quick ? rows : [...rows, ...rows.filter((r) => twice.has(r.rs.spec)).map((r) => ({ ...r, pass: 2 }))];
+	// A second pass costs a whole extra session, and its reversed diff shares
+	// no prompt cache with pass 1. On a short diff it is nearly the same
+	// prompt too, so it mostly re-derives the same findings. `secondPassMinLines`
+	// (default 0 = always run) gates it on changed-line count, which is known
+	// before the fan-out.
+	const changedLines = whichChangedLines(target.diffText);
+	const secondPassRuns = (spec: string): boolean => twice.has(spec) && changedLines >= cfg.secondPassMinLines;
+	const skippedSecondPass = flags.quick ? [] : rows.filter((r) => twice.has(r.rs.spec) && !secondPassRuns(r.rs.spec)).map((r) => r.rs.spec);
+	const passes = flags.quick ? rows : [...rows, ...rows.filter((r) => secondPassRuns(r.rs.spec)).map((r) => ({ ...r, pass: 2 }))];
+	if (skippedSecondPass.length > 0) {
+		target.metaLines.push(
+			`(second pass skipped for ${skippedSecondPass.join(", ")}: ${changedLines} changed lines < secondPassMinLines=${cfg.secondPassMinLines})`,
+		);
+	}
 	const reversedPrompt = passes.length > rows.length ? buildReviewUserPrompt(target, { reverseFiles: true }) : userPrompt;
 	progress.update({ phase: `fanning out to ${passes.length} reviewers (cap ${cfg.concurrency})`, done: 0, total: passes.length });
 	const runs = await runAllReviewers(
@@ -574,7 +603,7 @@ async function runReviewPipeline(
 		...prClaims.map((c, i) => ({ key: `P:${i}`, label: `PR comment by @${c.author}`, text: `${c.path ? `${c.path}: ` : ""}${c.claim}` })),
 	];
 	const { groups, matches, usage: groupingUsage } = await groupFindings(ctx, cfg, runs, signal, progress, hidden);
-	addUsage(cost, cfg.dedupeModel === "lexical" ? "grouping (lexical)" : (cfg.dedupeModel ?? cfg.judge), groupingUsage);
+	addUsage(cost, dedupeTarget(cfg) ?? "grouping (lexical)", groupingUsage);
 	// Grouping and judge calls turn an abort into an error + fallback; a
 	// cancelled run must stop here, not publish a fallback review.
 	throwIfAborted(signal);
@@ -599,7 +628,13 @@ async function runReviewPipeline(
 		// One row per model: a duplicate would count as two independent verifiers.
 		const verifierPool = [...rows, ...verifierRows].filter((r, i, all) => all.findIndex((o) => o.rs.spec === r.rs.spec) === i);
 		if (sandboxReason && cfg.sandbox && !flags.quick && runOpts.useTools) target.warnings.push(`verifiers can't execute code: ${sandboxReason}`);
-		const { failures, runs: verifierRuns } = await runVerification(ctx, cfg, verifierPool, toVerify, userPrompt, { ...fit(runOpts, FINAL_RESERVE_MS), sandbox: sandboxReason === null, sandboxExtras }, signal, progress);
+		const { failures, runs: verifierRuns } = await runVerification(
+			ctx, cfg, verifierPool, toVerify, userPrompt,
+			{ ...fit(runOpts, FINAL_RESERVE_MS), sandbox: sandboxReason === null, sandboxExtras },
+			signal, progress,
+			// A verifier needs its findings' files, not every file in the change.
+			(assigned) => buildNarrowVerifyPrompt(target, target.brief, assigned),
+		);
 		for (const r of verifierRuns) addUsage(cost, `${r.spec} (verify)`, r.usage);
 		for (const f of failures) target.warnings.push(`verifier failed (its claims stay unverified): ${f}`);
 		suspicionGroups.forEach((g, i) => {
@@ -624,7 +659,7 @@ async function runReviewPipeline(
 		markdown = synthesizeNoFindingsMarkdown(target, runs, label);
 	} else if (judge) {
 		progress.update({ phase: `${groups.length} groups · invoking judge ${shortSpec(cfg.judge)}`, done: undefined, total: undefined });
-		const jr = await runJudge(judge, groups, target, runs.filter((r) => !r.ok).map((r) => r.spec), ctx, signal, cfg.temperature, cfg.judgeThinking);
+		const jr = await runJudge(judge, groups, target, runs.filter((r) => !r.ok).map((r) => r.spec), ctx, signal, cfg.temperature, cfg.judgeThinking, cfg.judgeMaxTokens);
 		throwIfAborted(signal);
 		judgeLabel = cfg.judge;
 		judgeDurationMs = jr.durationMs;

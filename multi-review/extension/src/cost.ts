@@ -21,6 +21,18 @@ export interface ModelUsage {
 	cacheWrite?: number;
 }
 
+/**
+ * Share of the prompt billed as a cache read, 0–1. Undefined when the
+ * provider reported no cache activity at all (nothing to say).
+ */
+export function cacheHitRate(usage: ModelUsage): number | undefined {
+	const read = usage.cacheRead ?? 0;
+	const write = usage.cacheWrite ?? 0;
+	const prompt = usage.input + read + write;
+	if (prompt === 0 || read + write === 0) return undefined;
+	return read / prompt;
+}
+
 export const EMPTY_USAGE: ModelUsage = { input: 0, output: 0, total: 0, cost: 0, cacheRead: 0, cacheWrite: 0 };
 
 /** Running total, optionally split per model spec. */
@@ -104,7 +116,10 @@ export function formatRunCost(run: RunCost): string {
 	const write = u.cacheWrite ?? 0;
 	// Cache tokens are billed separately and dominate long runs, so they get
 	// their own slot rather than being folded into the input count.
-	const cache = read + write > 0 ? `, ${formatTokens(read)} cached${write > 0 ? ` + ${formatTokens(write)} written` : ""}` : "";
+	const hit = cacheHitRate(u);
+	const cache = read + write > 0
+		? `, ${formatTokens(read)} cached${write > 0 ? ` + ${formatTokens(write)} written` : ""}${hit === undefined ? "" : ` (${Math.round(hit * 100)}% of prompt)`}`
+		: "";
 	return `${formatCost(u.cost)} · ${formatTokens(u.input)} in / ${formatTokens(u.output)} out${cache} across ${run.calls} call${run.calls === 1 ? "" : "s"}`;
 }
 

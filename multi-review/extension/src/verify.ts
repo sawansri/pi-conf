@@ -46,6 +46,8 @@ export async function runVerification(
 	runOpts: ReviewerRunOptions,
 	signal: AbortSignal | undefined,
 	progress?: MultiReviewProgressReporter,
+	/** Narrow prompt per verifier's assignments (see buildNarrowVerifyPrompt); unset = whole brief. */
+	narrowPrompt?: (assigned: DedupeGroup[]) => string | undefined,
 ): Promise<{ failures: string[]; runs: Array<{ spec: string; usage?: ModelUsage }> }> {
 	// Every reviewer can verify — including ones whose own review failed:
 	// having raised nothing, they're the most independent checkers. `rows`
@@ -54,16 +56,28 @@ export async function runVerification(
 	const assignments = [...assignVerifiers(groups, pool, cfg.verifiersPerFinding)];
 	const byId = new Map(groups.map((g) => [g.id, g]));
 	const failures: string[] = [];
-	// Verification re-sends the whole brief to every verifier, so it is often
-	// the second-biggest line item; its usage has to reach the run total.
+	// Verification re-sends the brief to every verifier, so it is often the
+	// second-biggest line item; its usage has to reach the run total.
 	const runs: Array<{ spec: string; usage?: ModelUsage }> = [];
+	// Verifying is confirm/refute against code the reviewer already read, so it
+	// gets its own (shorter) timeout and, when configured, a lower thinking
+	// level than the pool reviews at. `Math.min` keeps a headless run's
+	// deadline-shrunk timeout authoritative: verifying must never be allowed
+	// more time than the phase it is part of has left.
+	const verifyOpts: ReviewerRunOptions = {
+		...runOpts,
+		tracePhase: "verify",
+		timeoutMs: Math.min(runOpts.timeoutMs, cfg.verifierTimeoutSec * 1000),
+	};
 	let done = 0;
 	progress?.update({ phase: "verifying findings", done: 0, total: assignments.length });
 	await mapWithConcurrency(assignments, cfg.concurrency, async ([spec, ids]) => {
 		const row = rows.find((r) => r.rs.spec === spec);
 		if (!row) return;
 		const assigned = ids.map((id) => byId.get(id)!).filter(Boolean);
-		const run = await runReviewer(row.model, row.rs, ctx, VERIFY_SYSTEM_PROMPT, buildVerifyPrompt(basePrompt, assigned), cfg.temperature, signal, { ...runOpts, tracePhase: "verify" }, () => []);
+		const rs: ReviewerSpec = cfg.verifierThinking ? { ...row.rs, thinking: cfg.verifierThinking } : row.rs;
+		const prompt = (cfg.verifyNarrowContext ? narrowPrompt?.(assigned) : undefined) ?? buildVerifyPrompt(basePrompt, assigned);
+		const run = await runReviewer(row.model, rs, ctx, VERIFY_SYSTEM_PROMPT, prompt, cfg.temperature, signal, verifyOpts, () => []);
 		let verdicts = new Map<string, Omit<Verification, "spec">>();
 		let error = run.errorMessage;
 		if (!error) {
@@ -74,7 +88,7 @@ export async function runVerification(
 			}
 		}
 		runs.push({ spec: row.rs.spec, usage: run.usage });
-		if (error) failures.push(`${formatReviewerSpec(row.rs)}: ${error.slice(0, 160)}`);
+		if (error) failures.push(`${formatReviewerSpec(rs)}: ${error.slice(0, 160)}`);
 		for (const [id, v] of verdicts) {
 			const g = byId.get(id)!;
 			(g.verifications ??= []).push({ spec, ...v });
@@ -85,7 +99,7 @@ export async function runVerification(
 			phase: "verifying findings",
 			done,
 			total: assignments.length,
-			latest: `${error ? "✗" : "✓"} ${shortSpec(formatReviewerSpec(row.rs))} verified ${verdicts.size}/${ids.length}` +
+			latest: `${error ? "✗" : "✓"} ${shortSpec(formatReviewerSpec(rs))} verified ${verdicts.size}/${ids.length}` +
 				(error ? ` — ${error.slice(0, 80)}` : ` (${Object.entries(tally).map(([k, n]) => `${n} ${k}`).join(", ")})`) +
 				`, ${(run.durationMs / 1000).toFixed(1)}s`,
 		});

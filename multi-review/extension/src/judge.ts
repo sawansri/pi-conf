@@ -51,6 +51,21 @@ Rules:
 - Use file paths exactly as given — do not rewrite to absolute paths.
 - Severity ladder is critical > high > medium > low > info > none.`;
 
+/**
+ * The judge's output cap for a run with `groups` findings.
+ *
+ * The configured cap is meant to stop an unbounded output budget, not to
+ * truncate a real review: each finding takes roughly 120 tokens of markdown
+ * plus the summary and side effects, and reasoning is spent against the same
+ * ceiling. So the cap grows with the finding count and never falls below the
+ * configured value. Truncation still falls back to the deterministic
+ * synthesis rather than publishing a partial review.
+ */
+export function judgeOutputCap(configured: number, groups: number): number | undefined {
+	if (!configured || configured <= 0) return undefined;
+	return Math.max(configured, Math.ceil(groups * 200 + 3_000));
+}
+
 export interface JudgeResult {
 	markdown: string;
 	stopReason: string;
@@ -131,13 +146,22 @@ export async function runJudge(
 	abortSignal: AbortSignal | undefined,
 	temperature: number,
 	thinking: ThinkingLevelAlias,
+	/** Output cap; a synthesis is a few thousand tokens, and providers derive
+	 * the thinking budget from it, so an unset cap pays for unused reasoning. */
+	maxTokens?: number,
 ): Promise<JudgeResult> {
 	const groupsPayload = renderGroupsForJudge(target, groups);
 	const coverage = failedSpecs.length > 0
 		? `, missing: ${failedSpecs.join(", ")}`
 		: "";
 	const userPrompt = `${groupsPayload}\n\n## Coverage notes\nReviewers that didn't return usable output: ${failedSpecs.length}${coverage}\n\nNow produce the markdown per the schema in the system prompt. Output ONLY markdown — no preamble, no "Here's the review:" opener.`;
-	const call = await callModel(ctx, judgeModel, JUDGE_SYSTEM_PROMPT, userPrompt, { thinking, temperature, signal: abortSignal });
+	const cap = judgeOutputCap(maxTokens ?? 0, groups.length);
+	const call = await callModel(ctx, judgeModel, JUDGE_SYSTEM_PROMPT, userPrompt, {
+		thinking,
+		temperature,
+		signal: abortSignal,
+		...(cap ? { maxTokens: cap } : {}),
+	});
 	// A judge cut off at maxTokens drops findings silently; fall back to the
 	// deterministic synthesis rather than publish a partial review.
 	const truncated = call.stopReason === "length";

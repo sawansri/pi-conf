@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { type MultiReviewConfig, parseReviewerSpec } from "./config.ts";
+import { type MultiReviewConfig, classifierTarget, parseReviewerSpec } from "./config.ts";
 import { parseJsonLenient } from "./findings.ts";
 import type { Verification } from "./grouping.ts";
 import { callModel, findModel } from "./models.ts";
@@ -253,7 +253,7 @@ export async function classifyPrComments(
 ): Promise<Omit<PrCommentsReport, "stats"> & { skippedNits: number; noise: number; error?: string }> {
 	const empty = { claims: [], others: [], skippedNits: 0, noise: 0 };
 	if (items.length === 0) return empty;
-	const parsedSpec = parseReviewerSpec(cfg.dedupeModel && cfg.dedupeModel !== "lexical" ? cfg.dedupeModel : cfg.judge, "low");
+	const parsedSpec = parseReviewerSpec(classifierTarget(cfg), "low");
 	const model = parsedSpec ? findModel(ctx, parsedSpec.spec) : null;
 	if (!parsedSpec || !model) return { ...empty, error: "no model available to classify PR comments" };
 	const listing = items.map((it) => [

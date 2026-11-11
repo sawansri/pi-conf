@@ -171,6 +171,12 @@ export async function callModel(
 					output: response.usage.output,
 					total: response.usage.totalTokens,
 					cost: response.usage.cost?.total ?? 0,
+					// Cached tokens are part of what the provider reported. Dropping
+					// them here would hide cache activity for every single-completion
+					// call (judge, grouping, PR classification, all of --quick) and
+					// make the run's cache figure and hit rate wrong.
+					cacheRead: response.usage.cacheRead ?? 0,
+					cacheWrite: response.usage.cacheWrite ?? 0,
 				}
 				: undefined,
 			durationMs: Date.now() - started,

@@ -108,7 +108,10 @@ export interface MultiReviewConfig {
 	autoChecks: boolean;
 	/**
 	 * A reviewer answering [] after fewer tool calls than this (progress
-	 * calls excluded) is nudged once to keep looking. 0 disables.
+	 * calls excluded) is nudged once to keep looking. 0 disables. Scaled down
+	 * for small diffs (see scaledMinToolCalls): a 20-line change has nothing to
+	 * investigate for ten tool calls, and the nudge then costs a whole extra
+	 * turn on every reviewer.
 	 */
 	minReviewToolCalls: number;
 	/** Reviewers and verifiers may search the web (sparingly; see web-search.ts). */
@@ -118,10 +121,53 @@ export interface MultiReviewConfig {
 	/** Model APIs that search natively on this gateway; other models use the proxy. */
 	webSearchNativeApis: string[];
 	/**
-	 * Model (`provider/id[@level]`) that groups findings into issues; defaults
-	 * to the judge at low thinking. "lexical" skips the model call.
+	 * Model (`provider/id[@level]`) that groups findings into issues. Defaults
+	 * to `dedupeDefaultModel` (a cheap model: clustering is not discovery).
+	 * "lexical" skips the model call.
 	 */
 	dedupeModel?: string;
+	/** Who groups findings when `dedupeModel` is unset; null keeps the old behaviour (the judge). */
+	dedupeDefaultModel?: string | null;
+	/**
+	 * Thinking level verifiers run at, overriding their spec's level. Verifying
+	 * is confirm/refute against code the reviewer already read; the pool's
+	 * benchmark found raising reasoning bought nothing but latency. null keeps
+	 * each verifier's own level.
+	 */
+	verifierThinking?: ThinkingLevelAlias | null;
+	/**
+	 * Wall-clock limit for one verifier session. Always applied as
+	 * `min(this, reviewerTimeoutSec)` and further shrunk by a headless run's
+	 * deadline, so raising it above `reviewerTimeoutSec` has no effect.
+	 */
+	verifierTimeoutSec: number;
+	/** Output-token cap for the judge (its synthesis is a few thousand tokens); 0 = pi's default. */
+	judgeMaxTokens: number;
+	/**
+	 * Cap on a single tool result's size in reviewer/verifier sessions, in
+	 * characters. Every byte stays in the session's history and is re-sent on
+	 * every later turn, so a long tool-using review amplifies it ~10x. 0
+	 * leaves pi's default (50KB) in place.
+	 */
+	readMaxChars: number;
+	/**
+	 * Send only the hunks a verifier needs (its findings' files' diff, plus
+	 * intent and requirements) instead of the whole reviewer brief; falls back
+	 * to the full brief when no diff is available.
+	 *
+	 * Off by default because prompt size is not what costs money here: the
+	 * gateway bills cache reads and writes at $0, so the full brief re-sent to
+	 * every verifier is nearly free, while a verifier that is missing the diff
+	 * runs 1.5-2x more tool calls and those calls' OUTPUT is billed. Measured
+	 * +18% on real runs with it on. Turn it on when the brief itself is large
+	 * enough to strain a verifier's context window, not to save money.
+	 */
+	verifyNarrowContext: boolean;
+	/**
+	 * Run a `secondPass` model only when the diff has at least this many
+	 * changed lines. 0 always runs the second pass.
+	 */
+	secondPassMinLines: number;
 	/** Default GitHub author filter for PR comments/reviews when none is passed per-run. */
 	commentAuthors?: string[];
 }
@@ -213,10 +259,68 @@ export const DEFAULTS: MultiReviewConfig = {
 	webSearch: true,
 	webSearchProxyModel: "amd-gateway-anthropic/Claude-Haiku-5.5",
 	webSearchNativeApis: ["anthropic-messages"],
+	// Clustering findings is a cheap semantic task, not discovery. Opus is 40x
+	// Haiku's input price and the answer is validated into a partition either
+	// way, so paying a frontier price here bought nothing.
+	dedupeDefaultModel: "amd-gateway-anthropic/Claude-Haiku-5.5",
+	// No reviewer leaf in the benchmark table, so verifiers default to the
+	// model's own level; set e.g. "low" to cut thinking tokens outright.
+	verifierThinking: null,
+	verifierTimeoutSec: 180,
+	judgeMaxTokens: 8_000,
+	readMaxChars: 0,
+	verifyNarrowContext: false,
+	secondPassMinLines: 0,
 };
 
 export function reviewerRunOptions(cfg: MultiReviewConfig): ReviewerRunOptions {
-	return { useTools: cfg.reviewerTools, timeoutMs: cfg.reviewerTimeoutSec * 1000, sandboxHomeDirs: cfg.sandboxHomeDirs, minToolCalls: cfg.minReviewToolCalls };
+	return {
+		useTools: cfg.reviewerTools,
+		timeoutMs: cfg.reviewerTimeoutSec * 1000,
+		sandboxHomeDirs: cfg.sandboxHomeDirs,
+		minToolCalls: cfg.minReviewToolCalls,
+		readMaxChars: cfg.readMaxChars,
+	};
+}
+
+/**
+ * The tool-call floor a run of this size deserves. The floor exists because a
+ * reviewer that stops early usually stops looking, not because the change is
+ * clean. How much looking a change needs scales with its size, so a one-file
+ * 20-line diff gets a floor of 2 rather than 10: past that, the nudge buys an
+ * extra turn per reviewer and nothing else.
+ *
+ * Two guards keep this from doing more than it says. A run with no diff (a
+ * file-scope or free-text review) keeps the configured floor: there is no
+ * size signal, and those reviews are broad by nature. And the result never
+ * exceeds `configured`, so scaling can lower a user's threshold but never
+ * raise it.
+ */
+export function scaledMinToolCalls(configured: number, changedLines: number): number {
+	if (configured <= 0) return 0;
+	if (changedLines <= 0) return configured;
+	const bySize = Math.max(2, Math.ceil(changedLines / 20));
+	return Math.min(configured, bySize);
+}
+
+/**
+ * The model that groups findings: the run's `dedupeModel`, else
+ * `dedupeDefaultModel`, else the judge.
+ *
+ * Returns null for `dedupeModel: "lexical"`, which is a switch, not a model:
+ * grouping is then done lexically and callers that need a real model (the
+ * PR-comment classifier) must supply one instead of trying to resolve
+ * "lexical" as a spec.
+ */
+export function dedupeTarget(cfg: MultiReviewConfig): string | null {
+	if (cfg.dedupeModel === "lexical") return null;
+	if (cfg.dedupeModel) return cfg.dedupeModel;
+	return cfg.dedupeDefaultModel ?? cfg.judge;
+}
+
+/** The model for tasks that need one regardless of how grouping is done. */
+export function classifierTarget(cfg: MultiReviewConfig): string {
+	return dedupeTarget(cfg) ?? cfg.judge;
 }
 
 /**
@@ -273,6 +377,25 @@ export function loadConfig(): MultiReviewConfig {
 		if (typeof parsed.reviewerTools === "boolean") cachedConfig.reviewerTools = parsed.reviewerTools;
 		if (typeof parsed.dedupeModel === "string" && (parsed.dedupeModel === "lexical" || parsed.dedupeModel.includes("/"))) {
 			cachedConfig.dedupeModel = parsed.dedupeModel;
+		}
+		if (parsed.dedupeDefaultModel === null) cachedConfig.dedupeDefaultModel = null;
+		else if (typeof parsed.dedupeDefaultModel === "string" && parsed.dedupeDefaultModel.includes("/")) cachedConfig.dedupeDefaultModel = parsed.dedupeDefaultModel;
+		if (parsed.verifierThinking === null) cachedConfig.verifierThinking = null;
+		else if (typeof parsed.verifierThinking === "string" && (THINKING_LEVEL_ALIASES as readonly string[]).includes(parsed.verifierThinking)) {
+			cachedConfig.verifierThinking = parsed.verifierThinking as ThinkingLevelAlias;
+		}
+		if (typeof parsed.verifierTimeoutSec === "number" && parsed.verifierTimeoutSec >= 10 && parsed.verifierTimeoutSec <= 3600) {
+			cachedConfig.verifierTimeoutSec = Math.floor(parsed.verifierTimeoutSec);
+		}
+		if (typeof parsed.judgeMaxTokens === "number" && parsed.judgeMaxTokens >= 0 && parsed.judgeMaxTokens <= 200_000) {
+			cachedConfig.judgeMaxTokens = Math.floor(parsed.judgeMaxTokens);
+		}
+		if (typeof parsed.readMaxChars === "number" && parsed.readMaxChars >= 0 && parsed.readMaxChars <= 400_000) {
+			cachedConfig.readMaxChars = Math.floor(parsed.readMaxChars);
+		}
+		if (typeof parsed.verifyNarrowContext === "boolean") cachedConfig.verifyNarrowContext = parsed.verifyNarrowContext;
+		if (typeof parsed.secondPassMinLines === "number" && parsed.secondPassMinLines >= 0) {
+			cachedConfig.secondPassMinLines = Math.floor(parsed.secondPassMinLines);
 		}
 		if (typeof parsed.reviewerTimeoutSec === "number" && parsed.reviewerTimeoutSec >= 10 && parsed.reviewerTimeoutSec <= 3600) {
 			cachedConfig.reviewerTimeoutSec = Math.floor(parsed.reviewerTimeoutSec);
