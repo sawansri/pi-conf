@@ -387,10 +387,17 @@ async function runAgenticReviewer(
 	} catch (err) {
 		const harvested = signal.aborted ? await harvest(session, extras.late, onEvent) : undefined;
 		if (harvested) return harvestedResult(session, harvested, extras.late!, started);
+		// A failing session was still billed for every turn it ran. Reporting no
+		// usage here silently dropped that spend from the run total: two
+		// reviewers timed out in one real run and the cost roll-up showed $0 for
+		// them, so the run's reported price was well under what was charged.
+		const stats = session.getSessionStats();
 		return {
 			text: "",
 			stopReason: "error",
 			errorMessage: signal.aborted ? `aborted: ${String(signal.reason ?? "cancelled")}` : (err instanceof Error ? err.message : String(err)),
+			usage: sessionUsage(stats),
+			toolCalls: stats.toolCalls,
 			durationMs: Date.now() - started,
 		};
 	} finally {

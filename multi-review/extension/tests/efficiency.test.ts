@@ -181,6 +181,25 @@ test("the cache-hit rate is the cached share of the prompt, or undefined with no
 
 // ---------- routing knobs ----------
 
+test("a failing session still reports the tokens it was billed for", async () => {
+	// Two reviewers timed out in a real run and the cost roll-up showed $0 for
+	// them, under-reporting what the gateway charged. Every failure return in
+	// the agentic path must carry usage like any other result.
+	const fs = await import("node:fs");
+	const src = fs.readFileSync(new URL("../src/reviewers.ts", import.meta.url), "utf8");
+	// Every `return {` inside runAgenticReviewer that sets stopReason "error"
+	// has to also set usage.
+	const fnStart = src.indexOf("async function runAgenticReviewer");
+	const fn = src.slice(fnStart, src.indexOf("function harvestedResult"));
+	const errorReturns = [...fn.matchAll(/return \{([\s\S]{0,400}?)\n\t\t\};/g)]
+		.map((m) => m[1])
+		.filter((body) => body.includes('stopReason: "error"'));
+	assert.ok(errorReturns.length > 0, "expected an error return to check");
+	for (const body of errorReturns) {
+		assert.match(body, /usage: sessionUsage\(stats\)/, `error return without usage:\n${body}`);
+	}
+});
+
 test("the read cap is on by default: fresh tool output is what a run pays for", () => {
 	assert.ok(DEFAULTS.readMaxChars > 0);
 });

@@ -612,7 +612,16 @@ async function runReviewPipeline(
 	// Suspicions and PR claims ride the verify round as claims of their own:
 	// every reviewer is eligible (none raised them; none saw them). PR
 	// claims are always verified — checking them is the point of fetching.
-	const suspicionGroups = flags.verify ? suspicions.map(suspicionAsGroup) : [];
+	//
+	// A suspicion a reviewer raised independently is NOT a verify target: it
+	// already entered the round as a finding group, so verifying it again
+	// pays twice for one answer. In a real run 16 lead suspicions doubled the
+	// verify round (31 targets instead of 15) to $1.21, and 12 of them were
+	// duplicates of finding groups or unraised. What a suspicion is for is
+	// "did anyone reach this on their own", so an independently-raised one is
+	// already answered.
+	const unraisedSuspicions = suspicions.filter((s) => s.raisedBy.length === 0);
+	const suspicionGroups = flags.verify ? unraisedSuspicions.map(suspicionAsGroup) : [];
 	const prClaimGroups = prClaims.map(prClaimAsGroup);
 	const verifyTimeLeft = deadlineMs === undefined ? Number.POSITIVE_INFINITY : deadlineMs - Date.now() - FINAL_RESERVE_MS;
 	// A straggler's harvested findings are always verified: it was cut off mid-check.
@@ -637,10 +646,15 @@ async function runReviewPipeline(
 		);
 		for (const r of verifierRuns) addUsage(cost, `${r.spec} (verify)`, r.usage);
 		for (const f of failures) target.warnings.push(`verifier failed (its claims stay unverified): ${f}`);
-		suspicionGroups.forEach((g, i) => {
-			suspicions[i].verifications = g.verifications;
-			suspicions[i].verificationNote = g.verificationNote;
-		});
+		// Map by the suspicion's own id, not by position: only unraised
+		// suspicions enter the round, so the group list is a subset.
+		const groupById = new Map(suspicionGroups.map((g) => [g.id, g]));
+		for (const sus of suspicions) {
+			const g = groupById.get(sus.id);
+			if (!g) continue;
+			sus.verifications = g.verifications;
+			sus.verificationNote = g.verificationNote;
+		}
 		prClaimGroups.forEach((g, i) => {
 			prClaims[i].verifications = g.verifications;
 			prClaims[i].verificationNote = g.verificationNote;

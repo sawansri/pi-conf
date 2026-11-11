@@ -22,6 +22,16 @@ export interface ModelUsage {
 }
 
 /**
+ * The gateway's real cache multipliers, relative to a model's input rate.
+ * Measured directly against `llm-api.amd.com` rather than read from
+ * `models.json`, whose `cacheRead`/`cacheWrite` are both 0 — which silently
+ * treats cached tokens as free and under-reports a cached run by ~1.7x.
+ * Anthropic-style caching bills a write at 1.25x input and a read at 0.05x.
+ */
+export const CACHE_WRITE_MULTIPLIER = 1.25;
+export const CACHE_READ_MULTIPLIER = 0.05;
+
+/**
  * Share of the prompt billed as a cache read, 0–1. Undefined when the
  * provider reported no cache activity at all (nothing to say).
  */
