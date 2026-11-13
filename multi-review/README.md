@@ -921,7 +921,7 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
   "judgeMaxTokens": 8000,
   "readMaxChars": 24000,
   "sessionMaxCostUsd": 1.5,
-  "promptCacheKeyModels": [],
+  "promptCacheKeyModels": ["amd-gateway/Kimi-K3.1-Pro"],
   "verifyNarrowContext": false,
   "secondPassMinLines": 0,
   "webSearch": true,
@@ -968,12 +968,13 @@ verifier requests carry a per-session `prompt_cache_key`, which routes a
 session's requests to the backend that holds its cached prefix (pi sends one
 itself only to api.openai.com). Kimi was billed 1.1M fresh input tokens in one
 review for a context that ended near 310k, about 3.5x what working prefix
-caching allows. Off by default until the gateway's Kimi backend is shown to
-accept the key (a backend that rejects unknown parameters would fail every
-Kimi session): run `tests/bench/cache-growth-probe.py Kimi-K3.1-Pro` with and
-without `CACHE_KEY=x`, then set `["amd-gateway/Kimi-K3.1-Pro"]`.
-`mr-run-summary` on a later run shows whether it closed the gap (fresh input
-vs tool output per session).
+caching allows. The Kimi backend accepts the key, but its cache leaked with
+the key on too: `tests/bench/cache-growth-probe.py` (4 turns, ~6k new tokens
+each) paid 79k fresh tokens for 42k of content and missed turn 3 entirely.
+Whether the key narrows the leak is unmeasured, because the backend
+rate-limited every run without it; rerun the probe with and without
+`CACHE_KEY=x` to settle it. `mr-run-summary` on real runs shows the same
+thing per session (fresh input vs tool output).
 `dedupeDefaultModel` is who groups findings when `dedupeModel` is unset
 (default Haiku 5.5: clustering is semantic bookkeeping, not discovery, and the
 answer is validated into a partition either way). `null` restores the old

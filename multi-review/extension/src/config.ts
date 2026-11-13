@@ -327,10 +327,11 @@ export const DEFAULTS: MultiReviewConfig = {
 	readMaxCharsByModel: { "amd-gateway/Kimi-K3.1-Pro": 12_000 },
 	// Above Sonnet's $1.18 on a large lemonade PR, under half of Kimi's $3.14.
 	sessionMaxCostUsd: 1.5,
-	// Off until a probe shows the gateway's Kimi backend accepts the key: one
-	// that rejects unknown parameters would fail every Kimi session.
-	// tests/bench/cache-growth-probe.py measures it.
-	promptCacheKeyModels: [],
+	// The gateway's Kimi backend accepts the key (tests/bench/cache-growth-probe.py,
+	// 2026-11-12). Its cache still leaked with it on: a 4-turn probe paid 79k
+	// fresh tokens for 42k of content, missing turn 3 entirely. Whether the key
+	// narrows that is unmeasured; the backend rate-limited every no-key run.
+	promptCacheKeyModels: ["amd-gateway/Kimi-K3.1-Pro"],
 	verifyNarrowContext: false,
 	secondPassMinLines: 0,
 };
