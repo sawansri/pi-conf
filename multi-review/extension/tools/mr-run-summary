@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Where a multi-review run's time and money went, per session.
+
+    mr-run-summary RUN_DIR...
+
+RUN_DIR is a run's trace directory: /tmp/multi-review-XXXXXX for an
+interactive run, or the --out directory of a headless one (which also has
+result.json). Reads trace.jsonl, progress.json and, when present,
+result.json, and prints for each session: phase, outcome, turns, tool calls
+by tool, files read more than twice, and cost.
+
+Cost comes from result.json's details.cost.bySpec. models.json prices cache
+tokens at $0, so the "billed" column re-prices them at the gateway's real
+rates (cost.ts: read 0.05x, write 1.25x input), using the input rate from
+$PI_CODING_AGENT_DIR/models.json. Without result.json (a run that was
+cancelled, or interactive) only the last three sessions' costs survive, in
+progress.json's events.
+
+Caveat: trace.jsonl truncates tool_result text, so it can count calls but not
+measure how much each one added to the context.
+"""
+import collections
+import json
+import os
+import re
+import sys
+
+CACHE_READ, CACHE_WRITE = 0.05, 1.25
+
+
+def input_rates():
+    agent_dir = os.environ.get("PI_CODING_AGENT_DIR", os.path.expanduser("~/.pi/agent"))
+    try:
+        models = json.load(open(os.path.join(agent_dir, "models.json")))
+    except OSError:
+        return {}
+    rates = {}
+    for prov, v in models.get("providers", {}).items():
+        for m in v.get("models", []):
+            if m.get("cost", {}).get("input"):
+                rates[f"{prov}/{m['id']}"] = m["cost"]["input"]
+    return rates
+
+
+def bare(spec):
+    return re.sub(r"(\s*\(verify\)|\s*#\d+|@[a-z]+)+$", "", spec)
+
+
+def summarize(run_dir, rates):
+    print(f"== {run_dir}")
+    events = []
+    with open(os.path.join(run_dir, "trace.jsonl")) as f:
+        for line in f:
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    if events:
+        print(f"   {events[0].get('t')} -> {events[-1].get('t')}")
+    tools = collections.defaultdict(collections.Counter)
+    reads = collections.defaultdict(collections.Counter)
+    notes = {}
+    for e in events:
+        key = (e.get("reviewer", "?"), e.get("phase", "?"))
+        if e.get("kind") == "tool":
+            tools[key][e.get("tool")] += 1
+            if e.get("tool") == "read":
+                args = e.get("args") or {}
+                reads[key][args.get("path") or args.get("file_path")] += 1
+        elif e.get("kind") == "finish":
+            notes[key] = e.get("note")
+
+    progress = {}
+    try:
+        progress = json.load(open(os.path.join(run_dir, "progress.json")))
+    except OSError:
+        pass
+    run = progress.get("run", {})
+    print(f"   mode={run.get('mode')} phase={run.get('phase')}")
+    turns = {(s["reviewer"], s["phase"]): s for s in progress.get("sessions", [])}
+
+    costs = {}
+    try:
+        cost = json.load(open(os.path.join(run_dir, "result.json")))["details"]["cost"]
+        for row in cost["bySpec"]:
+            u = row["usage"]
+            rate = rates.get(bare(row["spec"]))
+            billed = u["cost"] + (u.get("cacheRead", 0) * CACHE_READ + u.get("cacheWrite", 0) * CACHE_WRITE) * (rate or 0) / 1e6
+            costs[row["spec"]] = (u["cost"], billed, u["input"], u.get("cacheRead", 0))
+        u = cost["usage"]
+        print(f"   run: catalog ${u['cost']:.3f}, {cost['calls']} calls")
+    except (OSError, KeyError):
+        for ev in run.get("events", []):
+            print(f"   event: {ev}")
+
+    for key in sorted(set(tools) | set(turns)):
+        reviewer, phase = key
+        s = turns.get(key, {})
+        name = reviewer + (" (verify)" if phase == "verify" else "")
+        line = f"   {name:52} {phase:6} {s.get('state', '?'):6} turns={s.get('turns', '?'):>3} {s.get('elapsedSec', '?'):>4}s"
+        line += f" calls={sum(tools[key].values()):>3} {dict(tools[key].most_common())}"
+        c = costs.get(name.replace(" (verify)", "")) if phase != "verify" else costs.get(bare(reviewer) + " (verify)")
+        if c:
+            line += f"\n{'':57}catalog ${c[0]:.3f}  billed ${c[1]:.3f}  fresh-in {c[2] / 1e3:.0f}k  cache-read {c[3] / 1e6:.1f}M"
+        rereads = [(p, n) for p, n in reads[key].most_common(3) if n > 2]
+        if rereads:
+            line += f"\n{'':57}re-read: {rereads}"
+        if notes.get(key):
+            line += f"\n{'':57}finish: {notes[key]}"
+        print(line)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    rates = input_rates()
+    for d in sys.argv[1:]:
+        summarize(d, rates)
