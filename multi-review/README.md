@@ -918,6 +918,7 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
   "verifierTimeoutSec": 180,
   "judgeMaxTokens": 8000,
   "readMaxChars": 24000,
+  "sessionMaxCostUsd": 1.5,
   "verifyNarrowContext": false,
   "secondPassMinLines": 0,
   "webSearch": true,
@@ -936,6 +937,14 @@ pool is healthy and false positives are expensive.
 a model's every session). Kimi defaults to 12k against the pool's 24k: in one
 real review it made 194 tool calls to Sonnet's 64 at the same list price and
 cost 8x, re-reading the same files up to 6 times.
+`sessionMaxCostUsd` caps what one reviewer or verifier session may spend
+(default $1.50, priced at the gateway's billed rates with cache included; 0
+disables it). A session that reaches it is cut and harvested like one that ran
+out of time, so its findings are kept and the review marks it partial. The
+read cap shrinks each call but bounds nothing: the time budget was the only
+per-session limit, and the fastest model makes the most calls in it. Kimi
+fanned out ~4 tool calls a turn and spent $3.14 on one large-PR review where
+Sonnet spent $1.18.
 `dedupeDefaultModel` is who groups findings when `dedupeModel` is unset
 (default Haiku 5.5: clustering is semantic bookkeeping, not discovery, and the
 answer is validated into a partition either way). `null` restores the old
