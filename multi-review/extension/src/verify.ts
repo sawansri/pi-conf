@@ -12,19 +12,24 @@ import { mapWithConcurrency } from "./util.ts";
 /**
  * Assign each group to `k` verifiers who did not raise it. Models in
  * `preferred` (config.verifiers) are used first, balanced by load with the
- * preference order breaking ties; the rest of the pool only verifies what no
- * preferred model can. With no preference, load balances over the pool,
- * pool order breaking ties. Verifying your own finding is not independent
+ * preference order breaking ties, up to `maxPerVerifier` groups each
+ * (config.maxGroupsPerVerifier); past that, and for groups every preferred
+ * model raised, the rest of the pool verifies. One verifier handles all its
+ * groups in one time-limited session, so an uncapped preference piled 8
+ * groups on gpt-6.1-sol, which timed out with none verified. A model only
+ * goes past the cap when nobody else is eligible. With no preference, load
+ * balances over the pool, pool order breaking ties. Verifying your own finding is not independent
  * evidence, so raisers are never assigned; a group every reviewer raised
  * gets a note instead.
  */
-export function assignVerifiers(groups: DedupeGroup[], pool: ModelSpec[], k: number, preferred: readonly string[] = []): Map<ModelSpec, string[]> {
+export function assignVerifiers(groups: DedupeGroup[], pool: ModelSpec[], k: number, preferred: readonly string[] = [], maxPerVerifier = Number.POSITIVE_INFINITY): Map<ModelSpec, string[]> {
 	const load = new Map<ModelSpec, string[]>(pool.map((spec) => [spec, []]));
 	const rank = (spec: ModelSpec) => {
 		const i = preferred.indexOf(spec);
 		return i === -1 ? preferred.length + pool.indexOf(spec) : i;
 	};
-	const tier = (spec: ModelSpec) => (preferred.includes(spec) ? 0 : 1);
+	const full = (spec: ModelSpec) => load.get(spec)!.length >= maxPerVerifier;
+	const tier = (spec: ModelSpec) => (full(spec) ? 2 : preferred.includes(spec) ? 0 : 1);
 	for (const g of groups) {
 		const candidates = pool
 			.filter((spec) => !g.reviewerSpecs.includes(spec))
@@ -78,7 +83,7 @@ export async function runVerification(
 	// having raised nothing, they're the most independent checkers. `rows`
 	// also carries the verify-only models, after the reviewers.
 	const pool = rows.map((r) => r.rs.spec);
-	const assignments = [...assignVerifiers(groups, pool, cfg.verifiersPerFinding, cfg.verifiers)];
+	const assignments = [...assignVerifiers(groups, pool, cfg.verifiersPerFinding, cfg.verifiers, cfg.maxGroupsPerVerifier || undefined)];
 	const byId = new Map(groups.map((g) => [g.id, g]));
 	const failures: string[] = [];
 	// Verification re-sends the brief to every verifier, so it is often the

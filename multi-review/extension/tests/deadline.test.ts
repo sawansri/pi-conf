@@ -298,10 +298,19 @@ function spendingSession() {
 			listeners.add(l);
 			return () => listeners.delete(l);
 		},
-		emit: (type: string) => { for (const l of listeners) l({ type } as AgentSessionEvent); },
+		/** `message_end` defaults to a tool-calling turn that adds nothing to the persisted stats. */
+		emit: (type: string, message: unknown = toolTurn(0)) => { for (const l of listeners) l({ type, message } as unknown as AgentSessionEvent); },
 		listeners,
 	};
 	return s;
+}
+
+/** An assistant message as pi emits it at message_end; `usage` is not in getSessionStats() yet. */
+function toolTurn(cost: number, input = 0) {
+	return { role: "assistant", content: [{ type: "toolCall", id: "1", name: "read", arguments: {} }], usage: { input, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: input, cost: { total: cost } } };
+}
+function finalTurn(cost: number) {
+	return { ...toolTurn(cost), content: [{ type: "text", text: "[]" }] };
 }
 
 test("the spend cap cuts a session once its billed spend, cache included, crosses the cap", () => {
@@ -364,4 +373,39 @@ test("a budget warning talks about spend, not seconds", () => {
 	assert.doesNotMatch(text, /400s/);
 	assert.match(text, /Skip the rest of your plan: "b", "c"\./);
 	assert.match(text, /Output ONLY the JSON\.$/);
+});
+
+test("the spend cap counts the turn that just arrived, which pi persists only after listeners run", () => {
+	// getSessionStats() sums persisted entries, and pi persists a message after
+	// notifying listeners, so a cap reading stats alone lagged a turn: gemini
+	// ran to $1.79 against a $1.50 cap when its last turn added $0.35.
+	const d = startDeadline(10 * MIN);
+	const s = spendingSession();
+	armSpendCap(s, d, { maxUsd: 1.5, inputPerMillion: 2.5 });
+	s.stats = { ...s.stats, cost: 1.35 };
+	s.emit("message_end", toolTurn(0.35, 141_000));
+	assert.equal(d.cut.aborted, true);
+	assert.equal(d.cut.reason, "spent $1.700 of its $1.500 budget");
+});
+
+test("a final answer that crosses the cap is kept, not cut and re-asked", () => {
+	// The spend is already incurred; cutting it sends the session to a harvest
+	// that replaces a finished answer, and loses it if that request fails.
+	const d = startDeadline(10 * MIN);
+	const s = spendingSession();
+	armSpendCap(s, d, { maxUsd: 1.5, inputPerMillion: 2 });
+	s.stats = { ...s.stats, cost: 1.4 };
+	s.emit("message_end", finalTurn(0.3));
+	assert.equal(d.cut.aborted, false);
+});
+
+test("a retry's cap starts from what the earlier attempts spent", () => {
+	// Each error retry is a fresh session: two attempts at $1.40 spent $2.80
+	// against a $1.50 cap and were never cut.
+	const d = startDeadline(10 * MIN);
+	const s = spendingSession();
+	armSpendCap(s, d, { maxUsd: 1.5, inputPerMillion: 2, spentBeforeUsd: 1.4 });
+	s.emit("message_end", toolTurn(0.11));
+	assert.equal(d.cut.aborted, true);
+	assert.equal(d.cut.reason, "spent $1.510 of its $1.500 budget");
 });

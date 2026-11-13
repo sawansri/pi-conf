@@ -68,6 +68,23 @@ export function emptyRunCost(): RunCost {
 	return { calls: 0, usage: { ...EMPTY_USAGE }, bySpec: [] };
 }
 
+/**
+ * Wrap one error-retry attempt so the usage of every attempt adds up. Each
+ * retry is a fresh session whose stats start at zero, so without this a
+ * reviewer that hit 429 three times reported only its last attempt: $0 for
+ * ~249k fresh tokens in one run. The attempt is told what earlier attempts
+ * used, so its spend cap can count it.
+ */
+export function carryUsage<R extends { usage?: ModelUsage }>(attempt: (before: ModelUsage | undefined) => Promise<R>): () => Promise<R> {
+	let before: ModelUsage | undefined;
+	return async () => {
+		const r = await attempt(before);
+		const total = r.usage ? (before ? addInto(before, r.usage) : r.usage) : before;
+		before = total;
+		return total ? { ...r, usage: total } : r;
+	};
+}
+
 function addInto(into: ModelUsage, usage: ModelUsage): ModelUsage {
 	return {
 		input: into.input + usage.input,

@@ -47,7 +47,22 @@ test("one model's two passes agreeing is not independent: still verified", () =>
 	assert.deepEqual(selectForVerification([g], false).map((x) => x.id), ["g1"]);
 });
 
-test("defaults: gpt-6.1-sol then Sonnet verify, and consensus findings are not re-verified", () => {
-	assert.deepEqual(DEFAULTS.verifiers, [GPT, SONNET]);
+test("consensus findings are not re-verified by default", () => {
 	assert.equal(DEFAULTS.verifyConsensus, false);
+});
+
+test("no verifier takes more than its share: the excess spills to the next model", () => {
+	// gpt-6.1-sol got 8 groups in one run and timed out at 148s with 0/8
+	// verdicts, while Sonnet verified its 4 in 55s.
+	const groups = Array.from({ length: 12 }, (_, i) => group(`g${i + 1}`, KIMI));
+	const load = assignVerifiers(groups, POOL, 1, [SONNET, GPT], 5);
+	assert.equal(load.get(SONNET)!.length, 5);
+	assert.equal(load.get(GPT)!.length, 5);
+	assert.equal(load.get(GEMINI)!.length, 2);
+	assert.equal(load.has(KIMI), false);
+});
+
+test("Sonnet verifies first by default: it finished its share; gpt-6.1-sol timed out on its", () => {
+	assert.deepEqual(DEFAULTS.verifiers, [SONNET, GPT]);
+	assert.equal(DEFAULTS.maxGroupsPerVerifier, 5);
 });

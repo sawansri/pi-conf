@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { DEFAULTS, classifierTarget, dedupeTarget, readMaxCharsFor, reviewerRunOptions, scaledMinToolCalls } from "../src/config.ts";
-import { billedCost, cacheHitRate } from "../src/cost.ts";
+import { billedCost, cacheHitRate, carryUsage } from "../src/cost.ts";
+import { retryOnError } from "../src/util.ts";
 import { applyCliFlags } from "../src/headless.ts";
 import { judgeOutputCap } from "../src/judge.ts";
 import { whichChangedLines } from "../src/pipeline.ts";
@@ -340,4 +341,25 @@ test("the cache key wraps a session's onPayload only for listed models, and keep
 	installPromptCacheKey({ agent: other, sessionId: "s2" }, { provider: "amd-gateway", id: "gemini-4-argon" }, ["amd-gateway/Kimi-K3.1-Pro"]);
 	assert.equal(other.onPayload, undefined);
 	assert.deepEqual(DEFAULTS.promptCacheKeyModels, ["amd-gateway/Kimi-K3.1-Pro"]);
+});
+
+test("usage is carried across error retries, so the run total includes failed attempts", async () => {
+	// Kimi hit 429 three times in one run; each retry is a fresh session and
+	// only the last attempt's usage was reported ($0, for ~249k fresh tokens).
+	const u = (input: number, cost: number) => ({ input, output: 0, total: input, cost, cacheRead: 0, cacheWrite: 0 });
+	const seenBefore: Array<number | undefined> = [];
+	const results = [
+		{ text: "", stopReason: "error", errorMessage: "429", durationMs: 1, usage: u(100_000, 0.2) },
+		{ text: "", stopReason: "error", errorMessage: "429", durationMs: 1, usage: u(149_000, 0.3) },
+		{ text: "[]", stopReason: "stop", durationMs: 1, usage: u(10_000, 0.02) },
+	];
+	let i = 0;
+	const attempt = carryUsage(async (before) => {
+		seenBefore.push(before?.input);
+		return results[i++];
+	});
+	const final = await retryOnError(new AbortController().signal, attempt as never, undefined, 0) as { usage: { input: number; cost: number } };
+	assert.deepEqual(seenBefore, [undefined, 100_000, 249_000]);
+	assert.equal(final.usage.input, 259_000);
+	assert.equal(final.usage.cost.toFixed(2), "0.52");
 });

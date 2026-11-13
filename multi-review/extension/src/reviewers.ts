@@ -2,7 +2,7 @@ import { type AgentSessionEvent, type ExtensionContext, createAgentSession, Defa
 import { createGitTool, createProgressTool, createRunTool } from "./agent-tools.ts";
 import { type LateSession, StragglerCutoff, armSpendCap, armWarning, harvest, startDeadline } from "./deadline.ts";
 import { type Model, type ReviewerSpec, type ThinkingLevelAlias, formatReviewerSpec } from "./config.ts";
-import type { ModelUsage } from "./cost.ts";
+import { type ModelUsage, billedCost, carryUsage } from "./cost.ts";
 import { type ReviewerFinding, type ReviewerRunResult, parseReviewerJson } from "./findings.ts";
 import { type ModelCallResult, callModel } from "./models.ts";
 import type { MultiReviewRunResult } from "./pipeline.ts";
@@ -65,6 +65,8 @@ export interface AgenticExtras {
 	promptCacheKeyModels?: string[];
 	/** Cut and harvest the session once it has spent this much (config.sessionMaxCostUsd); needs `late`. */
 	maxCostUsd?: number;
+	/** What earlier error-retry attempts of the same review spent, counted against maxCostUsd. */
+	spentBeforeUsd?: number;
 	/** Directory for the sandboxed `run` tool; unset means no `run`. */
 	runDir?: string;
 	sandboxHomeDirs?: string[];
@@ -323,7 +325,7 @@ async function runAgenticReviewer(
 	if (nativeSearch) installNativeWebSearch(session, onEvent);
 	const unwarn = armWarning(session, extras.late, progressState, onEvent);
 	const uncap = extras.late && extras.maxCostUsd
-		? armSpendCap(session, extras.late.deadline, { maxUsd: extras.maxCostUsd, inputPerMillion: model.cost?.input })
+		? armSpendCap(session, extras.late.deadline, { maxUsd: extras.maxCostUsd, inputPerMillion: model.cost?.input, spentBeforeUsd: extras.spentBeforeUsd })
 		: () => {};
 	const onAbort = () => void session.abort();
 	signal.addEventListener("abort", onAbort, { once: true });
@@ -507,7 +509,8 @@ export async function runReviewer(
 	// Reviewers run their own repros; verifiers run code to settle claims.
 	const canRun = Boolean(runOpts.sandbox);
 	// Each retry starts a fresh session: an errored one may have dropped its stream mid-turn.
-	const call = await retryOnError(signal, () => runOpts.useTools
+	// carryUsage adds every attempt's usage up, for the run's cost and the spend cap.
+	const call = await retryOnError(signal, carryUsage((before) => runOpts.useTools
 		? runAgenticReviewer(
 			ctx, model, reviewerSpec.thinking,
 			systemPrompt + buildToolPromptAddendum(model, runOpts, canRun, false),
@@ -522,6 +525,7 @@ export async function runReviewer(
 				late: { deadline, userSignal: abortSignal, finalFormat: JSON_FINAL_FORMAT },
 				readMaxChars,
 				maxCostUsd: runOpts.maxCostUsd,
+				spentBeforeUsd: before ? billedCost(before, model.cost?.input) : 0,
 				promptCacheKeyModels: runOpts.promptCacheKeyModels,
 			},
 		)
@@ -529,7 +533,7 @@ export async function runReviewer(
 			thinking: reviewerSpec.thinking,
 			temperature,
 			signal,
-		}), (retry, error) => tracer?.onEvent({ type: "multi_review_error_retry", retry, error } as unknown as AgentSessionEvent));
+		})), (retry, error) => tracer?.onEvent({ type: "multi_review_error_retry", retry, error } as unknown as AgentSessionEvent));
 	// Cut while waiting to retry an error: say both.
 	if (call.errorMessage && deadline.cut.aborted && !abortSignal?.aborted) {
 		call.errorMessage = call.errorMessage.startsWith("aborted") ? String(deadline.cut.reason) : `${String(deadline.cut.reason)}, retrying after: ${call.errorMessage}`;

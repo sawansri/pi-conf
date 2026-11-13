@@ -158,7 +158,7 @@ export function sandboxInvocation(
 		"--allow", scratch, "--allow-file", "/dev/null", "--read", top, "--workdir", dir,
 	];
 	for (const w of extras.writePaths ?? []) args.push("--allow", w);
-	const read = [...SANDBOX_HOST_DIRS, ...homeDirs.map((rel) => path.join(home, rel)), SANDBOX_TOOLS_DIR, ANALYSIS_TOOLS_HOME, ...(extras.readPaths ?? [])];
+	const read = sandboxReadPaths(home, homeDirs, extras);
 	// Worktrees (PR checkouts) keep their git objects in the main repo.
 	if (commonDir && !isInside(commonDir, top)) read.push(commonDir);
 	for (const p of read) {
@@ -188,6 +188,24 @@ export function stopSandboxed(child: ReturnType<typeof spawn>): void {
 		child.kill("SIGKILL");
 		killNonoCgroup(child.pid);
 	}, 3_000).unref?.();
+}
+
+/**
+ * What a sandboxed command may read besides the repo. Of the analysis home,
+ * only the tools (venv) and the clangd index: the same tree holds every past
+ * run (briefs, findings, traces with reviewers' thinking) and the outcomes
+ * log, which code under review must not read and a verifier must not use to
+ * see what the reviewers it is checking concluded.
+ */
+export function sandboxReadPaths(home: string, homeDirs: string[], extras: SandboxExtras): string[] {
+	return [
+		...SANDBOX_HOST_DIRS,
+		...homeDirs.map((rel) => path.join(home, rel)),
+		SANDBOX_TOOLS_DIR,
+		path.join(ANALYSIS_TOOLS_HOME, "venv"),
+		path.join(ANALYSIS_TOOLS_HOME, "clangd-index"),
+		...(extras.readPaths ?? []),
+	];
 }
 
 /**

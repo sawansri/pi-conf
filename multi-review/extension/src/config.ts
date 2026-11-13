@@ -89,12 +89,17 @@ export interface MultiReviewConfig {
 	verifyOnly: string[];
 	/**
 	 * Preferred verifiers (`provider/id`), in order. They take the verify
-	 * round's work, balanced by load; other pool models verify only findings
-	 * every preferred model raised itself. Empty balances over the whole pool.
-	 * Kimi's verify session cost $1.22 in one run and Sonnet's $0.58, while
-	 * gpt-6.1-sol caches its whole prefix and reviews for about $0.10.
+	 * round's work, balanced by load up to maxGroupsPerVerifier each; other
+	 * pool models verify the overflow and findings every preferred model
+	 * raised itself. Empty balances over the whole pool. Billed (cache
+	 * included), Kimi's verify session cost $1.22 in one run, Sonnet's $0.42
+	 * for 4 groups in 55s, gpt-6.1-sol's $0.42 for 8 groups that timed out
+	 * with none verified. (pi reports gpt's uncached input as cacheWrite,
+	 * which models.json prices at $0, so its catalog cost reads ~10x low.)
 	 */
 	verifiers: string[];
+	/** Most groups one verifier session takes before the next model gets them; 0 = no limit. */
+	maxGroupsPerVerifier: number;
 	/**
 	 * Also verify findings two or more distinct models raised independently.
 	 * Off: over 5 real runs no such finding was refuted, so its verifier
@@ -291,7 +296,8 @@ export const DEFAULTS: MultiReviewConfig = {
 	verify: false,
 	verifiersPerFinding: 1,
 	verifyOnly: [],
-	verifiers: ["amd-gateway/gpt-6.1-sol", "amd-gateway-anthropic/Claude-Sonnet-5.5"],
+	verifiers: ["amd-gateway-anthropic/Claude-Sonnet-5.5", "amd-gateway/gpt-6.1-sol"],
+	maxGroupsPerVerifier: 5,
 	verifyConsensus: false,
 	// Sonnet: the best recall per second in the pool.
 	secondPass: ["amd-gateway-anthropic/Claude-Sonnet-5.5"],
@@ -449,6 +455,9 @@ export function loadConfig(): MultiReviewConfig {
 			cachedConfig.verifiers = parsed.verifiers
 				.filter((x: unknown): x is string => typeof x === "string" && x.includes("/"))
 				.map((x: string) => x.replace(/@[a-z]+$/, ""));
+		}
+		if (typeof parsed.maxGroupsPerVerifier === "number" && parsed.maxGroupsPerVerifier >= 0) {
+			cachedConfig.maxGroupsPerVerifier = Math.floor(parsed.maxGroupsPerVerifier);
 		}
 		if (typeof parsed.verifyConsensus === "boolean") cachedConfig.verifyConsensus = parsed.verifyConsensus;
 		if (Array.isArray(parsed.verifyOnly)) {

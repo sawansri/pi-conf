@@ -150,28 +150,55 @@ export interface SpendingSession {
 	getSessionStats(): { tokens: { input: number; output: number; total: number; cacheRead?: number; cacheWrite?: number }; cost: number };
 }
 
+/** The usage pi attaches to an assistant message. */
+interface MessageUsage {
+	input?: number;
+	output?: number;
+	cacheRead?: number;
+	cacheWrite?: number;
+	totalTokens?: number;
+	cost?: { total?: number };
+}
+
 /**
  * Cut a session once its billed spend crosses `maxUsd`, through the same
  * harvest a timeout gets, so what it verified is kept. At 75% of the budget
  * it is warned, as at 75% of its time, so it wraps up rather than being cut
- * mid-investigation. Time alone does not
- * bound spend: the fastest model makes the most calls in the same budget.
- * Kimi K3.1 Pro fanned out 4 tool calls a turn and spent $3.14 on one review
- * where Sonnet spent $1.18. Spend is checked when an assistant message lands,
- * which is when its usage is known. Returns the unsubscribe.
+ * mid-investigation. Time alone does not bound spend: the fastest model makes
+ * the most calls in the same budget. Kimi K3.1 Pro fanned out 4 tool calls a
+ * turn and spent $3.14 on one review where Sonnet spent $1.18.
+ *
+ * Checked at each assistant message_end. pi persists the message only after
+ * notifying listeners, so getSessionStats() does not include it yet: its own
+ * usage is added here, or the cap lags a turn (gemini ran to $1.79 against a
+ * $1.50 cap that way). A final answer (no tool calls) is never cut: its spend
+ * is already incurred, and the harvest would replace a finished answer.
+ * `spentBeforeUsd` is what earlier error-retry attempts of the same review
+ * spent, since each retry is a fresh session. Returns the unsubscribe.
  */
 export function armSpendCap(
 	session: SpendingSession,
 	deadline: SessionDeadline,
-	opts: { maxUsd: number; inputPerMillion: number | undefined },
+	opts: { maxUsd: number; inputPerMillion: number | undefined; spentBeforeUsd?: number },
 ): () => void {
 	if (!(opts.maxUsd > 0)) return () => {};
 	return session.subscribe((event) => {
 		if (event.type !== "message_end" || deadline.cut.aborted) return;
+		const message = (event as { message?: { role?: string; content?: Array<{ type: string }>; usage?: MessageUsage } }).message;
+		if (message?.role !== "assistant") return;
 		const stats = session.getSessionStats();
-		const spent = billedCost({ ...stats.tokens, cost: stats.cost }, opts.inputPerMillion);
-		if (spent >= opts.maxUsd) deadline.cutNow(`spent ${formatCost(spent)} of its ${formatCost(opts.maxUsd)} budget`);
-		else if (spent >= opts.maxUsd * WARN_FRACTION) deadline.warnBudget(`you have spent ${formatCost(spent)} of your ${formatCost(opts.maxUsd)} budget`);
+		const u = message.usage ?? {};
+		const spent = (opts.spentBeforeUsd ?? 0) + billedCost({
+			input: stats.tokens.input + (u.input ?? 0),
+			output: stats.tokens.output + (u.output ?? 0),
+			total: stats.tokens.total + (u.totalTokens ?? 0),
+			cacheRead: (stats.tokens.cacheRead ?? 0) + (u.cacheRead ?? 0),
+			cacheWrite: (stats.tokens.cacheWrite ?? 0) + (u.cacheWrite ?? 0),
+			cost: stats.cost + (u.cost?.total ?? 0),
+		}, opts.inputPerMillion);
+		const callsTools = (message.content ?? []).some((c) => c.type === "toolCall");
+		if (spent >= opts.maxUsd && callsTools) deadline.cutNow(`spent ${formatCost(spent)} of its ${formatCost(opts.maxUsd)} budget`);
+		else if (spent >= opts.maxUsd * WARN_FRACTION && callsTools) deadline.warnBudget(`you have spent ${formatCost(spent)} of your ${formatCost(opts.maxUsd)} budget`);
 	});
 }
 
