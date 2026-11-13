@@ -339,5 +339,6 @@ test("the cache key wraps a session's onPayload only for listed models, and keep
 	const other = { onPayload: undefined as undefined | ((p: unknown) => Promise<unknown>) };
 	installPromptCacheKey({ agent: other, sessionId: "s2" }, { provider: "amd-gateway", id: "gemini-4-argon" }, ["amd-gateway/Kimi-K3.1-Pro"]);
 	assert.equal(other.onPayload, undefined);
-	assert.deepEqual(DEFAULTS.promptCacheKeyModels, ["amd-gateway/Kimi-K3.1-Pro"]);
+	// Off by default until the Kimi backend is shown to accept the key.
+	assert.deepEqual(DEFAULTS.promptCacheKeyModels, []);
 });
