@@ -1,6 +1,6 @@
 import { type AgentSessionEvent, type ExtensionContext, createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager, SettingsManager } from "@mariozechner/pi-coding-agent";
 import { createGitTool, createProgressTool, createRunTool } from "./agent-tools.ts";
-import { type LateSession, StragglerCutoff, armWarning, harvest, startDeadline } from "./deadline.ts";
+import { type LateSession, StragglerCutoff, armSpendCap, armWarning, harvest, startDeadline } from "./deadline.ts";
 import { type Model, type ReviewerSpec, type ThinkingLevelAlias, formatReviewerSpec } from "./config.ts";
 import type { ModelUsage } from "./cost.ts";
 import { type ReviewerFinding, type ReviewerRunResult, parseReviewerJson } from "./findings.ts";
@@ -60,6 +60,8 @@ export function promptWithFilterRetry(
 }
 
 export interface AgenticExtras {
+	/** Cut and harvest the session once it has spent this much (config.sessionMaxCostUsd); needs `late`. */
+	maxCostUsd?: number;
 	/** Directory for the sandboxed `run` tool; unset means no `run`. */
 	runDir?: string;
 	sandboxHomeDirs?: string[];
@@ -315,6 +317,9 @@ async function runAgenticReviewer(
 	});
 	if (nativeSearch) installNativeWebSearch(session, onEvent);
 	const unwarn = armWarning(session, extras.late, progressState, onEvent);
+	const uncap = extras.late && extras.maxCostUsd
+		? armSpendCap(session, extras.late.deadline, { maxUsd: extras.maxCostUsd, inputPerMillion: model.cost?.input })
+		: () => {};
 	const onAbort = () => void session.abort();
 	signal.addEventListener("abort", onAbort, { once: true });
 	const unsubscribe = onEvent ? session.subscribe(onEvent) : undefined;
@@ -402,6 +407,7 @@ async function runAgenticReviewer(
 		};
 	} finally {
 		unwarn();
+		uncap();
 		signal.removeEventListener("abort", onAbort);
 		unsubscribe?.();
 		session.dispose();
@@ -456,6 +462,8 @@ export interface ReviewerRunOptions {
 	minToolCalls?: number;
 	/** Cap on one read/grep result's text (tool-budget.ts); 0 = pi's default. */
 	readMaxChars?: number;
+	/** Spend cap per session (config.sessionMaxCostUsd); 0 or unset = none. */
+	maxCostUsd?: number;
 	/**
 	 * Per-spec overrides for `readMaxChars`, looked up by the reviewer's spec
 	 * (see config.readMaxCharsFor). A pool-wide cap would either be too tight
@@ -506,6 +514,7 @@ export async function runReviewer(
 				minToolCalls: verifying ? undefined : runOpts.minToolCalls,
 				late: { deadline, userSignal: abortSignal, finalFormat: JSON_FINAL_FORMAT },
 				readMaxChars,
+				maxCostUsd: runOpts.maxCostUsd,
 			},
 		)
 		: callModel(ctx, model, systemPrompt + modelAddendum(model), userPrompt, {

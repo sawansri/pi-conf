@@ -170,6 +170,15 @@ export interface MultiReviewConfig {
 	 */
 	readMaxCharsByModel: Record<string, number>;
 	/**
+	 * Spend cap for one reviewer or verifier session, in USD at the gateway's
+	 * billed rates (cache included); 0 disables it. A session that reaches it
+	 * is cut and harvested like one that ran out of time, so its findings are
+	 * kept. The time budget alone does not bound spend: the fastest model
+	 * makes the most tool calls in it. Kimi K3.1 Pro spent $3.14 on one
+	 * review, where Sonnet spent $1.18 on the same change.
+	 */
+	sessionMaxCostUsd: number;
+	/**
 	 * Send only the hunks a verifier needs (its findings' files' diff, plus
 	 * intent and requirements) instead of the whole reviewer brief; falls back
 	 * to the full brief when no diff is available.
@@ -292,6 +301,8 @@ export const DEFAULTS: MultiReviewConfig = {
 	// review, re-reading the same files up to 6 times. Same list price, 8x the
 	// bill, so its reads are capped harder than the pool default.
 	readMaxCharsByModel: { "amd-gateway/Kimi-K3.1-Pro": 12_000 },
+	// Above Sonnet's $1.18 on a large lemonade PR, under half of Kimi's $3.14.
+	sessionMaxCostUsd: 1.5,
 	verifyNarrowContext: false,
 	secondPassMinLines: 0,
 };
@@ -316,6 +327,7 @@ export function reviewerRunOptions(cfg: MultiReviewConfig, spec?: string): Revie
 		timeoutMs: cfg.reviewerTimeoutSec * 1000,
 		sandboxHomeDirs: cfg.sandboxHomeDirs,
 		minToolCalls: cfg.minReviewToolCalls,
+		maxCostUsd: cfg.sessionMaxCostUsd,
 		readMaxChars: spec === undefined ? cfg.readMaxChars : readMaxCharsFor(cfg, spec),
 	};
 }
@@ -441,6 +453,9 @@ export function loadConfig(): MultiReviewConfig {
 				map[key.replace(/\s*#\d+$/, "").replace(/\s*\(verify\)$/, "").replace(/@[a-z]+$/, "").trim()] = Math.floor(value);
 			}
 			cachedConfig.readMaxCharsByModel = map;
+		}
+		if (typeof parsed.sessionMaxCostUsd === "number" && parsed.sessionMaxCostUsd >= 0) {
+			cachedConfig.sessionMaxCostUsd = parsed.sessionMaxCostUsd;
 		}
 		if (typeof parsed.verifyNarrowContext === "boolean") cachedConfig.verifyNarrowContext = parsed.verifyNarrowContext;
 		if (typeof parsed.secondPassMinLines === "number" && parsed.secondPassMinLines >= 0) {

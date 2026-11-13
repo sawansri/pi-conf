@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { DEFAULTS, classifierTarget, dedupeTarget, readMaxCharsFor, scaledMinToolCalls } from "../src/config.ts";
-import { cacheHitRate } from "../src/cost.ts";
+import { DEFAULTS, classifierTarget, dedupeTarget, readMaxCharsFor, reviewerRunOptions, scaledMinToolCalls } from "../src/config.ts";
+import { billedCost, cacheHitRate } from "../src/cost.ts";
 import { applyCliFlags } from "../src/headless.ts";
 import { judgeOutputCap } from "../src/judge.ts";
 import { whichChangedLines } from "../src/pipeline.ts";
@@ -295,4 +295,21 @@ test("--verify and --quick on the headless command line override the brief", () 
 	const both = applyCliFlags({ ...brief, verify: false }, "--quick --verify");
 	assert.equal(both.quick, true);
 	assert.equal(both.verify, true);
+});
+
+test("billed cost adds the cache spend the catalog prices at $0", () => {
+	// The $4.23 run's Kimi review: 1.1M fresh in, 7.06M cache reads at $2/M input.
+	const usage = { input: 1_101_970, output: 22_731, total: 0, cost: 2.43125, cacheRead: 7_064_576, cacheWrite: 0 };
+	assert.equal(billedCost(usage, 2).toFixed(4), (2.43125 + 7_064_576 * 0.05 * 2 / 1e6).toFixed(4));
+	assert.equal(billedCost({ ...usage, cacheRead: 0, cacheWrite: 1_000_000 }, 2).toFixed(4), (2.43125 + 2.5).toFixed(4));
+	assert.equal(billedCost(usage, undefined), 2.43125);
+});
+
+test("every session has a spend cap by default: time alone let Kimi spend $3.14 on one review", () => {
+	assert.equal(DEFAULTS.sessionMaxCostUsd, 1.5);
+});
+
+test("the spend cap reaches reviewer and verifier sessions through their run options", () => {
+	assert.equal(reviewerRunOptions(DEFAULTS).maxCostUsd, 1.5);
+	assert.equal(reviewerRunOptions({ ...DEFAULTS, sessionMaxCostUsd: 0 }).maxCostUsd, 0);
 });

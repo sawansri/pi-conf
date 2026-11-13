@@ -14,6 +14,7 @@
 
 import type { AgentSessionEvent } from "@mariozechner/pi-coding-agent";
 import type { createProgressTool } from "./agent-tools.ts";
+import { billedCost, formatCost } from "./cost.ts";
 import { abortable, lastTurnAssistantText } from "./util.ts";
 
 export const WARN_FRACTION = 0.75;
@@ -61,6 +62,8 @@ export interface SessionDeadline {
 	listen(onWarn: (w: DeadlineWarning) => void): void;
 	/** Seconds until the cut. */
 	secondsLeft(): number;
+	/** Cut now for a reason other than time (the spend cap); the harvest keeps its budget. */
+	cutNow(reason: string): void;
 	dispose(): void;
 }
 
@@ -94,6 +97,16 @@ export function startDeadline(timeoutMs: number, cutoff?: StragglerCutoff, opts:
 		cut: cut.signal,
 		end: end.signal,
 		secondsLeft: () => Math.max(0, Math.round((cutAt - Date.now()) / 1000)),
+		cutNow: (reason) => {
+			if (cut.signal.aborted) return;
+			cutAt = Date.now();
+			clearTimeout(cutTimer);
+			timers.delete(cutTimer);
+			cut.abort(reason);
+			clearTimeout(endTimer);
+			timers.delete(endTimer);
+			endTimer = at(Math.min(hardEnd, cutAt + harvestMs), () => end.abort("harvest ran out of time"));
+		},
 		listen: (onWarn) => {
 			listener = onWarn;
 			if (due !== undefined && !cut.signal.aborted) onWarn({ secondsLeft: deadline.secondsLeft(), why: due });
@@ -124,6 +137,34 @@ export function startDeadline(timeoutMs: number, cutoff?: StragglerCutoff, opts:
 	const unsubscribe = cutoff?.onArm(onCutoff);
 	onCutoff();
 	return deadline;
+}
+
+/** The stats a spend cap reads: an `AgentSession` or a test double. */
+export interface SpendingSession {
+	subscribe(listener: (event: AgentSessionEvent) => void): () => void;
+	getSessionStats(): { tokens: { input: number; output: number; total: number; cacheRead?: number; cacheWrite?: number }; cost: number };
+}
+
+/**
+ * Cut a session once its billed spend crosses `maxUsd`, through the same
+ * harvest a timeout gets, so what it verified is kept. Time alone does not
+ * bound spend: the fastest model makes the most calls in the same budget.
+ * Kimi K3.1 Pro fanned out 4 tool calls a turn and spent $3.14 on one review
+ * where Sonnet spent $1.18. Spend is checked when an assistant message lands,
+ * which is when its usage is known. Returns the unsubscribe.
+ */
+export function armSpendCap(
+	session: SpendingSession,
+	deadline: SessionDeadline,
+	opts: { maxUsd: number; inputPerMillion: number | undefined },
+): () => void {
+	if (!(opts.maxUsd > 0)) return () => {};
+	return session.subscribe((event) => {
+		if (event.type !== "message_end" || deadline.cut.aborted) return;
+		const stats = session.getSessionStats();
+		const spent = billedCost({ ...stats.tokens, cost: stats.cost }, opts.inputPerMillion);
+		if (spent >= opts.maxUsd) deadline.cutNow(`spent ${formatCost(spent)} of its ${formatCost(opts.maxUsd)} budget`);
+	});
 }
 
 /** The warning steered into a straggling session. */

@@ -32,6 +32,17 @@ export const CACHE_WRITE_MULTIPLIER = 1.25;
 export const CACHE_READ_MULTIPLIER = 0.05;
 
 /**
+ * What the gateway actually bills for `usage`: the catalog cost plus the cache
+ * tokens it prices at $0, at the real multipliers. Without the model's input
+ * rate there is nothing to price them with, so the catalog cost stands.
+ */
+export function billedCost(usage: ModelUsage, inputPerMillion: number | undefined): number {
+	if (!inputPerMillion) return usage.cost;
+	const cached = (usage.cacheRead ?? 0) * CACHE_READ_MULTIPLIER + (usage.cacheWrite ?? 0) * CACHE_WRITE_MULTIPLIER;
+	return usage.cost + (cached * inputPerMillion) / 1e6;
+}
+
+/**
  * Share of the prompt billed as a cache read, 0–1. Undefined when the
  * provider reported no cache activity at all (nothing to say).
  */

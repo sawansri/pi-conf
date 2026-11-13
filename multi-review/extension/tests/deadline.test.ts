@@ -1,7 +1,7 @@
 import type { AgentSessionEvent } from "@mariozechner/pi-coding-agent";
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, mock, test } from "node:test";
-import { type DeadlineWarning, HARVEST_MS, type HarvestableSession, type LateSession, StragglerCutoff, armWarning, harvest, harvestPrompt, startDeadline, warningText } from "../src/deadline.ts";
+import { type DeadlineWarning, HARVEST_MS, type HarvestableSession, type LateSession, StragglerCutoff, armSpendCap, armWarning, harvest, harvestPrompt, startDeadline, warningText } from "../src/deadline.ts";
 import { shouldArmStragglerCutoff, stragglerQuorum } from "../src/reviewers.ts";
 
 const MIN = 60_000;
@@ -268,4 +268,73 @@ test("a quorum that can no longer be reached still arms the cutoff", () => {
 	// can never make it unreachable: its cutoff stays the plain timeout.
 	assert.equal(stragglerQuorum(2), Number.POSITIVE_INFINITY);
 	assert.deepEqual(shouldArmStragglerCutoff(2, 1, 1), { arm: false, reason: "wait" });
+});
+
+test("cutNow cuts at once and still leaves the harvest its budget", () => {
+	const d = startDeadline(10 * MIN);
+	mock.timers.tick(2 * MIN);
+	d.cutNow("spent $1.62 of its $1.50 budget");
+	assert.equal(d.cut.aborted, true);
+	assert.equal(d.cut.reason, "spent $1.62 of its $1.50 budget");
+	mock.timers.tick(HARVEST_MS - 1);
+	assert.equal(d.end.aborted, false);
+	mock.timers.tick(1);
+	assert.equal(d.end.aborted, true);
+});
+
+test("cutNow after the cut changes nothing", () => {
+	const d = startDeadline(10 * MIN);
+	mock.timers.tick(9 * MIN);
+	d.cutNow("spent too much");
+	assert.equal(d.cut.reason, "timed out after 600s");
+});
+
+function spendingSession() {
+	const listeners = new Set<(e: AgentSessionEvent) => void>();
+	const s = {
+		stats: { tokens: { input: 0, output: 0, total: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0, toolCalls: 0 },
+		getSessionStats: () => s.stats,
+		subscribe(l: (e: AgentSessionEvent) => void) {
+			listeners.add(l);
+			return () => listeners.delete(l);
+		},
+		emit: (type: string) => { for (const l of listeners) l({ type } as AgentSessionEvent); },
+		listeners,
+	};
+	return s;
+}
+
+test("the spend cap cuts a session once its billed spend, cache included, crosses the cap", () => {
+	const d = startDeadline(10 * MIN);
+	const s = spendingSession();
+	// $2/M input: 7M cached reads bill $0.70 the catalog price leaves out.
+	armSpendCap(s, d, { maxUsd: 1.5, inputPerMillion: 2 });
+	s.stats = { ...s.stats, cost: 0.79, tokens: { ...s.stats.tokens, cacheRead: 7_000_000 } };
+	s.emit("message_end");
+	assert.equal(d.cut.aborted, false);
+	s.stats = { ...s.stats, cost: 0.81 };
+	s.emit("message_end");
+	assert.equal(d.cut.aborted, true);
+	assert.equal(d.cut.reason, "spent $1.510 of its $1.500 budget");
+});
+
+test("no cap, or a cap of 0, never cuts and doesn't listen", () => {
+	const d = startDeadline(10 * MIN);
+	const s = spendingSession();
+	const off = armSpendCap(s, d, { maxUsd: 0, inputPerMillion: 2 });
+	assert.equal(s.listeners.size, 0);
+	s.stats = { ...s.stats, cost: 100 };
+	s.emit("message_end");
+	assert.equal(d.cut.aborted, false);
+	off();
+});
+
+test("the spend cap's unsubscribe stops it", () => {
+	const d = startDeadline(10 * MIN);
+	const s = spendingSession();
+	const off = armSpendCap(s, d, { maxUsd: 1, inputPerMillion: 2 });
+	off();
+	s.stats = { ...s.stats, cost: 5 };
+	s.emit("message_end");
+	assert.equal(d.cut.aborted, false);
 });
