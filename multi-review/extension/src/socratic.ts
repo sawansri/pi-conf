@@ -277,6 +277,7 @@ export async function runSocraticDiscussion(
 			xref: runOpts.xref,
 			webSearch: runOpts.webSearch,
 			readMaxChars: runOpts.readMaxChars,
+			promptCacheKeyModels: runOpts.promptCacheKeyModels,
 		});
 		sessions[idx] = sess;
 		return sess;

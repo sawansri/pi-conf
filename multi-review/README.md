@@ -921,6 +921,7 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
   "judgeMaxTokens": 8000,
   "readMaxChars": 24000,
   "sessionMaxCostUsd": 1.5,
+  "promptCacheKeyModels": ["amd-gateway/Kimi-K3.1-Pro"],
   "verifyNarrowContext": false,
   "secondPassMinLines": 0,
   "webSearch": true,
@@ -962,6 +963,13 @@ read cap shrinks each call but bounds nothing: the time budget was the only
 per-session limit, and the fastest model makes the most calls in it. Kimi
 fanned out ~4 tool calls a turn and spent $3.14 on one large-PR review where
 Sonnet spent $1.18.
+`promptCacheKeyModels` lists the models (`provider/id`) whose reviewer and
+verifier requests carry a per-session `prompt_cache_key`, which routes a
+session's requests to the backend that holds its cached prefix (pi sends one
+itself only to api.openai.com). Kimi was billed 1.1M fresh input tokens in one
+review for a context that ended near 310k, about 3.5x what working prefix
+caching allows; `mr-run-summary` on a new run shows whether the key closed
+the gap (fresh input vs tool output per session).
 `dedupeDefaultModel` is who groups findings when `dedupeModel` is unset
 (default Haiku 5.5: clustering is semantic bookkeeping, not discovery, and the
 answer is validated into a partition either way). `null` restores the old

@@ -5,7 +5,7 @@ import { billedCost, cacheHitRate } from "../src/cost.ts";
 import { applyCliFlags } from "../src/headless.ts";
 import { judgeOutputCap } from "../src/judge.ts";
 import { whichChangedLines } from "../src/pipeline.ts";
-import { capGrepOutput, capReadOutput, capToolResult } from "../src/tool-budget.ts";
+import { capGrepOutput, capReadOutput, capToolResult, installPromptCacheKey, withPromptCacheKey } from "../src/tool-budget.ts";
 import { buildNarrowVerifyPrompt, splitDiffByFile } from "../src/verdicts.ts";
 import type { DedupeGroup } from "../src/grouping.ts";
 
@@ -312,4 +312,32 @@ test("every session has a spend cap by default: time alone let Kimi spend $3.14 
 test("the spend cap reaches reviewer and verifier sessions through their run options", () => {
 	assert.equal(reviewerRunOptions(DEFAULTS).maxCostUsd, 1.5);
 	assert.equal(reviewerRunOptions({ ...DEFAULTS, sessionMaxCostUsd: 0 }).maxCostUsd, 0);
+});
+
+test("a listed model's requests carry the session's prompt_cache_key", async () => {
+	// Kimi paid 1.1M fresh tokens for a context that ended near 310k: its
+	// gateway backend kept missing the cache. A per-session key keeps one
+	// session's requests on the machine that holds its prefix.
+	const payload = { model: "Kimi-K3.1-Pro", messages: [] };
+	const keyed = withPromptCacheKey(payload, "mr-abc") as Record<string, unknown>;
+	assert.equal(keyed.prompt_cache_key, "mr-abc");
+	assert.equal((payload as Record<string, unknown>).prompt_cache_key, undefined, "the original payload is untouched");
+	// A key pi already set wins; anything that isn't a request body passes through.
+	assert.equal((withPromptCacheKey({ ...payload, prompt_cache_key: "pi" }, "mr-abc") as Record<string, unknown>).prompt_cache_key, "pi");
+	assert.equal(withPromptCacheKey("x", "mr-abc"), "x");
+	// OpenAI caps the key's length.
+	assert.equal(((withPromptCacheKey(payload, "k".repeat(100)) as Record<string, unknown>).prompt_cache_key as string).length, 64);
+});
+
+test("the cache key wraps a session's onPayload only for listed models, and keeps pi's own hook", async () => {
+	const seen: unknown[] = [];
+	const agent = { onPayload: async (p: unknown) => { seen.push(p); return undefined; } };
+	installPromptCacheKey({ agent, sessionId: "s1" }, { provider: "amd-gateway", id: "Kimi-K3.1-Pro" }, ["amd-gateway/Kimi-K3.1-Pro"]);
+	const out = (await agent.onPayload({ messages: [] })) as Record<string, unknown>;
+	assert.equal(out.prompt_cache_key, "mr-s1");
+	assert.equal(seen.length, 1);
+	const other = { onPayload: undefined as undefined | ((p: unknown) => Promise<unknown>) };
+	installPromptCacheKey({ agent: other, sessionId: "s2" }, { provider: "amd-gateway", id: "gemini-4-argon" }, ["amd-gateway/Kimi-K3.1-Pro"]);
+	assert.equal(other.onPayload, undefined);
+	assert.deepEqual(DEFAULTS.promptCacheKeyModels, ["amd-gateway/Kimi-K3.1-Pro"]);
 });

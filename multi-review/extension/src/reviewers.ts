@@ -9,6 +9,7 @@ import type { MultiReviewRunResult } from "./pipeline.ts";
 import { REVIEWER_REPRO_ADDENDUM, REVIEWER_TOOLS_ADDENDUM, SOCRATIC_TOOLS_ADDENDUM, VERIFIER_RUN_ADDENDUM, XREF_ADDENDUM, checksRecitation, modelAddendum } from "./prompts.ts";
 import { type SandboxExtras } from "./sandbox.ts";
 import { createBudgetedReadTools } from "./session-tools.ts";
+import { installPromptCacheKey } from "./tool-budget.ts";
 import { ReviewTrace, type ReviewerActivity } from "./trace.ts";
 import { abortable, lastTurnAssistantText, retryOnError } from "./util.ts";
 import { type WebSearchOptions, NO_WEB_ADDENDUM, createWebSearchTool, installNativeWebSearch, searchesNatively, webSearchAddendum, webSearchAvailable } from "./web-search.ts";
@@ -60,6 +61,8 @@ export function promptWithFilterRetry(
 }
 
 export interface AgenticExtras {
+	/** Models whose requests carry a per-session prompt_cache_key (config.promptCacheKeyModels). */
+	promptCacheKeyModels?: string[];
 	/** Cut and harvest the session once it has spent this much (config.sessionMaxCostUsd); needs `late`. */
 	maxCostUsd?: number;
 	/** Directory for the sandboxed `run` tool; unset means no `run`. */
@@ -135,6 +138,7 @@ export async function createReviewerSession(
 		settingsManager,
 		sessionManager: SessionManager.inMemory(cwd),
 	});
+	installPromptCacheKey(session as never, model, extras.promptCacheKeyModels ?? []);
 	let activeOnEvent: ((event: AgentSessionEvent) => void) | undefined;
 	if (nativeSearch) installNativeWebSearch(session, (ev) => activeOnEvent?.(ev));
 
@@ -315,6 +319,7 @@ async function runAgenticReviewer(
 		settingsManager,
 		sessionManager: SessionManager.inMemory(cwd),
 	});
+	installPromptCacheKey(session as never, model, extras.promptCacheKeyModels ?? []);
 	if (nativeSearch) installNativeWebSearch(session, onEvent);
 	const unwarn = armWarning(session, extras.late, progressState, onEvent);
 	const uncap = extras.late && extras.maxCostUsd
@@ -464,6 +469,8 @@ export interface ReviewerRunOptions {
 	readMaxChars?: number;
 	/** Spend cap per session (config.sessionMaxCostUsd); 0 or unset = none. */
 	maxCostUsd?: number;
+	/** See AgenticExtras.promptCacheKeyModels. */
+	promptCacheKeyModels?: string[];
 	/**
 	 * Per-spec overrides for `readMaxChars`, looked up by the reviewer's spec
 	 * (see config.readMaxCharsFor). A pool-wide cap would either be too tight
@@ -515,6 +522,7 @@ export async function runReviewer(
 				late: { deadline, userSignal: abortSignal, finalFormat: JSON_FINAL_FORMAT },
 				readMaxChars,
 				maxCostUsd: runOpts.maxCostUsd,
+				promptCacheKeyModels: runOpts.promptCacheKeyModels,
 			},
 		)
 		: callModel(ctx, model, systemPrompt + modelAddendum(model), userPrompt, {

@@ -94,3 +94,38 @@ export function capToolResult(result: CapableResult, cap: (text: string) => stri
 	const { structuredContent: _dropped, ...rest } = result;
 	return { ...rest, content };
 }
+
+/** OpenAI's limit on `prompt_cache_key`. */
+const PROMPT_CACHE_KEY_MAX = 64;
+
+/**
+ * A request body with `prompt_cache_key` set, unless pi already set one. The
+ * key routes a session's requests to the machine holding its prefix; without
+ * it the gateway's Kimi backend billed one review 1.1M fresh input tokens for
+ * a context that ended near 310k (~3.5x what working prefix caching allows).
+ * pi only sends the key itself for api.openai.com.
+ */
+export function withPromptCacheKey(payload: unknown, key: string): unknown {
+	if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
+	if ((payload as Record<string, unknown>).prompt_cache_key !== undefined) return payload;
+	return { ...payload, prompt_cache_key: key.slice(0, PROMPT_CACHE_KEY_MAX) };
+}
+
+type PayloadHook = (payload: unknown, model: never) => unknown | Promise<unknown>;
+
+/**
+ * Key every request of a session whose model is listed in `models`
+ * (`provider/id`, config.promptCacheKeyModels), on top of whatever onPayload
+ * pi installed. pi reads `agent.onPayload` per request, so wrapping it after
+ * the session is created is enough.
+ */
+export function installPromptCacheKey(
+	session: { agent: { onPayload?: PayloadHook }; sessionId: string },
+	model: { provider: string; id: string },
+	models: readonly string[],
+): void {
+	if (!models.includes(`${model.provider}/${model.id}`)) return;
+	const inner = session.agent.onPayload;
+	const key = `mr-${session.sessionId}`;
+	session.agent.onPayload = async (payload, m) => withPromptCacheKey((await inner?.(payload, m)) ?? payload, key);
+}

@@ -193,6 +193,14 @@ export interface MultiReviewConfig {
 	 */
 	sessionMaxCostUsd: number;
 	/**
+	 * Models (`provider/id`) whose reviewer and verifier requests carry a
+	 * per-session `prompt_cache_key`, which keeps a session's requests on the
+	 * backend that holds its cached prefix. pi sends one only to
+	 * api.openai.com. Kimi K3.1 Pro was billed 1.1M fresh input tokens in one
+	 * review for a context that ended near 310k.
+	 */
+	promptCacheKeyModels: string[];
+	/**
 	 * Send only the hunks a verifier needs (its findings' files' diff, plus
 	 * intent and requirements) instead of the whole reviewer brief; falls back
 	 * to the full brief when no diff is available.
@@ -319,6 +327,7 @@ export const DEFAULTS: MultiReviewConfig = {
 	readMaxCharsByModel: { "amd-gateway/Kimi-K3.1-Pro": 12_000 },
 	// Above Sonnet's $1.18 on a large lemonade PR, under half of Kimi's $3.14.
 	sessionMaxCostUsd: 1.5,
+	promptCacheKeyModels: ["amd-gateway/Kimi-K3.1-Pro"],
 	verifyNarrowContext: false,
 	secondPassMinLines: 0,
 };
@@ -344,6 +353,7 @@ export function reviewerRunOptions(cfg: MultiReviewConfig, spec?: string): Revie
 		sandboxHomeDirs: cfg.sandboxHomeDirs,
 		minToolCalls: cfg.minReviewToolCalls,
 		maxCostUsd: cfg.sessionMaxCostUsd,
+		promptCacheKeyModels: cfg.promptCacheKeyModels,
 		readMaxChars: spec === undefined ? cfg.readMaxChars : readMaxCharsFor(cfg, spec),
 	};
 }
@@ -476,6 +486,11 @@ export function loadConfig(): MultiReviewConfig {
 				map[key.replace(/\s*#\d+$/, "").replace(/\s*\(verify\)$/, "").replace(/@[a-z]+$/, "").trim()] = Math.floor(value);
 			}
 			cachedConfig.readMaxCharsByModel = map;
+		}
+		if (Array.isArray(parsed.promptCacheKeyModels)) {
+			cachedConfig.promptCacheKeyModels = parsed.promptCacheKeyModels
+				.filter((x: unknown): x is string => typeof x === "string" && x.includes("/"))
+				.map((x: string) => x.replace(/@[a-z]+$/, ""));
 		}
 		if (typeof parsed.sessionMaxCostUsd === "number" && parsed.sessionMaxCostUsd >= 0) {
 			cachedConfig.sessionMaxCostUsd = parsed.sessionMaxCostUsd;
