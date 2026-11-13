@@ -16,8 +16,11 @@ $PI_CODING_AGENT_DIR/models.json. Without result.json (a run that was
 cancelled, or interactive) only the last three sessions' costs survive, in
 progress.json's events.
 
-Caveat: trace.jsonl truncates tool_result text, so it can count calls but not
-measure how much each one added to the context.
+Traces written since per-turn usage was added also give each session's
+fresh (uncached) input against the tool output it received (~4 chars a
+token). With working prefix caching the two are close; fresh input several
+times the tool output means the provider's cache is missing. Older traces
+have neither, so the line is left out.
 """
 import collections
 import json
@@ -60,6 +63,8 @@ def summarize(run_dir, rates):
     tools = collections.defaultdict(collections.Counter)
     reads = collections.defaultdict(collections.Counter)
     notes = {}
+    fresh = collections.Counter()
+    result_chars = collections.Counter()
     for e in events:
         key = (e.get("reviewer", "?"), e.get("phase", "?"))
         if e.get("kind") == "tool":
@@ -67,6 +72,10 @@ def summarize(run_dir, rates):
             if e.get("tool") == "read":
                 args = e.get("args") or {}
                 reads[key][args.get("path") or args.get("file_path")] += 1
+        elif e.get("kind") == "message" and e.get("usage"):
+            fresh[key] += e["usage"].get("input", 0) + e["usage"].get("cacheWrite", 0)
+        elif e.get("kind") == "tool_result" and "chars" in e:
+            result_chars[key] += e["chars"]
         elif e.get("kind") == "finish":
             notes[key] = e.get("note")
 
@@ -102,6 +111,10 @@ def summarize(run_dir, rates):
         c = costs.get(name.replace(" (verify)", "")) if phase != "verify" else costs.get(bare(reviewer) + " (verify)")
         if c:
             line += f"\n{'':57}catalog ${c[0]:.3f}  billed ${c[1]:.3f}  fresh-in {c[2] / 1e3:.0f}k  cache-read {c[3] / 1e6:.1f}M"
+        if fresh[key]:
+            got = result_chars[key] / 4
+            ratio = f"{fresh[key] / got:.1f}x" if got else "n/a"
+            line += f"\n{'':57}fresh-in {fresh[key] / 1e3:.0f}k tokens vs tool output ~{got / 1e3:.0f}k ({ratio})"
         rereads = [(p, n) for p, n in reads[key].most_common(3) if n > 2]
         if rereads:
             line += f"\n{'':57}re-read: {rereads}"

@@ -132,11 +132,14 @@ export class ReviewTrace {
 					const { retry, error } = event as unknown as { retry: number; error: string };
 					a.lastTool = `retry ${retry} after error`;
 					this.append(a, { kind: "error_retry", retry, error: error.slice(0, 300) });
-				} else if (event.type === "tool_execution_end" && (event.toolName === GIT_TOOL || event.toolName === RUN_TOOL || event.toolName === XREF_TOOL || event.toolName === WEB_SEARCH_TOOL)) {
-					// Executed commands are evidence; keep the head of what they returned.
+				} else if (event.type === "tool_execution_end") {
+					// Every result's size: it enters the context as fresh input, which is
+					// what a run pays for. Executed commands are evidence too, so keep the
+					// head of what they returned.
 					const content = ((event.result as { content?: Array<{ type: string; text?: string }> } | undefined)?.content ?? []);
 					const text = content.filter((c) => c.type === "text").map((c) => c.text ?? "").join("");
-					this.append(a, { kind: "tool_result", tool: event.toolName, isError: event.isError, text: text.slice(0, 600) });
+					const evidence = event.toolName === GIT_TOOL || event.toolName === RUN_TOOL || event.toolName === XREF_TOOL || event.toolName === WEB_SEARCH_TOOL;
+					this.append(a, { kind: "tool_result", tool: event.toolName, isError: event.isError, chars: text.length, ...(evidence ? { text: text.slice(0, 600) } : {}) });
 					return;
 				} else if (event.type === "tool_execution_start") {
 					a.toolCalls++;
@@ -150,7 +153,11 @@ export class ReviewTrace {
 					const content = ((event.message as { content?: unknown[] }).content ?? []) as Array<{ type: string; text?: string; thinking?: string }>;
 					const thinking = content.filter((c) => c.type === "thinking").map((c) => c.thinking ?? "").join("\n");
 					const text = content.filter((c) => c.type === "text").map((c) => c.text ?? "").join("");
-					if (thinking || text) this.append(a, { kind: "message", turn: a.turns, thinking, text });
+					// Usage per turn shows where a session's cache missed; a turn that only
+					// calls tools has no text but was billed all the same.
+					const u = (event.message as { usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number } }).usage;
+					const usage = u ? { input: u.input ?? 0, output: u.output ?? 0, cacheRead: u.cacheRead ?? 0, cacheWrite: u.cacheWrite ?? 0 } : undefined;
+					if (thinking || text || usage) this.append(a, { kind: "message", turn: a.turns, thinking, text, ...(usage ? { usage } : {}) });
 				} else return;
 				this.schedule();
 			},
