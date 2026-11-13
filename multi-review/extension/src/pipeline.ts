@@ -19,7 +19,7 @@ import { prClaimAsGroup, prCommentsMarkdown, suspicionAsGroup, suspicionMarkdown
 import { type ReviewTarget, buildReviewTarget, exec, preparePrCheckout } from "./target.ts";
 import { ReviewTrace } from "./trace.ts";
 import { buildNarrowVerifyPrompt } from "./verdicts.ts";
-import { runVerification } from "./verify.ts";
+import { runVerification, selectForVerification } from "./verify.ts";
 import { createXrefService } from "./xref.ts";
 
 /**
@@ -638,7 +638,9 @@ async function runReviewPipeline(
 	// By run, not model: one partial pass doesn't make the other's findings partial.
 	const runKey = (r: { spec: string; pass?: number }) => `${r.spec}#${r.pass ?? 1}`;
 	const partialRuns = new Set(runs.filter((r) => r.partial).map(runKey));
-	const findingGroups = flags.verify ? groups : groups.filter((g) => g.members.some((m) => partialRuns.has(runKey(m))));
+	const findingGroups = flags.verify
+		? selectForVerification(groups, cfg.verifyConsensus)
+		: groups.filter((g) => g.members.some((m) => partialRuns.has(runKey(m))));
 	const toVerify = [...findingGroups, ...suspicionGroups, ...prClaimGroups];
 	if (toVerify.length > 0 && verifyTimeLeft < MIN_PHASE_MS) {
 		const unverifiedPartial = partialRuns.size > 0 ? "; partial reviewers' findings are unverified" : "";

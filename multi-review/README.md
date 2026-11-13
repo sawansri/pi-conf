@@ -900,6 +900,8 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
   "verify": false,
   "verifiersPerFinding": 1,
   "verifyOnly": [],
+  "verifiers": ["amd-gateway/gpt-6.1-sol", "amd-gateway-anthropic/Claude-Sonnet-5.5"],
+  "verifyConsensus": false,
   "secondPass": ["amd-gateway-anthropic/Claude-Sonnet-5.5"],
   "quickReviewers": [
     "amd-gateway/gpt-6-luna@low",
@@ -932,6 +934,17 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
 one, because both alternate verifiers timed out and returned no verdicts, so
 k=1 delivers what the run achieved for half the verify bill. Raise it when the
 pool is healthy and false positives are expensive.
+`verifiers` lists the preferred verifiers (`provider/id`), in order: they
+take the verify round's work, balanced by load, and the rest of the pool only
+verifies findings every preferred model raised itself (a model can't verify
+its own finding). `[]` balances over the whole pool. The default is gpt-6.1-sol, then
+Sonnet: in one run Kimi's verify session cost $1.22 and Sonnet's $0.58, while
+gpt-6.1-sol caches its whole prefix and costs about a tenth of either.
+`verifyConsensus: false` skips verifying findings that two or more distinct
+models raised independently (one model's two passes don't count); the review
+notes why each one was skipped. Over 5 real runs verification returned 75
+confirmations to 6 refutations, and none of the refuted findings had a
+second model behind it.
 `readMaxCharsByModel` overrides `readMaxChars` per model (`provider/id`; the
 `@level`, `#2` and `(verify)` suffixes are normalized away, so one entry covers
 a model's every session). Kimi defaults to 12k against the pool's 24k: in one

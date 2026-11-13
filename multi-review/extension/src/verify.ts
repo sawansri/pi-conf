@@ -10,17 +10,25 @@ import { mapWithConcurrency } from "./util.ts";
 // ---------- verification round ----------
 
 /**
- * Assign each group to `k` verifiers who did not raise it, balancing load
- * (least-loaded first, pool order breaks ties). Verifying your own finding
- * is not independent evidence, so raisers are never assigned; a group
- * every reviewer raised gets a note instead.
+ * Assign each group to `k` verifiers who did not raise it. Models in
+ * `preferred` (config.verifiers) are used first, balanced by load with the
+ * preference order breaking ties; the rest of the pool only verifies what no
+ * preferred model can. With no preference, load balances over the pool,
+ * pool order breaking ties. Verifying your own finding is not independent
+ * evidence, so raisers are never assigned; a group every reviewer raised
+ * gets a note instead.
  */
-export function assignVerifiers(groups: DedupeGroup[], pool: ModelSpec[], k: number): Map<ModelSpec, string[]> {
+export function assignVerifiers(groups: DedupeGroup[], pool: ModelSpec[], k: number, preferred: readonly string[] = []): Map<ModelSpec, string[]> {
 	const load = new Map<ModelSpec, string[]>(pool.map((spec) => [spec, []]));
+	const rank = (spec: ModelSpec) => {
+		const i = preferred.indexOf(spec);
+		return i === -1 ? preferred.length + pool.indexOf(spec) : i;
+	};
+	const tier = (spec: ModelSpec) => (preferred.includes(spec) ? 0 : 1);
 	for (const g of groups) {
 		const candidates = pool
 			.filter((spec) => !g.reviewerSpecs.includes(spec))
-			.sort((a, b) => load.get(a)!.length - load.get(b)!.length || pool.indexOf(a) - pool.indexOf(b))
+			.sort((a, b) => tier(a) - tier(b) || load.get(a)!.length - load.get(b)!.length || rank(a) - rank(b))
 			.slice(0, k);
 		for (const spec of candidates) load.get(spec)!.push(g.id);
 		g.verifiers = candidates.length;
@@ -29,6 +37,23 @@ export function assignVerifiers(groups: DedupeGroup[], pool: ModelSpec[], k: num
 	}
 	for (const [spec, ids] of load) if (ids.length === 0) load.delete(spec);
 	return load;
+}
+
+/**
+ * The finding groups worth a verifier. A group two or more distinct models
+ * raised independently already has its corroboration: over 5 real runs
+ * verification returned 75 confirmations to 6 refutations, and none of the
+ * refuted findings had a second model behind it. Skipped groups get a note
+ * saying why. One model's two passes agreeing is not independent, so those
+ * groups are still verified (`consensus` counts distinct models).
+ */
+export function selectForVerification(groups: DedupeGroup[], verifyConsensus: boolean): DedupeGroup[] {
+	if (verifyConsensus) return groups;
+	return groups.filter((g) => {
+		if (!g.consensus) return true;
+		g.verificationNote = `raised independently by ${g.reviewerSpecs.length} models — not re-verified`;
+		return false;
+	});
 }
 
 /**
@@ -53,7 +78,7 @@ export async function runVerification(
 	// having raised nothing, they're the most independent checkers. `rows`
 	// also carries the verify-only models, after the reviewers.
 	const pool = rows.map((r) => r.rs.spec);
-	const assignments = [...assignVerifiers(groups, pool, cfg.verifiersPerFinding)];
+	const assignments = [...assignVerifiers(groups, pool, cfg.verifiersPerFinding, cfg.verifiers)];
 	const byId = new Map(groups.map((g) => [g.id, g]));
 	const failures: string[] = [];
 	// Verification re-sends the brief to every verifier, so it is often the

@@ -88,6 +88,20 @@ export interface MultiReviewConfig {
 	 */
 	verifyOnly: string[];
 	/**
+	 * Preferred verifiers (`provider/id`), in order. They take the verify
+	 * round's work, balanced by load; other pool models verify only findings
+	 * every preferred model raised itself. Empty balances over the whole pool.
+	 * Kimi's verify session cost $1.22 in one run and Sonnet's $0.58, while
+	 * gpt-6.1-sol caches its whole prefix and reviews for about $0.10.
+	 */
+	verifiers: string[];
+	/**
+	 * Also verify findings two or more distinct models raised independently.
+	 * Off: over 5 real runs no such finding was refuted, so its verifier
+	 * bought nothing.
+	 */
+	verifyConsensus: boolean;
+	/**
 	 * Reviewers (by provider/id) that review twice, the second pass with the
 	 * diff's files in reverse order. Runs of one model vary a lot, and
 	 * combining them raised F1 by up to 44% on SWR-Bench; agreement between
@@ -269,6 +283,8 @@ export const DEFAULTS: MultiReviewConfig = {
 	verify: false,
 	verifiersPerFinding: 1,
 	verifyOnly: [],
+	verifiers: ["amd-gateway/gpt-6.1-sol", "amd-gateway-anthropic/Claude-Sonnet-5.5"],
+	verifyConsensus: false,
 	// Sonnet: the best recall per second in the pool.
 	secondPass: ["amd-gateway-anthropic/Claude-Sonnet-5.5"],
 	quickReviewers: [
@@ -414,6 +430,13 @@ export function loadConfig(): MultiReviewConfig {
 		if (typeof parsed.verifiersPerFinding === "number" && parsed.verifiersPerFinding >= 1 && parsed.verifiersPerFinding <= 8) {
 			cachedConfig.verifiersPerFinding = Math.floor(parsed.verifiersPerFinding);
 		}
+		if (Array.isArray(parsed.verifiers)) {
+			// Bare provider/id: the pool is matched by model, whatever its level.
+			cachedConfig.verifiers = parsed.verifiers
+				.filter((x: unknown): x is string => typeof x === "string" && x.includes("/"))
+				.map((x: string) => x.replace(/@[a-z]+$/, ""));
+		}
+		if (typeof parsed.verifyConsensus === "boolean") cachedConfig.verifyConsensus = parsed.verifyConsensus;
 		if (Array.isArray(parsed.verifyOnly)) {
 			cachedConfig.verifyOnly = parsed.verifyOnly.filter((x: unknown): x is string => typeof x === "string" && x.includes("/"));
 		}
