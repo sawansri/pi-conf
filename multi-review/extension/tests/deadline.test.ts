@@ -338,3 +338,30 @@ test("the spend cap's unsubscribe stops it", () => {
 	s.emit("message_end");
 	assert.equal(d.cut.aborted, false);
 });
+
+test("the spend cap warns once at 75% of the budget, before it cuts", () => {
+	const d = startDeadline(10 * MIN);
+	const seen = warnings(d);
+	const s = spendingSession();
+	armSpendCap(s, d, { maxUsd: 1.5, inputPerMillion: 2 });
+	s.stats = { ...s.stats, cost: 1.12 };
+	s.emit("message_end");
+	assert.deepEqual(seen, []);
+	s.stats = { ...s.stats, cost: 1.13 };
+	s.emit("message_end");
+	assert.equal(seen.length, 1);
+	assert.equal(seen[0].budget, true);
+	assert.equal(seen[0].why, "you have spent $1.130 of your $1.500 budget");
+	assert.equal(d.cut.aborted, false);
+	s.stats = { ...s.stats, cost: 1.3 };
+	s.emit("message_end");
+	assert.equal(seen.length, 1);
+});
+
+test("a budget warning talks about spend, not seconds", () => {
+	const text = warningText({ secondsLeft: 400, why: "you have spent $1.130 of your $1.500 budget", budget: true }, { items: ["a", "b", "c"], done: 0 }, "Output ONLY the JSON.");
+	assert.match(text, /^Budget check: you have spent \$1\.130 of your \$1\.500 budget\./);
+	assert.doesNotMatch(text, /400s/);
+	assert.match(text, /Skip the rest of your plan: "b", "c"\./);
+	assert.match(text, /Output ONLY the JSON\.$/);
+});

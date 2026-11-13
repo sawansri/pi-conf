@@ -940,7 +940,11 @@ cost 8x, re-reading the same files up to 6 times.
 `sessionMaxCostUsd` caps what one reviewer or verifier session may spend
 (default $1.50, priced at the gateway's billed rates with cache included; 0
 disables it). A session that reaches it is cut and harvested like one that ran
-out of time, so its findings are kept and the review marks it partial. The
+out of time, so its findings are kept and the review marks it partial. At
+75% of it ($1.125 by default) the session is warned, as at 75% of its time, to
+finish the step it is on and write its answer. The budget is never stated up
+front: a visible budget would push every model toward stopping early, and
+Gemini already did that before the `minReviewToolCalls` nudge. The
 read cap shrinks each call but bounds nothing: the time budget was the only
 per-session limit, and the fastest model makes the most calls in it. Kimi
 fanned out ~4 tool calls a turn and spent $3.14 on one large-PR review where

@@ -49,8 +49,10 @@ export class StragglerCutoff {
 
 export interface DeadlineWarning {
 	secondsLeft: number;
-	/** Why now: the pool's status, or how much of the time is gone. */
+	/** Why now: the pool's status, how much of the time is gone, or how much was spent. */
 	why: string;
+	/** Due to the spend cap, not the clock: the session is told what it spent, not how long it has. */
+	budget?: boolean;
 }
 
 export interface SessionDeadline {
@@ -62,6 +64,8 @@ export interface SessionDeadline {
 	listen(onWarn: (w: DeadlineWarning) => void): void;
 	/** Seconds until the cut. */
 	secondsLeft(): number;
+	/** Warn now about spend (once per session, like the time warning; whichever comes first). */
+	warnBudget(why: string): void;
 	/** Cut now for a reason other than time (the spend cap); the harvest keeps its budget. */
 	cutNow(reason: string): void;
 	dispose(): void;
@@ -87,16 +91,17 @@ export function startDeadline(timeoutMs: number, cutoff?: StragglerCutoff, opts:
 	};
 	let listener: ((w: DeadlineWarning) => void) | undefined;
 	/** Why the warning is due, once it is. */
-	let due: string | undefined;
-	const warn = (why: string) => {
+	let due: Omit<DeadlineWarning, "secondsLeft"> | undefined;
+	const warn = (why: string, budget?: boolean) => {
 		if (due !== undefined || cut.signal.aborted) return;
-		due = why;
-		listener?.({ secondsLeft: deadline.secondsLeft(), why });
+		due = budget ? { why, budget } : { why };
+		listener?.({ secondsLeft: deadline.secondsLeft(), ...due });
 	};
 	const deadline: SessionDeadline = {
 		cut: cut.signal,
 		end: end.signal,
 		secondsLeft: () => Math.max(0, Math.round((cutAt - Date.now()) / 1000)),
+		warnBudget: (why) => warn(why, true),
 		cutNow: (reason) => {
 			if (cut.signal.aborted) return;
 			cutAt = Date.now();
@@ -109,7 +114,7 @@ export function startDeadline(timeoutMs: number, cutoff?: StragglerCutoff, opts:
 		},
 		listen: (onWarn) => {
 			listener = onWarn;
-			if (due !== undefined && !cut.signal.aborted) onWarn({ secondsLeft: deadline.secondsLeft(), why: due });
+			if (due !== undefined && !cut.signal.aborted) onWarn({ secondsLeft: deadline.secondsLeft(), ...due });
 		},
 		dispose: () => {
 			for (const t of timers) clearTimeout(t);
@@ -147,7 +152,9 @@ export interface SpendingSession {
 
 /**
  * Cut a session once its billed spend crosses `maxUsd`, through the same
- * harvest a timeout gets, so what it verified is kept. Time alone does not
+ * harvest a timeout gets, so what it verified is kept. At 75% of the budget
+ * it is warned, as at 75% of its time, so it wraps up rather than being cut
+ * mid-investigation. Time alone does not
  * bound spend: the fastest model makes the most calls in the same budget.
  * Kimi K3.1 Pro fanned out 4 tool calls a turn and spent $3.14 on one review
  * where Sonnet spent $1.18. Spend is checked when an assistant message lands,
@@ -164,6 +171,7 @@ export function armSpendCap(
 		const stats = session.getSessionStats();
 		const spent = billedCost({ ...stats.tokens, cost: stats.cost }, opts.inputPerMillion);
 		if (spent >= opts.maxUsd) deadline.cutNow(`spent ${formatCost(spent)} of its ${formatCost(opts.maxUsd)} budget`);
+		else if (spent >= opts.maxUsd * WARN_FRACTION) deadline.warnBudget(`you have spent ${formatCost(spent)} of your ${formatCost(opts.maxUsd)} budget`);
 	});
 }
 
@@ -172,8 +180,11 @@ export function warningText(w: DeadlineWarning, plan: { items: string[]; done: n
 	// plan.done counts finished items; the one at that index is in progress.
 	const skipped = plan.items.slice(plan.done + 1);
 	const rest = skipped.length ? ` Skip the rest of your plan: ${skipped.map((p) => `"${p}"`).join(", ")}.` : "";
+	const check = w.budget
+		? `Budget check: ${w.why}. You are stopped when it runs out.`
+		: `Time check: ${w.why}. You have about ${w.secondsLeft}s left before you are cut off.`;
 	return (
-		`Time check: ${w.why}. You have about ${w.secondsLeft}s left before you are cut off.` +
+		check +
 		` Finish the step you're on, then stop investigating.${rest}` +
 		` ${finalFormat}`
 	);
