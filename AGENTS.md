@@ -81,7 +81,9 @@ price vs the billed cost. Read the **billed** column.
 ### Traps
 
 - **The reported cost is low.** `models.json` prices cache reads and writes
-  at $0, but the gateway bills 0.05x and 1.25x the input rate (`cost.ts`).
+  at $0, but the gateway bills them: per family, `cacheMultipliers` in
+  `cost.ts`. The `x-token-usage-cost` response header is the ground truth;
+  measure with it rather than inferring rates.
   Anthropic models are under-reported the most: in run `20261111-1321`,
   Sonnet showed $0.30 at catalog price and was billed $1.18. Kimi showed
   $2.43 and was billed $3.14.

@@ -12,7 +12,7 @@ by tool, files read more than twice, and cost.
 
 Cost comes from result.json's details.cost.bySpec. models.json prices cache
 tokens at $0, so the "billed" column re-prices them at the gateway's real
-rates (cost.ts: read 0.05x, write 1.25x input), using the input rate from
+rates (cost.ts cacheMultipliers, per model family), using the input rate from
 $PI_CODING_AGENT_DIR/models.json. Without result.json (a run that was
 cancelled, or interactive) only the last three sessions' costs survive, in
 progress.json's events.
@@ -32,7 +32,14 @@ import os
 import re
 import sys
 
-CACHE_READ, CACHE_WRITE = 0.05, 1.25
+def multipliers(spec):
+    """cost.ts cacheMultipliers: measured from the gateway's x-token-usage-cost."""
+    m = bare(spec).split("/")[-1].lower()
+    if m.startswith("claude"):
+        return 0.1, 1.25
+    if m.startswith("gpt"):
+        return 0.05, 1.25
+    return 0.1, 1.0
 
 
 def input_rates():
@@ -103,7 +110,8 @@ def summarize(run_dir, rates):
         for row in cost["bySpec"]:
             u = row["usage"]
             rate = rates.get(bare(row["spec"]))
-            billed = u["cost"] + (u.get("cacheRead", 0) * CACHE_READ + u.get("cacheWrite", 0) * CACHE_WRITE) * (rate or 0) / 1e6
+            read, write = multipliers(row["spec"])
+            billed = u["cost"] + (u.get("cacheRead", 0) * read + u.get("cacheWrite", 0) * write) * (rate or 0) / 1e6
             costs[row["spec"]] = (u["cost"], billed, u["input"], u.get("cacheRead", 0))
         u = cost["usage"]
         print(f"   run: catalog ${u['cost']:.3f}, {cost['calls']} calls")

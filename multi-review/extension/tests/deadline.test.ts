@@ -316,9 +316,9 @@ function finalTurn(cost: number) {
 test("the spend cap cuts a session once its billed spend, cache included, crosses the cap", () => {
 	const d = startDeadline(10 * MIN);
 	const s = spendingSession();
-	// $2/M input: 7M cached reads bill $0.70 the catalog price leaves out.
+	// $2/M input: 3.5M cached reads at 0.1x bill $0.70 the catalog price leaves out.
 	armSpendCap(s, d, { maxUsd: 1.5, inputPerMillion: 2 });
-	s.stats = { ...s.stats, cost: 0.79, tokens: { ...s.stats.tokens, cacheRead: 7_000_000 } };
+	s.stats = { ...s.stats, cost: 0.79, tokens: { ...s.stats.tokens, cacheRead: 3_500_000 } };
 	s.emit("message_end");
 	assert.equal(d.cut.aborted, false);
 	s.stats = { ...s.stats, cost: 0.81 };

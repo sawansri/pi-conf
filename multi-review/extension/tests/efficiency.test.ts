@@ -301,8 +301,8 @@ test("--verify and --quick on the headless command line override the brief", () 
 test("billed cost adds the cache spend the catalog prices at $0", () => {
 	// The $4.23 run's Kimi review: 1.1M fresh in, 7.06M cache reads at $2/M input.
 	const usage = { input: 1_101_970, output: 22_731, total: 0, cost: 2.43125, cacheRead: 7_064_576, cacheWrite: 0 };
-	assert.equal(billedCost(usage, 2).toFixed(4), (2.43125 + 7_064_576 * 0.05 * 2 / 1e6).toFixed(4));
-	assert.equal(billedCost({ ...usage, cacheRead: 0, cacheWrite: 1_000_000 }, 2).toFixed(4), (2.43125 + 2.5).toFixed(4));
+	assert.equal(billedCost(usage, 2, "Kimi-K3.1-Pro").toFixed(4), (2.43125 + 7_064_576 * 0.1 * 2 / 1e6).toFixed(4));
+	assert.equal(billedCost({ ...usage, cacheRead: 0, cacheWrite: 1_000_000 }, 2, "Claude-Sonnet-5.5").toFixed(4), (2.43125 + 2.5).toFixed(4));
 	assert.equal(billedCost(usage, undefined), 2.43125);
 });
 
@@ -362,4 +362,14 @@ test("usage is carried across error retries, so the run total includes failed at
 	assert.deepEqual(seenBefore, [undefined, 100_000, 249_000]);
 	assert.equal(final.usage.input, 259_000);
 	assert.equal(final.usage.cost.toFixed(2), "0.52");
+});
+
+test("cache tokens are billed at each family's measured multipliers", () => {
+	// x-token-usage-cost on 2026-11-12: Claude reads 0.1x / writes 1.25x;
+	// gpt reads 0.05x and bills every uncached token as a 1.25x write; gemini
+	// reads 0.1x with no write charge.
+	const u = { input: 0, output: 0, total: 0, cost: 0, cacheRead: 1_000_000, cacheWrite: 1_000_000 };
+	assert.equal(billedCost(u, 2, "amd-gateway-anthropic/Claude-Sonnet-5.5").toFixed(2), (0.2 + 2.5).toFixed(2));
+	assert.equal(billedCost(u, 1.36, "amd-gateway/gpt-6.1-sol").toFixed(3), (0.068 + 1.7).toFixed(3));
+	assert.equal(billedCost(u, 2.5, "amd-gateway/gemini-4-argon").toFixed(2), (0.25 + 2.5).toFixed(2));
 });

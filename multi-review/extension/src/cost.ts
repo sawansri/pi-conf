@@ -22,23 +22,30 @@ export interface ModelUsage {
 }
 
 /**
- * The gateway's real cache multipliers, relative to a model's input rate.
- * Measured directly against `llm-api.amd.com` rather than read from
- * `models.json`, whose `cacheRead`/`cacheWrite` are both 0 — which silently
- * treats cached tokens as free and under-reports a cached run by ~1.7x.
- * Anthropic-style caching bills a write at 1.25x input and a read at 0.05x.
+ * The gateway's cache multipliers for a model's family, relative to its input
+ * rate. `models.json` prices cache tokens at $0, which under-reports a cached
+ * run by ~2x. Measured from the gateway's `x-token-usage-cost` response
+ * header on 2026-11-12: Claude reads at 0.1x and writes (5-minute TTL) at
+ * 1.25x; gpt reads at 0.05x and bills every uncached token as a 1.25x write
+ * (pi reports those as cacheWrite); gemini reads at 0.1x with no write charge.
+ * Other families (Kimi) are unmeasured and priced like gemini.
  */
-export const CACHE_WRITE_MULTIPLIER = 1.25;
-export const CACHE_READ_MULTIPLIER = 0.05;
+export function cacheMultipliers(model: string): { read: number; write: number } {
+	const id = model.replace(/^.*\//, "").toLowerCase();
+	if (id.startsWith("claude")) return { read: 0.1, write: 1.25 };
+	if (id.startsWith("gpt")) return { read: 0.05, write: 1.25 };
+	return { read: 0.1, write: 1 };
+}
 
 /**
  * What the gateway actually bills for `usage`: the catalog cost plus the cache
- * tokens it prices at $0, at the real multipliers. Without the model's input
- * rate there is nothing to price them with, so the catalog cost stands.
+ * tokens it prices at $0, at `model`'s family multipliers. Without the model's
+ * input rate there is nothing to price them with, so the catalog cost stands.
  */
-export function billedCost(usage: ModelUsage, inputPerMillion: number | undefined): number {
+export function billedCost(usage: ModelUsage, inputPerMillion: number | undefined, model = ""): number {
 	if (!inputPerMillion) return usage.cost;
-	const cached = (usage.cacheRead ?? 0) * CACHE_READ_MULTIPLIER + (usage.cacheWrite ?? 0) * CACHE_WRITE_MULTIPLIER;
+	const m = cacheMultipliers(model);
+	const cached = (usage.cacheRead ?? 0) * m.read + (usage.cacheWrite ?? 0) * m.write;
 	return usage.cost + (cached * inputPerMillion) / 1e6;
 }
 

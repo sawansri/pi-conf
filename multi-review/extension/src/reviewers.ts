@@ -325,7 +325,7 @@ async function runAgenticReviewer(
 	if (nativeSearch) installNativeWebSearch(session, onEvent);
 	const unwarn = armWarning(session, extras.late, progressState, onEvent);
 	const uncap = extras.late && extras.maxCostUsd
-		? armSpendCap(session, extras.late.deadline, { maxUsd: extras.maxCostUsd, inputPerMillion: model.cost?.input, spentBeforeUsd: extras.spentBeforeUsd })
+		? armSpendCap(session, extras.late.deadline, { maxUsd: extras.maxCostUsd, inputPerMillion: model.cost?.input, spentBeforeUsd: extras.spentBeforeUsd, model: model.id })
 		: () => {};
 	const onAbort = () => void session.abort();
 	signal.addEventListener("abort", onAbort, { once: true });
@@ -525,7 +525,7 @@ export async function runReviewer(
 				late: { deadline, userSignal: abortSignal, finalFormat: JSON_FINAL_FORMAT },
 				readMaxChars,
 				maxCostUsd: runOpts.maxCostUsd,
-				spentBeforeUsd: before ? billedCost(before, model.cost?.input) : 0,
+				spentBeforeUsd: before ? billedCost(before, model.cost?.input, model.id) : 0,
 				promptCacheKeyModels: runOpts.promptCacheKeyModels,
 			},
 		)

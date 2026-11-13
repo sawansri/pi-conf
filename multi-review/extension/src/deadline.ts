@@ -179,7 +179,7 @@ interface MessageUsage {
 export function armSpendCap(
 	session: SpendingSession,
 	deadline: SessionDeadline,
-	opts: { maxUsd: number; inputPerMillion: number | undefined; spentBeforeUsd?: number },
+	opts: { maxUsd: number; inputPerMillion: number | undefined; spentBeforeUsd?: number; model?: string },
 ): () => void {
 	if (!(opts.maxUsd > 0)) return () => {};
 	return session.subscribe((event) => {
@@ -195,7 +195,7 @@ export function armSpendCap(
 			cacheRead: (stats.tokens.cacheRead ?? 0) + (u.cacheRead ?? 0),
 			cacheWrite: (stats.tokens.cacheWrite ?? 0) + (u.cacheWrite ?? 0),
 			cost: stats.cost + (u.cost?.total ?? 0),
-		}, opts.inputPerMillion);
+		}, opts.inputPerMillion, opts.model);
 		const callsTools = (message.content ?? []).some((c) => c.type === "toolCall");
 		if (spent >= opts.maxUsd && callsTools) deadline.cutNow(`spent ${formatCost(spent)} of its ${formatCost(opts.maxUsd)} budget`);
 		else if (spent >= opts.maxUsd * WARN_FRACTION && callsTools) deadline.warnBudget(`you have spent ${formatCost(spent)} of your ${formatCost(opts.maxUsd)} budget`);
