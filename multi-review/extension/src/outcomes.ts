@@ -40,6 +40,23 @@ export function outcomesPath(): string {
 	return path.join(data, "multi-review", "outcomes.jsonl");
 }
 
+/**
+ * Where run directories (trace, progress, result) are kept: next to the
+ * outcomes log, because /tmp is cleared on reboot and took every run with it
+ * (77 run directories on Nov 10, one left two days later).
+ */
+export function runsHome(): string {
+	return path.join(path.dirname(outcomesPath()), "runs");
+}
+
+/** A fresh directory for one run, `YYYYMMDD-HHMMSS-xxxxxx`, so `ls` lists runs by start time. */
+export function newRunDir(now = new Date()): string {
+	const p = (n: number) => String(n).padStart(2, "0");
+	const stamp = `${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}-${p(now.getHours())}${p(now.getMinutes())}${p(now.getSeconds())}`;
+	fs.mkdirSync(runsHome(), { recursive: true });
+	return fs.mkdtempSync(path.join(runsHome(), `${stamp}-`));
+}
+
 export function readOutcomes(file = outcomesPath()): OutcomeRecord[] {
 	let text: string;
 	try {

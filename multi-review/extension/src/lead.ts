@@ -1,5 +1,7 @@
+import * as path from "node:path";
 import { parseReviewArgs } from "./args.ts";
 import type { ReviewFlags } from "./config.ts";
+import { runsHome } from "./outcomes.ts";
 
 /**
  * Turn a `/multi-review` invocation into a task for the main agent. The agent
@@ -152,7 +154,7 @@ export function leadJudgmentInstructions(hasSpec: boolean, prNumber?: number): s
 		"",
 		...(prNumber !== undefined
 			? [
-				`Draft replies: after the verdict, write a reply for each triaged PR comment (valid → what will be fixed and how; invalid → the code evidence; question → the answer) into a local markdown file such as /tmp/multi-review/pr-${prNumber}-replies.md — one section per comment with its link. NEVER post to GitHub or resolve threads (not via gh, not via the API): the user posts replies themselves. Tell the user where the file is.`,
+				`Draft replies: after the verdict, write a reply for each triaged PR comment (valid → what will be fixed and how; invalid → the code evidence; question → the answer) into a local markdown file such as ${path.join(runsHome(), `pr-${prNumber}-replies.md`)} — one section per comment with its link. NEVER post to GitHub or resolve threads (not via gh, not via the API): the user posts replies themselves. Tell the user where the file is.`,
 				"",
 			]
 			: []),

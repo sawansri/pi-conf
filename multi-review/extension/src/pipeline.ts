@@ -1,5 +1,4 @@
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { type ParsedReviewArgs, parseAuthorFlags, parseBoolFlag, parseReviewArgs, parseReviewFlags, parseSocraticFlags, parseValueFlag } from "./args.ts";
@@ -17,7 +16,7 @@ import type { MultiReviewDetails } from "./render.ts";
 import { type ReviewerRunOptions, allReviewersFailedResult, runAllReviewers, throwIfAborted } from "./reviewers.ts";
 import { type SandboxExtras, sandboxUnavailable } from "./sandbox.ts";
 import { DEFAULT_SOCRATIC_ROUNDS, MAX_SOCRATIC_ROUNDS, runSocraticDiscussion, runSocraticJudge, synthesizeSocraticLeadView } from "./socratic.ts";
-import { readOutcomes, trackRecordLines } from "./outcomes.ts";
+import { newRunDir, readOutcomes, trackRecordLines } from "./outcomes.ts";
 import { prClaimAsGroup, prCommentsMarkdown, suspicionAsGroup, suspicionMarkdown, synthesizeLeadView, synthesizeMarkdownFromGroups, synthesizeNoFindingsMarkdown } from "./synthesis.ts";
 import { type ReviewTarget, buildReviewTarget, exec, preparePrCheckout } from "./target.ts";
 import { ReviewTrace } from "./trace.ts";
@@ -220,7 +219,7 @@ export async function runMultiReviewFromArgs(
 				}),
 			cleanups,
 		};
-		trace = new ReviewTrace(runOptions.traceDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "multi-review-")), (lines) => progress.activity(lines));
+		trace = new ReviewTrace(runOptions.traceDir ?? newRunDir(), (lines) => progress.activity(lines));
 		runOpts.trace = trace;
 		const runTrace = trace;
 		progress.mirror((run) => runTrace.setRun(run));

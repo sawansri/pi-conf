@@ -9,6 +9,7 @@ import { normalizeAuthorFilter } from "./pr-comments.ts";
 import type { ToolUpdateFn } from "./progress.ts";
 import type { MultiReviewDetails } from "./render.ts";
 import { MAX_SOCRATIC_ROUNDS, socraticLeadInstructions } from "./socratic.ts";
+import { newRunDir } from "./outcomes.ts";
 
 /**
  * Brief fields shared by the multi_review tool and the headless
@@ -239,7 +240,7 @@ export async function runHeadless(pi: ExtensionAPI, args: string, ctx: Extension
 	const outFlag = parseValueFlag(briefFlag.rest, "out");
 	const maxFlag = parseValueFlag(outFlag.rest, "max-seconds");
 	const maxSeconds = maxFlag.value ? Number(maxFlag.value) : HEADLESS_DEFAULT_MAX_SECONDS;
-	const outPath = path.resolve(ctx.cwd, outFlag.value ?? path.join(os.tmpdir(), `multi-review-${Date.now()}.json`));
+	const outPath = path.resolve(ctx.cwd, outFlag.value ?? path.join(newRunDir(), "result.json"));
 	const mdPath = outPath.replace(/\.json$/, "") + ".md";
 	const fail = (error: string) => {
 		fs.mkdirSync(path.dirname(outPath), { recursive: true });

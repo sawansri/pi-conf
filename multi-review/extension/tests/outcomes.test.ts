@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
-import { MIN_TRACK_RECORD, type OutcomeRecord, readOutcomes, recordOutcomes, trackRecordLines, trackRecords } from "../src/outcomes.ts";
+import { MIN_TRACK_RECORD, type OutcomeRecord, newRunDir, outcomesPath, readOutcomes, recordOutcomes, runsHome, trackRecordLines, trackRecords } from "../src/outcomes.ts";
 
 function runDir(groups: unknown[], buckets: Record<string, string>): string {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mr-outcomes-"));
@@ -70,4 +70,35 @@ test("an issue both of a model's passes raised is one finding in its track recor
 	const both = [...Array(MIN_TRACK_RECORD)].flatMap((_, i) => [{ ...rec("p/sonnet", "act_on"), group: `g${i}` }, { ...rec("p/sonnet", "act_on"), group: `g${i}`, pass: 2 }]);
 	assert.equal(trackRecords(both, ["p/sonnet"])[0].n, MIN_TRACK_RECORD);
 	assert.deepEqual(trackRecords(both.slice(0, MIN_TRACK_RECORD + 2), ["p/sonnet"]), []);
+});
+
+test("runs are kept with the outcomes log, not in /tmp, which a reboot clears", () => {
+	const saved = process.env.XDG_DATA_HOME;
+	try {
+		delete process.env.XDG_DATA_HOME;
+		assert.equal(runsHome(), path.join(os.homedir(), ".local", "share", "multi-review", "runs"));
+		const data = fs.mkdtempSync(path.join(os.tmpdir(), "mr-data-"));
+		process.env.XDG_DATA_HOME = data;
+		assert.equal(runsHome(), path.join(data, "multi-review", "runs"));
+		assert.equal(path.dirname(runsHome()), path.dirname(outcomesPath()));
+	} finally {
+		if (saved === undefined) delete process.env.XDG_DATA_HOME;
+		else process.env.XDG_DATA_HOME = saved;
+	}
+});
+
+test("each run gets its own directory, named so they sort by start time", () => {
+	const saved = process.env.XDG_DATA_HOME;
+	try {
+		process.env.XDG_DATA_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "mr-data-"));
+		const a = newRunDir(new Date(2026, 10, 12, 9, 5, 7));
+		const b = newRunDir(new Date(2026, 10, 12, 9, 5, 7));
+		assert.notEqual(a, b);
+		assert.equal(path.dirname(a), runsHome());
+		assert.match(path.basename(a), /^20261112-090507-/);
+		assert.ok(fs.statSync(a).isDirectory());
+	} finally {
+		if (saved === undefined) delete process.env.XDG_DATA_HOME;
+		else process.env.XDG_DATA_HOME = saved;
+	}
 });
