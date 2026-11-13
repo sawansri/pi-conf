@@ -34,7 +34,7 @@ If this conversation produced the change, you already have most of this. Still l
 
 Reviewers do NOT see this conversation. Give them what they can't discover, but not where you think the bugs are. Independent discovery is the point. Hypotheses in the brief anchor every reviewer on the same spots, turn "consensus" into an echo of your prompt, and copy your blind spots into theirs.
 
-Write a JSON file (e.g. `/tmp/multi-review/<timestamp>/brief.json`; create the directory first). All fields are optional; text fields are strings, list fields are arrays of strings.
+Write a JSON file (e.g. `~/.local/share/multi-review/runs/<timestamp>/brief.json`, with `~` written out as the absolute home path; create the directory first). Runs are kept there rather than in `/tmp`, which a reboot clears. All fields are optional; text fields are strings, list fields are arrays of strings.
 
 For a **code review**:
 ```json
@@ -83,7 +83,7 @@ For a **Socratic discussion** (when `--socratic` / `--discuss` is passed, or whe
 pi -p "/multi-review-run --brief=<brief.json> --out=<dir>/result.json" < /dev/null
 ```
 
-- Write the command exactly in this form, with literal absolute paths (e.g. `/tmp/multi-review/20261030-1215/brief.json`): no shell variables or `$(...)`, nothing chained before it (no `cd …;`, no assignments), and nothing after `< /dev/null` (no `2>&1 | tail`). That form matches the pre-approved `Bash(pi -p *)` rule, keeps pi's stderr progress visible, and lets the `multi-review-status` mod show the run live above the prompt. The review's scope comes from the working directory: if the shell isn't at the repo root, `cd` there in a separate Bash call first.
+- Write the command exactly in this form, with literal absolute paths (e.g. `/home/<user>/.local/share/multi-review/runs/20261030-1215/brief.json`): no shell variables or `$(...)`, nothing chained before it (no `cd …;`, no assignments), and nothing after `< /dev/null` (no `2>&1 | tail`). That form matches the pre-approved `Bash(pi -p *)` rule, keeps pi's stderr progress visible, and lets the `multi-review-status` mod show the run live above the prompt. The review's scope comes from the working directory: if the shell isn't at the repo root, `cd` there in a separate Bash call first.
 - Run it in the **foreground** with the Bash tool's maximum timeout (`timeout: 600000`). It typically takes 1–5 minutes. Don't use `run_in_background`: non-interactive sessions end before it finishes.
 - The run fits itself into `--max-seconds` (default 540, inside the 10-minute Bash cap). It shrinks reviewer timeouts, and when time runs short it skips verification with a warning instead of overrunning. Any such warning is in the result's Warnings section; mention it to the user.
 - `< /dev/null` is required: `pi -p` waits for stdin to close before it starts.

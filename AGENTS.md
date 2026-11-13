@@ -59,12 +59,14 @@ points to them instead of repeating them:
 
 | Run | Directory | Files |
 |---|---|---|
-| Interactive (pi) | `/tmp/multi-review-XXXXXX/` | `progress.json`, `trace.jsonl` |
-| Headless (skill, `--out`) | `/tmp/multi-review/<name>/` | the above + `brief.json`, `result.json`, `result.md`, `verdict.md`, `outcomes.json` |
-| Benchmark | `/tmp/mr-bench-HHMMSS-<mode>/` | as headless |
+| Interactive (pi) | `~/.local/share/multi-review/runs/YYYYMMDD-HHMMSS-xxxxxx/` | `progress.json`, `trace.jsonl` |
+| Headless (skill) | `~/.local/share/multi-review/runs/<timestamp>/` (the brief's directory; `--out` decides) | the above + `brief.json`, `result.json`, `result.md`, `verdict.md`, `outcomes.json` |
+| Benchmark | `~/.local/share/multi-review/runs/bench-YYYYMMDD-HHMMSS-<mode>/` | as headless |
 
-`/tmp` gets cleaned, so old runs disappear. Copy a run's directory before you
-start a long analysis of it. `~/.local/share/multi-review/outcomes.jsonl`
+`$XDG_DATA_HOME` replaces `~/.local/share` when it is set. Runs from before
+commit `5f667e0` were written to `/tmp` (`/tmp/multi-review-XXXXXX/`,
+`/tmp/multi-review/<name>/`, `/tmp/mr-bench-*`), which a reboot clears, so
+most of them are gone. `~/.local/share/multi-review/outcomes.jsonl`
 survives, with one line per finding: run, group, spec, severity, evidence,
 verification and bucket. `~/.cache/multi-review/runs/<pid>.json` only
 registers a run for the status mod, and entries for dead processes stay

@@ -10,7 +10,7 @@ set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 fixture="$here/fixture"
 mode="${1:-balanced}"; shift || true
-outdir="${MR_BENCH_OUT:-/tmp/mr-bench-$(date +%H%M%S)-$mode}"
+outdir="${MR_BENCH_OUT:-${XDG_DATA_HOME:-$HOME/.local/share}/multi-review/runs/bench-$(date +%Y%m%d-%H%M%S)-$mode}"
 mkdir -p "$outdir"
 
 cli_flags=()
