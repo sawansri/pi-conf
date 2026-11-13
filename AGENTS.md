@@ -90,11 +90,18 @@ price vs the billed cost. Read the **billed** column.
 - **Cost per session exists only in `result.json`** (`details.cost.bySpec`).
   Without it, for a cancelled or interactive run, only the last three
   sessions' costs survive, as text in `progress.json` `run.events`.
-- **`trace.jsonl` can't show how big a tool result was.** `tool_result` is
-  recorded only for `git`, `run`, `xref` and `web_search`, and cut to 600
-  characters (`trace.ts`). `read` and `grep` results aren't recorded. You can
-  count calls, but to find what grew the context, use the fresh `input`
-  tokens in `bySpec`.
+- **Tool result sizes and per-turn usage are only in traces since
+  `c95daf5`.** Every `tool_result` now carries `chars`, and every assistant
+  `message` carries `usage` (`input`, `output`, `cacheRead`,
+  `cacheWrite`). Only `git`, `run`, `xref` and `web_search` results keep
+  text, cut to 600 characters. In older traces you can count calls but not
+  sizes; use the fresh `input` tokens in `bySpec`.
+- **gpt-6.1-sol's uncached input is reported as `cacheWrite`, not `input`.**
+  `models.json` prices cacheWrite at $0, so its catalog cost reads ~10x low
+  (a session showing $0.07 billed ~$0.57).
+- **`getSessionStats()` excludes the message that just arrived** when a
+  `message_end` listener runs: pi persists the message after notifying
+  listeners. Add `event.message.usage` yourself (see `armSpendCap`).
 - **Session names:** `@level` is the thinking level, `#2` is the second pass
   (files in reverse order), and `(verify)` is a verifier. Result groups strip
   the level, so to tell which level found something, read the session's final

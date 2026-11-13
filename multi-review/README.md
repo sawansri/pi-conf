@@ -900,7 +900,8 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
   "verify": false,
   "verifiersPerFinding": 1,
   "verifyOnly": [],
-  "verifiers": ["amd-gateway/gpt-6.1-sol", "amd-gateway-anthropic/Claude-Sonnet-5.5"],
+  "verifiers": ["amd-gateway-anthropic/Claude-Sonnet-5.5", "amd-gateway/gpt-6.1-sol"],
+  "maxGroupsPerVerifier": 5,
   "verifyConsensus": false,
   "secondPass": ["amd-gateway-anthropic/Claude-Sonnet-5.5"],
   "quickReviewers": [
@@ -936,11 +937,15 @@ one, because both alternate verifiers timed out and returned no verdicts, so
 k=1 delivers what the run achieved for half the verify bill. Raise it when the
 pool is healthy and false positives are expensive.
 `verifiers` lists the preferred verifiers (`provider/id`), in order: they
-take the verify round's work, balanced by load, and the rest of the pool only
-verifies findings every preferred model raised itself (a model can't verify
-its own finding). `[]` balances over the whole pool. The default is gpt-6.1-sol, then
-Sonnet: in one run Kimi's verify session cost $1.22 and Sonnet's $0.58, while
-gpt-6.1-sol caches its whole prefix and costs about a tenth of either.
+take the verify round's work, balanced by load up to `maxGroupsPerVerifier`
+findings each (default 5; 0 = no limit), and the rest of the pool verifies the
+overflow and findings every preferred model raised itself (a model can't
+verify its own finding). `[]` balances over the whole pool. The default is
+Sonnet, then gpt-6.1-sol. Billed, Kimi's verify session cost $1.22 in one
+run; in another, Sonnet verified 4 findings in 55s for $0.42, while
+gpt-6.1-sol took 8, spent $0.42 and timed out with none verified, which is
+why the cap exists. gpt-6.1-sol's catalog cost reads ~10x low because pi
+reports its uncached input as `cacheWrite`, which `models.json` prices at $0.
 `verifyConsensus: false` skips verifying findings that two or more distinct
 models raised independently (one model's two passes don't count); the review
 notes why each one was skipped. Over 5 real runs verification returned 75
@@ -956,7 +961,12 @@ cost 8x, re-reading the same files up to 6 times.
 disables it). A session that reaches it is cut and harvested like one that ran
 out of time, so its findings are kept and the review marks it partial. At
 75% of it ($1.125 by default) the session is warned, as at 75% of its time, to
-finish the step it is on and write its answer. The budget is never stated up
+finish the step it is on and write its answer. The check runs after every
+turn and counts the earlier attempts of an error-retried session; a final
+answer that crosses the cap is kept rather than cut, since its spend is
+already incurred, so a session can finish up to one turn past it. One turn
+can be large: a gemini turn that missed the cache resent ~135k tokens
+(~$0.35). The budget is never stated up
 front: a visible budget would push every model toward stopping early, and
 Gemini already did that before the `minReviewToolCalls` nudge. The
 read cap shrinks each call but bounds nothing: the time budget was the only

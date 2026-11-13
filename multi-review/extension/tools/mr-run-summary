@@ -3,9 +3,10 @@
 
     mr-run-summary RUN_DIR...
 
-RUN_DIR is a run's trace directory: /tmp/multi-review-XXXXXX for an
-interactive run, or the --out directory of a headless one (which also has
-result.json). Reads trace.jsonl, progress.json and, when present,
+RUN_DIR is a run's directory under ~/.local/share/multi-review/runs
+($XDG_DATA_HOME if set): an interactive run's, or the --out directory of a
+headless one (which also has result.json). Runs from before they moved there
+lived in /tmp. Reads trace.jsonl, progress.json and, when present,
 result.json, and prints for each session: phase, outcome, turns, tool calls
 by tool, files read more than twice, and cost.
 
@@ -17,10 +18,13 @@ cancelled, or interactive) only the last three sessions' costs survive, in
 progress.json's events.
 
 Traces written since per-turn usage was added also give each session's
-fresh (uncached) input against the tool output it received (~4 chars a
-token). With working prefix caching the two are close; fresh input several
-times the tool output means the provider's cache is missing. Older traces
-have neither, so the line is left out.
+fresh (uncached, or newly cached) input after its first turn, against the
+new content it was sent in that time: every tool result (~4 chars a token)
+plus its own earlier replies. The first turn is left out because it is the
+system prompt and brief. With working prefix caching the two are close
+(Sonnet: ~1x); fresh input several times the new content means the
+provider's cache is missing (gemini-4-argon resent ~135k tokens a turn on
+cache misses). Older traces have neither, so the line is left out.
 """
 import collections
 import json
@@ -65,6 +69,7 @@ def summarize(run_dir, rates):
     notes = {}
     fresh = collections.Counter()
     result_chars = collections.Counter()
+    outputs = collections.defaultdict(list)
     for e in events:
         key = (e.get("reviewer", "?"), e.get("phase", "?"))
         if e.get("kind") == "tool":
@@ -73,7 +78,11 @@ def summarize(run_dir, rates):
                 args = e.get("args") or {}
                 reads[key][args.get("path") or args.get("file_path")] += 1
         elif e.get("kind") == "message" and e.get("usage"):
-            fresh[key] += e["usage"].get("input", 0) + e["usage"].get("cacheWrite", 0)
+            u = e["usage"]
+            # The first turn's fresh input is the system prompt and brief, not growth.
+            if outputs[key]:
+                fresh[key] += u.get("input", 0) + u.get("cacheWrite", 0)
+            outputs[key].append(u.get("output", 0))
         elif e.get("kind") == "tool_result" and "chars" in e:
             result_chars[key] += e["chars"]
         elif e.get("kind") == "finish":
@@ -112,9 +121,10 @@ def summarize(run_dir, rates):
         if c:
             line += f"\n{'':57}catalog ${c[0]:.3f}  billed ${c[1]:.3f}  fresh-in {c[2] / 1e3:.0f}k  cache-read {c[3] / 1e6:.1f}M"
         if fresh[key]:
-            got = result_chars[key] / 4
+            # Each reply is resent from the next turn on; the last one never is.
+            got = result_chars[key] / 4 + sum(outputs[key][:-1])
             ratio = f"{fresh[key] / got:.1f}x" if got else "n/a"
-            line += f"\n{'':57}fresh-in {fresh[key] / 1e3:.0f}k tokens vs tool output ~{got / 1e3:.0f}k ({ratio})"
+            line += f"\n{'':57}fresh-in after turn 1 {fresh[key] / 1e3:.0f}k tokens vs new content ~{got / 1e3:.0f}k ({ratio})"
         rereads = [(p, n) for p, n in reads[key].most_common(3) if n > 2]
         if rereads:
             line += f"\n{'':57}re-read: {rereads}"
