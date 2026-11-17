@@ -1,7 +1,7 @@
 ---
 name: multi-review
 description: Multi-model code review and Socratic discussion through pi's multi-review extension. Reviewers across model families (Sonnet 5.5, gpt-6.1-sol, Kimi K3.1 Pro, Gemini 4 Argon), each with read-only repo access and tools, review the current change, a PR, or a spec implementation in parallel — or hold a multi-round Socratic discussion on a topic when asked. You write the brief, act as lead reviewer or moderator on their output, and, if asked, fix issues test-first and confirm with a re-review. Also verifies a PR's existing review comments (CodeRabbit, other bots, collaborators; filterable by author): which are real, which are wrong, and what they missed, with draft replies (never posted). Use when the user asks for a multi-model review, a Socratic discussion/debate among models on a topic, a second opinion from other models, a check of an implementation against a spec, whether CodeRabbit's or specific reviewers' PR comments are valid, or to fix and confirm review findings.
-argument-hint: "[--socratic [--rounds=2]] [--spec=path] [--verify] [--quick] [--premium] [#PR [--pr-comments [--author=login[,login]] [--nits] [--resolved]] | area or topic]"
+argument-hint: "[--socratic [--rounds=2]] [--spec=path] [--verify] [--quick] [--premium] [--swap=seat=model] [#PR [--pr-comments [--author=login[,login]] [--nits] [--resolved]] | area or topic]"
 allowed-tools: Bash(pi -p *) Bash(mkdir *) Bash(git diff *) Bash(git log *) Bash(git show *) Bash(git status *) Bash(git merge-base *) Bash(git rev-parse *) Bash(gh pr view *) Bash(gh pr diff *) Read Write
 ---
 
@@ -15,6 +15,7 @@ Arguments: `$ARGUMENTS`
 - `--verify`: each finding (and each of your suspicions) is cross-checked by reviewers who didn't raise it. Costs ~1.5–2×. Use it for high-stakes changes.
 - `--quick`: a fast pool without repo tools (10–50s). Good for small diffs or a first look.
 - `--premium`: Claude Fable 5.2 reviews in Sonnet's seat and GPT-6.2 Astra in Kimi's, at ~4x their price. Only when the user asks for premium reviewers, Fable or Astra by name; never on your own judgment.
+- `--swap=<seat>=<model>` (repeatable, or comma-separated): give a reviewer seat to another model for this run, e.g. `--swap=sonnet=amd-gateway-anthropic/Claude-Opus-5.5@high`. Pass it as `swaps` (`{"sonnet": "…"}`). Also when the user names models in words ("use Opus instead of Kimi"). A model that isn't available keeps the original in its seat, and the result warns about it; tell the user.
 - `#123` or a PR URL: review or discuss that PR. Any other text is either a focus for the diff review, the area to review, or (with `--socratic`) the topic to discuss.
 - `--author=<login[,login]>` / `--pr-comments`: author filtering is parsed and active by default in any scenario (regular PR reviews, `--pr-comments`, and Socratic discussions). Passing `--author=<login[,login]>` (or setting `"comment_authors"` / `"author"` in `brief.json`) automatically enables PR comment/review triage filtered to those author(s) without needing `--pr-comments` separately. Supports GitHub logins (`alice`, `@alice`, `coderabbitai[bot]`), bot shorthands (`coderabbit`, `copilot`), `human`, `bot`, and `!pattern` exclusions (`!bot`, `!coderabbit`). `--nits` includes nitpicks, and `--resolved` re-checks resolved threads.
 
@@ -75,7 +76,7 @@ For a **Socratic discussion** (when `--socratic` / `--discuss` is passed, or whe
 | `suspicions` | Your specific bug hypotheses or devil's-advocate challenges, one per item. Hidden in Round 1. In review mode they're matched against independent findings and cross-checked with `verify`; in Socratic mode they're posed as Round 2 challenges. |
 | `scope` | `"area"` when there is no change to review and `focus`/`topic` describes the area/topic (default for `socratic: true` with a topic); `"diff"` when reviewing or discussing the uncommitted working-tree diff. |
 | `pr_number` | For PR reviews or PR discussions. |
-| `verify`, `quick`, `premium` | From the arguments. Set `premium` only when the user asked for it. |
+| `verify`, `quick`, `premium`, `swaps` | From the arguments. Set `premium` and `swaps` only when the user asked for them. |
 | `pr_comments`, `comment_authors`, `include_nits`, `include_resolved` | Author filtering is on by default in any scenario (regular review, `--pr-comments`, or Socratic discussion): passing `"comment_authors"` (or `"author"` / `"authors"`, e.g. `["coderabbitai"]`, `["alice", "bob"]`, `["human"]`, `["bot"]`, `["!bot"]`) automatically enables `pr_comments` without needing `"pr_comments": true` separately. Omit `comment_authors` to check all authors when `pr_comments: true`. **Do not copy PR comments into the brief** (not `focus`, not `suspicions`): models must investigate independently. |
 
 ## 3. Run the review

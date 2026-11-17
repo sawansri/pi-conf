@@ -248,6 +248,8 @@ export interface ReviewFlags {
 	quick: boolean;
 	/** Swap in `premiumSwaps` for this run; only when the user asks for it. */
 	premium?: boolean;
+	/** The user's own seat swaps for this run (see applySwaps); applied after premium. */
+	swaps?: Record<string, string>;
 	authors?: string[];
 }
 
@@ -323,8 +325,8 @@ export const DEFAULTS: MultiReviewConfig = {
 	// they take ($2/$10); unmeasured as reviewers here. No second pass: that
 	// would double the most expensive seat.
 	premiumSwaps: {
-		"amd-gateway-anthropic/Claude-Sonnet-5.5": "amd-gateway-anthropic/Claude-Fable-5-2@high",
-		"amd-gateway/Kimi-K3.1-Pro": "amd-gateway/GPT-6.2-Astra@high",
+		"amd-gateway-anthropic/Claude-Sonnet-5.5": "amd-gateway-anthropic/Claude-Fable-5-2@medium",
+		"amd-gateway/Kimi-K3.1-Pro": "amd-gateway/GPT-6.2-Astra@medium",
 	},
 	reviewerTools: true,
 	reviewerTimeoutSec: 600,
@@ -394,12 +396,78 @@ export function reviewerRunOptions(cfg: MultiReviewConfig, spec?: string): Revie
 	};
 }
 
+/** Lowercase alphanumerics only, so "fable-5.2" matches "Claude-Fable-5-2". */
+const squash = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+
 /**
- * The reviewer pool for a `--premium` run: each spec whose bare `provider/id`
- * has a swap gives its seat to the swap; the rest stay.
+ * Give seats in a reviewer pool to other models. A swap's key names the seat:
+ * a `provider/id` matches exactly (level ignored), anything else matches every
+ * seat whose model id contains it ("sonnet", "kimi"). Its value is the model
+ * to seat: `provider/id[@level]`, or just the id when one provider has it. A
+ * replacement without a level takes the seat's.
+ *
+ * `available` holds the registry's `provider/id` keys. A replacement that is
+ * not among them leaves the original model in its seat, with a note saying so:
+ * a swap must never cost the run a reviewer.
  */
-export function applyPremiumSwaps(specs: string[], swaps: Record<string, string>): string[] {
-	return specs.map((raw) => swaps[raw.replace(/@[a-z]+$/, "")] ?? raw);
+export function applySwaps(
+	specs: string[],
+	swaps: Record<string, string>,
+	available: Iterable<string>,
+): { specs: string[]; notes: string[] } {
+	const keys = [...available];
+	const notes: string[] = [];
+	const out = [...specs];
+	for (const [seat, to] of Object.entries(swaps)) {
+		const bareSeat = seat.trim().replace(/@[a-z]+$/, "");
+		const matches = (raw: string): boolean => {
+			const spec = parseReviewerSpec(raw)?.spec ?? raw;
+			return bareSeat.includes("/") ? spec === bareSeat : squash(spec.slice(spec.indexOf("/") + 1)).includes(squash(bareSeat));
+		};
+		const seats = out.map((raw, i) => (matches(raw) ? i : -1)).filter((i) => i >= 0);
+		if (seats.length === 0) {
+			notes.push(`swap ${seat} → ${to}: no reviewer seat matches "${seat}"`);
+			continue;
+		}
+		const at = to.trim().match(/^(.+?)(?:@([a-z]+))?$/);
+		const model = at?.[1] ?? "";
+		const wantedLevel = at?.[2] && (THINKING_LEVEL_ALIASES as readonly string[]).includes(at[2]) ? at[2] : undefined;
+		// A bare id can exist under several providers (amd-gateway-anthropic and
+		// anthropic both list Sonnet): prefer the seat's own provider, then one
+		// the pool already uses, so the swap bills where the run does.
+		const candidates = model.includes("/")
+			? keys.filter((k) => k === model)
+			: keys.filter((k) => squash(k.slice(k.indexOf("/") + 1)) === squash(model));
+		const providerOf = (spec: string): string => spec.slice(0, spec.indexOf("/"));
+		const poolProviders = new Set(specs.map(providerOf));
+		for (const i of seats) {
+			const found = candidates.find((k) => providerOf(k) === providerOf(out[i]))
+				?? candidates.find((k) => poolProviders.has(providerOf(k)))
+				?? candidates[0];
+			if (!found) {
+				notes.push(`swap ${seat} → ${to}: model not available, ${out[i]} keeps its seat`);
+				continue;
+			}
+			const level = wantedLevel ?? out[i].match(/@([a-z]+)$/)?.[1];
+			out[i] = level ? `${found}@${level}` : found;
+		}
+	}
+	return { specs: out, notes };
+}
+
+/**
+ * Parse `seat=model` pairs, comma-separated (`--swap=sonnet=x,kimi=y`). Pairs
+ * without both halves are dropped.
+ */
+export function parseSwapPairs(value: string): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const pair of value.split(",")) {
+		const eq = pair.indexOf("=");
+		const seat = pair.slice(0, eq).trim();
+		const to = pair.slice(eq + 1).trim();
+		if (eq > 0 && seat && to) out[seat] = to;
+	}
+	return out;
 }
 
 /**

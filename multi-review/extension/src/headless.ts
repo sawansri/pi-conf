@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { type ParsedReviewArgs, parseBoolFlag, parseValueFlag } from "./args.ts";
+import { parseSwapPairs } from "./config.ts";
 import { leadJudgmentInstructions } from "./lead.ts";
 import { TRANSIENT_REVIEWERS, runMultiReviewFromArgs } from "./pipeline.ts";
 import { normalizeAuthorFilter } from "./pr-comments.ts";
@@ -29,6 +30,8 @@ export interface ReviewRequest {
 	quick?: boolean;
 	/** Swap in config.premiumSwaps; only when the user asked for those models. */
 	premium?: boolean;
+	/** Reviewer seat → model for this run (config.applySwaps); unavailable models keep the seat's original. */
+	swaps?: Record<string, string>;
 	/** Triage the PR's existing review comments (needs pr_number). */
 	pr_comments?: boolean;
 	/** Filter PR comments/reviews by GitHub author login(s), "bot", "human", or "!login". */
@@ -98,7 +101,7 @@ export async function runAgentLedReview(
 			checks: params.checks,
 		},
 		focus: params.scope === "area" ? undefined : (focus || topic),
-		flags: { verify: params.verify, quick: params.quick, premium: params.premium },
+		flags: { verify: params.verify, quick: params.quick, premium: params.premium, swaps: params.swaps },
 		deadlineMs,
 		detailHint,
 		traceDir,
@@ -158,6 +161,12 @@ export function parseReviewRequest(raw: unknown): ReviewRequest | { error: strin
 		str("intent"); str("spec_path"); str("focus"); str("topic");
 		strs("requirements"); strs("suspicions"); strs("context_files"); strs("checks"); strs("comment_authors");
 		bool("verify"); bool("quick"); bool("premium"); bool("pr_comments"); bool("include_nits"); bool("include_resolved"); bool("socratic");
+		if (o.swaps !== undefined) {
+			if (typeof o.swaps !== "object" || Array.isArray(o.swaps) || !Object.values(o.swaps as object).every((x) => typeof x === "string")) {
+				throw new Error(`"swaps" must be an object of seat → model strings`);
+			}
+			req.swaps = o.swaps as Record<string, string>;
+		}
 		if (o.scope !== undefined) {
 			if (o.scope !== "diff" && o.scope !== "area") throw new Error(`"scope" must be "diff" or "area"`);
 			req.scope = o.scope;
@@ -221,7 +230,7 @@ function announceRun(progressPath: string, cwd: string): void {
 
 /**
  * Apply the boolean run-shape flags given on the command line over a parsed
- * brief. `--verify` / `--quick` / `--premium` are what a caller reaches for; everything else
+ * brief. `--verify` / `--quick` / `--premium` / `--swap` are what a caller reaches for; everything else
  * stays a brief field so the brief remains the record of what was asked.
  */
 export function applyCliFlags(req: ReviewRequest, args: string): ReviewRequest {
@@ -230,7 +239,13 @@ export function applyCliFlags(req: ReviewRequest, args: string): ReviewRequest {
 	if (verify.present) out.verify = true;
 	const quick = parseBoolFlag(verify.rest, "quick");
 	if (quick.present) out.quick = true;
-	if (parseBoolFlag(quick.rest, "premium").present) out.premium = true;
+	const premium = parseBoolFlag(quick.rest, "premium");
+	if (premium.present) out.premium = true;
+	let rest = premium.rest;
+	for (let swap = parseValueFlag(rest, "swap"); swap.value !== undefined; swap = parseValueFlag(rest, "swap")) {
+		rest = swap.rest;
+		out.swaps = { ...out.swaps, ...parseSwapPairs(swap.value) };
+	}
 	// Both compose, as they do on the slash command: a fast pass that still
 	// cross-checks.
 	return out;

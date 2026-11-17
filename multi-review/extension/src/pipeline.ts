@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { type ParsedReviewArgs, parseAuthorFlags, parseBoolFlag, parseReviewArgs, parseReviewFlags, parseSocraticFlags, parseValueFlag } from "./args.ts";
 import { type BriefInput, buildBrief, hasBriefInput, readSpecFile } from "./brief.ts";
 import { CXX_FILE, cxxAutoCheck, runChecks } from "./checks.ts";
-import { type Model, type ModelSpec, type MultiReviewConfig, type ReviewFlags, type ReviewerSpec, applyPremiumSwaps, dedupeTarget, describeFlags, loadConfig, parseReviewerSpec, reviewerRunOptions, scaledMinToolCalls } from "./config.ts";
+import { type Model, type ModelSpec, type MultiReviewConfig, type ReviewFlags, type ReviewerSpec, applySwaps, dedupeTarget, describeFlags, loadConfig, parseReviewerSpec, reviewerRunOptions, scaledMinToolCalls } from "./config.ts";
 import { type RunCost, addUsage, emptyRunCost, formatRunCost, runCostLine } from "./cost.ts";
 import { type HiddenClaim, type SuspicionResult, groupFindings } from "./grouping.ts";
 import { type JudgeResult, runJudge } from "./judge.ts";
@@ -166,12 +166,20 @@ export async function runMultiReviewFromArgs(
 	// tools, so they keep the quick pool.
 	const socraticSpecs = [...reviewOnlySpecs, ...cfg.verifyOnly]
 		.filter((raw, i, all) => all.findIndex((o) => parseReviewerSpec(o)?.spec === parseReviewerSpec(raw)?.spec) === i);
-	// --premium swaps seats in the configured pool; a picked pool or the
-	// quick pool is already what was asked for.
-	const configuredSpecs = isSocratic ? socraticSpecs : reviewOnlySpecs;
-	const effectiveReviewerSpecs: string[] = usingTransientReviewers
+	let effectiveReviewerSpecs: string[] = usingTransientReviewers
 		? transientReviewers
-		: flags.quick ? cfg.quickReviewers : flags.premium ? applyPremiumSwaps(configuredSpecs, cfg.premiumSwaps) : configuredSpecs;
+		: flags.quick ? cfg.quickReviewers : isSocratic ? socraticSpecs : reviewOnlySpecs;
+	// Premium seats (never in the quick pool), then the user's own swaps. A
+	// replacement the registry doesn't have leaves the original in its seat.
+	const swapNotes: string[] = [];
+	if ((flags.premium && !flags.quick) || Object.keys(flags.swaps ?? {}).length > 0) {
+		const available = (await ctx.modelRegistry.getAvailable()).map((m) => `${m.provider}/${m.id}`);
+		for (const swaps of [flags.premium && !flags.quick ? cfg.premiumSwaps : {}, flags.swaps ?? {}]) {
+			const swapped = applySwaps(effectiveReviewerSpecs, swaps, available);
+			effectiveReviewerSpecs = swapped.specs;
+			swapNotes.push(...swapped.notes);
+		}
+	}
 	if (usingTransientReviewers && transientReviewers === TRANSIENT_REVIEWERS) TRANSIENT_REVIEWERS = null;
 	if (effectiveReviewerSpecs.length === 0) {
 		return {
@@ -206,6 +214,7 @@ export async function runMultiReviewFromArgs(
 	try {
 		progress.update({ phase: "resolving scope" });
 		const target = await buildReviewTarget(pi, parsed, ctx.cwd);
+		target.warnings.push(...swapNotes);
 		// A focus hint narrows attention within the diff; it never replaces the diff.
 		if (runOptions.focus?.trim()) {
 			target.focusHint = target.focusHint ? `${target.focusHint}\n\n${runOptions.focus.trim()}` : runOptions.focus.trim();

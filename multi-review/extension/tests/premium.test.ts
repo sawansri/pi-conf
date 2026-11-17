@@ -1,15 +1,30 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { parseReviewFlags } from "../src/args.ts";
-import { DEFAULTS, applyPremiumSwaps, describeFlags, parseReviewerSpec } from "../src/config.ts";
-import { applyCliFlags } from "../src/headless.ts";
+import { DEFAULTS, applySwaps, describeFlags, parseReviewerSpec, parseSwapPairs } from "../src/config.ts";
+import { applyCliFlags, parseReviewRequest } from "../src/headless.ts";
+
+// What the registry has: the default pool, the premium models and Opus.
+const AVAILABLE = [
+	// Listed first, as pi's registry does: a bare id must not resolve here.
+	"anthropic/claude-sonnet-5-5",
+	"anthropic/claude-opus-5-5",
+	"amd-gateway-anthropic/Claude-Sonnet-5.5",
+	"amd-gateway-anthropic/Claude-Opus-5.5",
+	"amd-gateway-anthropic/Claude-Fable-5-2",
+	"amd-gateway/gpt-6.1-sol",
+	"amd-gateway/Kimi-K3.1-Pro",
+	"amd-gateway/GPT-6.2-Astra",
+	"amd-gateway/gemini-4-argon",
+];
 
 test("premium swaps Sonnet for Fable and Kimi for Astra, and keeps the other seats", () => {
-	const pool = applyPremiumSwaps(DEFAULTS.reviewers, DEFAULTS.premiumSwaps);
+	const { specs: pool, notes } = applySwaps(DEFAULTS.reviewers, DEFAULTS.premiumSwaps, AVAILABLE);
+	assert.deepEqual(notes, []);
 	assert.deepEqual(pool, [
-		"amd-gateway-anthropic/Claude-Fable-5-2@high",
+		"amd-gateway-anthropic/Claude-Fable-5-2@medium",
 		"amd-gateway/gpt-6.1-sol@high",
-		"amd-gateway/GPT-6.2-Astra@high",
+		"amd-gateway/GPT-6.2-Astra@medium",
 		"amd-gateway/gemini-4-argon@medium",
 	]);
 	// The default pool itself never changes.
@@ -18,8 +33,8 @@ test("premium swaps Sonnet for Fable and Kimi for Astra, and keeps the other sea
 
 test("a swap matches its seat whatever the seat's level", () => {
 	assert.deepEqual(
-		applyPremiumSwaps(["amd-gateway/Kimi-K3.1-Pro@low", "amd-gateway/Kimi-K3.1-Pro"], DEFAULTS.premiumSwaps),
-		["amd-gateway/GPT-6.2-Astra@high", "amd-gateway/GPT-6.2-Astra@high"],
+		applySwaps(["amd-gateway/Kimi-K3.1-Pro@low", "amd-gateway/Kimi-K3.1-Pro"], DEFAULTS.premiumSwaps, AVAILABLE).specs,
+		["amd-gateway/GPT-6.2-Astra@medium", "amd-gateway/GPT-6.2-Astra@medium"],
 	);
 });
 
@@ -47,4 +62,56 @@ test("premium is off unless asked for, on every surface", () => {
 	assert.equal(describeFlags({ verify: true, quick: false, premium: true }), "balanced+premium+verify");
 	// --quick picks its own pool, so premium doesn't apply there.
 	assert.equal(describeFlags({ verify: false, quick: true, premium: true }), "quick");
+});
+
+test("a premium model the registry doesn't have leaves the original in its seat", () => {
+	const noFable = AVAILABLE.filter((k) => !k.includes("Fable"));
+	const { specs, notes } = applySwaps(DEFAULTS.reviewers, DEFAULTS.premiumSwaps, noFable);
+	assert.equal(specs[0], "amd-gateway-anthropic/Claude-Sonnet-5.5@high");
+	assert.equal(specs[2], "amd-gateway/GPT-6.2-Astra@medium");
+	assert.equal(notes.length, 1);
+	assert.match(notes[0], /not available.*Claude-Sonnet-5\.5@high keeps its seat/);
+});
+
+test("a user swap names its seat by part of the id and its model by bare id, keeping the seat's level", () => {
+	const { specs, notes } = applySwaps(DEFAULTS.reviewers, { sonnet: "claude-opus-5.5", Argon: "amd-gateway/gpt-6.1-sol@low" }, AVAILABLE);
+	assert.deepEqual(notes, []);
+	assert.deepEqual(specs, [
+		"amd-gateway-anthropic/Claude-Opus-5.5@high",
+		"amd-gateway/gpt-6.1-sol@high",
+		"amd-gateway/Kimi-K3.1-Pro@high",
+		"amd-gateway/gpt-6.1-sol@low",
+	]);
+});
+
+test("an unknown model or an unmatched seat changes nothing and says why", () => {
+	const { specs, notes } = applySwaps(DEFAULTS.reviewers, { kimi: "amd-gateway/No-Such-Model", grok: "claude-opus-5.5" }, AVAILABLE);
+	assert.deepEqual(specs, DEFAULTS.reviewers);
+	assert.equal(notes.length, 2);
+	assert.match(notes[0], /swap kimi → amd-gateway\/No-Such-Model: model not available, amd-gateway\/Kimi-K3\.1-Pro@high keeps its seat/);
+	assert.match(notes[1], /no reviewer seat matches "grok"/);
+});
+
+test("user swaps apply after premium, so they can replace a premium seat", () => {
+	const premium = applySwaps(DEFAULTS.reviewers, DEFAULTS.premiumSwaps, AVAILABLE).specs;
+	assert.equal(applySwaps(premium, { fable: "claude-opus-5.5@max" }, AVAILABLE).specs[0], "amd-gateway-anthropic/Claude-Opus-5.5@max");
+});
+
+test("--swap parses on the slash command, the headless command line and the brief", () => {
+	assert.deepEqual(parseSwapPairs("sonnet=a/b@high, kimi=c ,bad,=x,y="), { sonnet: "a/b@high", kimi: "c" });
+	const parsed = parseReviewFlags("--swap=sonnet=a/b --verify --swap=kimi=c/d@low #12", { verify: false, quick: false });
+	assert.deepEqual(parsed.flags.swaps, { sonnet: "a/b", kimi: "c/d@low" });
+	assert.equal(parsed.flags.verify, true);
+	assert.equal(parsed.rest, "#12");
+	assert.deepEqual(applyCliFlags({ intent: "x" }, "--swap=argon=e/f").swaps, { argon: "e/f" });
+	assert.deepEqual(parseReviewRequest({ swaps: { sonnet: "a/b" } }), { swaps: { sonnet: "a/b" } });
+	assert.ok("error" in parseReviewRequest({ swaps: ["sonnet=a/b"] }));
+	assert.ok("error" in parseReviewRequest({ swaps: { sonnet: 3 } }));
+});
+
+test("a bare id resolves under the seat's own provider, not another provider with the same model", () => {
+	// Real run 20261117-1425-swap-smoke: haiku → claude-sonnet-5.5 seated
+	// anthropic/claude-sonnet-5-5, off the gateway the rest of the run used.
+	const { specs } = applySwaps(["amd-gateway-anthropic/Claude-Haiku-5.5", "amd-gateway/gpt-6.1-sol@high"], { haiku: "claude-sonnet-5.5", sol: "claude-opus-5.5" }, AVAILABLE);
+	assert.deepEqual(specs, ["amd-gateway-anthropic/Claude-Sonnet-5.5", "amd-gateway-anthropic/Claude-Opus-5.5@high"]);
 });

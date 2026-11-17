@@ -2,7 +2,7 @@
  * Multi-Review — multi-model code review led by the main agent (DESIGN: ../README.md · ../install.md)
  *
  * Surfaces:
- *   /multi-review [--spec=path] [--verify] [--quick] [--premium] [--direct] [PR-number | focus]
+ *   /multi-review [--spec=path] [--verify] [--quick] [--premium] [--swap=seat=model] [--direct] [PR-number | focus]
  *     → hands off to the main agent (buildHandoffPrompt), which drafts the
  *       reviewer brief and calls the tool; --direct / print / RPC run the
  *       pipeline here with an external judge instead.
@@ -180,7 +180,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("multi-review", {
 		description:
 			"Fan-out code review or Socratic discussion across configured models. Usage: " +
-			"/multi-review [--socratic [--rounds=2]] [--spec=path] [--verify] [--quick] [--premium] [--direct] [PR-number [--pr-comments [--author=login[,login]] [--nits] [--resolved]] | free-text focus/topic]. " +
+			"/multi-review [--socratic [--rounds=2]] [--spec=path] [--verify] [--quick] [--premium] [--swap=seat=model] [--direct] [PR-number [--pr-comments [--author=login[,login]] [--nits] [--resolved]] | free-text focus/topic]. " +
 			"The main agent drafts the brief from your args (and spec), then judges or synthesizes the results. " +
 			"--direct skips the agent and uses the configured judge.",
 		// Argument autocomplete hints the call shape so users don't have to
@@ -380,6 +380,11 @@ export default function (pi: ExtensionAPI) {
 			})),
 			premium: Type.Optional(Type.Boolean({
 				description: "Claude Fable 5.2 and GPT-6.2 Astra take Sonnet's and Kimi's seats, at ~4x their price. Only when the user explicitly asks for premium reviewers, Fable or Astra.",
+			})),
+			swaps: Type.Optional(Type.Record(Type.String(), Type.String(), {
+				description:
+					"Only when the user names models to swap: reviewer seat → replacement for this run, e.g. {\"sonnet\": \"amd-gateway-anthropic/Claude-Opus-5.5@high\"}. " +
+					"A seat is a provider/id or part of a model id; a replacement is provider/id[@level] or a bare id. One that isn't available leaves the original model in its seat.",
 			})),
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {

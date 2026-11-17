@@ -1,7 +1,7 @@
-import type { ReviewFlags } from "./config.ts";
+import { type ReviewFlags, parseSwapPairs } from "./config.ts";
 
 /**
- * Pull `--verify`, `--quick`, `--premium`, `--author` (and legacy `--mode=…`) out of the args.
+ * Pull `--verify`, `--quick`, `--premium`, `--swap`, `--author` (and legacy `--mode=…`) out of the args.
  * Legacy modes map onto the flags: council → verify, triage → quick,
  * balanced/light → defaults (agent-led balanced subsumes both).
  */
@@ -17,6 +17,10 @@ export function parseReviewFlags(rawArgs: string, defaults: ReviewFlags): { flag
 	const premium = parseBoolFlag(rest, "premium");
 	rest = premium.rest;
 	if (premium.present) flags.premium = true;
+	for (let swap = parseValueFlag(rest, "swap"); swap.value !== undefined; swap = parseValueFlag(rest, "swap")) {
+		rest = swap.rest;
+		flags.swaps = { ...flags.swaps, ...parseSwapPairs(swap.value) };
+	}
 	const legacy = parseValueFlag(rest, "mode");
 	rest = legacy.rest;
 	if (legacy.value?.toLowerCase() === "council") flags.verify = true;
@@ -130,6 +134,7 @@ const ARG_COMPLETIONS: Array<{ token: string; label: string; description: string
 	{ token: "--verify", label: "--verify", description: "cross-check each finding with reviewers who didn't raise it" },
 	{ token: "--quick", label: "--quick", description: "fast reviewer pool, no tools" },
 	{ token: "--premium", label: "--premium", description: "Fable 5.2 and GPT-6.2 Astra take Sonnet's and Kimi's seats (~4x their price)" },
+	{ token: "--swap=", label: "--swap=<seat>=<model>", description: "give a reviewer seat to another model this run, e.g. sonnet=amd-gateway-anthropic/Claude-Opus-5.5; unavailable models keep the original" },
 	{ token: "--direct", label: "--direct", description: "skip the main agent; external judge synthesizes" },
 	{ token: "--pr-comments", label: "--pr-comments", description: "with a PR: verify its existing review comments (CodeRabbit, collaborators)" },
 	{ token: "--author=", label: "--author=<login[,login]>", description: "with --pr-comments: filter comments/reviews by author (or bot/human/!login)" },

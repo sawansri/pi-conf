@@ -48,6 +48,7 @@ export function buildHandoffPrompt(
 	if (flags.verify) lines.push("   - `verify`: true (each finding is cross-checked by reviewers who didn't raise it)");
 	if (flags.quick) lines.push("   - `quick`: true (fast reviewer pool, no tools)");
 	if (flags.premium) lines.push("   - `premium`: true (the user asked for the premium reviewers)");
+	if (flags.swaps && Object.keys(flags.swaps).length > 0) lines.push(`   - \`swaps\`: ${JSON.stringify(flags.swaps)} (the user's reviewer swaps)`);
 	const effectiveAuthors = prComments?.authors?.length ? prComments.authors : flags.authors;
 	const wantPrComments = Boolean(prComments || effectiveAuthors?.length);
 	if (wantPrComments) {
@@ -105,6 +106,7 @@ export function buildSocraticHandoffPrompt(
 	}
 	if (flags.quick) lines.push("   - `quick`: true (fast pool, no tools)");
 	if (flags.premium) lines.push("   - `premium`: true (the user asked for the premium reviewers)");
+	if (flags.swaps && Object.keys(flags.swaps).length > 0) lines.push(`   - \`swaps\`: ${JSON.stringify(flags.swaps)} (the user's reviewer swaps)`);
 	lines.push(`${specPath ? "4" : "3"}. **Synthesize.** When results return, follow the Lead moderator synthesis instructions in the tool result.`);
 	return lines.join("\n");
 }
