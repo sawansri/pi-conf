@@ -115,6 +115,11 @@ export interface MultiReviewConfig {
 	secondPass: string[];
 	/** Fast pool for `--quick` runs: single completions, no tools. */
 	quickReviewers: string[];
+	/**
+	 * `--premium` runs only: a reviewer (bare `provider/id`) → the spec that
+	 * takes its seat. Never used unless a run asks for it.
+	 */
+	premiumSwaps: Record<string, string>;
 	/** Run finding reviewers as nested agents with read-only repo tools. */
 	reviewerTools: boolean;
 	/** Per-reviewer wall-clock limit; a reviewer past it is reported as failed. */
@@ -198,6 +203,12 @@ export interface MultiReviewConfig {
 	 */
 	sessionMaxCostUsd: number;
 	/**
+	 * Per-model overrides for `sessionMaxCostUsd`, keyed by bare `provider/id`.
+	 * A model priced well above the pool needs a cap to match, or it is cut
+	 * before it has reviewed anything.
+	 */
+	sessionMaxCostUsdByModel: Record<string, number>;
+	/**
 	 * Models (`provider/id`) whose reviewer and verifier requests carry a
 	 * per-session `prompt_cache_key`, which keeps a session's requests on the
 	 * backend that holds its cached prefix. pi sends one only to
@@ -235,11 +246,13 @@ export interface MultiReviewConfig {
 export interface ReviewFlags {
 	verify: boolean;
 	quick: boolean;
+	/** Swap in `premiumSwaps` for this run; only when the user asks for it. */
+	premium?: boolean;
 	authors?: string[];
 }
 
 export function describeFlags(flags: ReviewFlags): string {
-	return [flags.quick ? "quick" : "balanced", flags.verify ? "verify" : ""].filter(Boolean).join("+");
+	return [flags.quick ? "quick" : "balanced", flags.premium && !flags.quick ? "premium" : "", flags.verify ? "verify" : ""].filter(Boolean).join("+");
 }
 
 /**
@@ -306,6 +319,13 @@ export const DEFAULTS: MultiReviewConfig = {
 		"amd-gateway-anthropic/Claude-Haiku-5.5",
 		"amd-gateway/gemini-3.8-flash@low",
 	],
+	// Opt-in only. Fable 5.2 and GPT-6.2 Astra list at $8/$40, 4x the seats
+	// they take ($2/$10); unmeasured as reviewers here. No second pass: that
+	// would double the most expensive seat.
+	premiumSwaps: {
+		"amd-gateway-anthropic/Claude-Sonnet-5.5": "amd-gateway-anthropic/Claude-Fable-5-2@high",
+		"amd-gateway/Kimi-K3.1-Pro": "amd-gateway/GPT-6.2-Astra@high",
+	},
 	reviewerTools: true,
 	reviewerTimeoutSec: 600,
 	sandbox: true,
@@ -333,6 +353,12 @@ export const DEFAULTS: MultiReviewConfig = {
 	readMaxCharsByModel: { "amd-gateway/Kimi-K3.1-Pro": 12_000 },
 	// Above Sonnet's $1.18 on a large lemonade PR, under half of Kimi's $3.14.
 	sessionMaxCostUsd: 1.5,
+	// The pool cap scaled by list price (4x Sonnet's), unmeasured until a real
+	// premium run bills them.
+	sessionMaxCostUsdByModel: {
+		"amd-gateway-anthropic/Claude-Fable-5-2": 6,
+		"amd-gateway/GPT-6.2-Astra": 6,
+	},
 	// The gateway's Kimi backend accepts the key (tests/bench/cache-growth-probe.py,
 	// 2026-11-12). Its cache still leaked with it on: a 4-turn probe paid 79k
 	// fresh tokens for 42k of content, missing turn 3 entirely. Whether the key
@@ -366,6 +392,14 @@ export function reviewerRunOptions(cfg: MultiReviewConfig, spec?: string): Revie
 		promptCacheKeyModels: cfg.promptCacheKeyModels,
 		readMaxChars: spec === undefined ? cfg.readMaxChars : readMaxCharsFor(cfg, spec),
 	};
+}
+
+/**
+ * The reviewer pool for a `--premium` run: each spec whose bare `provider/id`
+ * has a swap gives its seat to the swap; the rest stay.
+ */
+export function applyPremiumSwaps(specs: string[], swaps: Record<string, string>): string[] {
+	return specs.map((raw) => swaps[raw.replace(/@[a-z]+$/, "")] ?? raw);
 }
 
 /**
@@ -469,6 +503,14 @@ export function loadConfig(): MultiReviewConfig {
 		if (Array.isArray(parsed.quickReviewers)) {
 			cachedConfig.quickReviewers = parsed.quickReviewers.filter((x: unknown): x is string => typeof x === "string" && x.includes("/"));
 		}
+		if (parsed.premiumSwaps && typeof parsed.premiumSwaps === "object" && !Array.isArray(parsed.premiumSwaps)) {
+			const map: Record<string, string> = {};
+			for (const [key, value] of Object.entries(parsed.premiumSwaps)) {
+				if (!key.includes("/") || typeof value !== "string" || !value.includes("/")) continue;
+				map[key.replace(/@[a-z]+$/, "").trim()] = value.trim();
+			}
+			cachedConfig.premiumSwaps = map;
+		}
 		if (typeof parsed.reviewerTools === "boolean") cachedConfig.reviewerTools = parsed.reviewerTools;
 		if (typeof parsed.dedupeModel === "string" && (parsed.dedupeModel === "lexical" || parsed.dedupeModel.includes("/"))) {
 			cachedConfig.dedupeModel = parsed.dedupeModel;
@@ -507,6 +549,14 @@ export function loadConfig(): MultiReviewConfig {
 		}
 		if (typeof parsed.sessionMaxCostUsd === "number" && parsed.sessionMaxCostUsd >= 0) {
 			cachedConfig.sessionMaxCostUsd = parsed.sessionMaxCostUsd;
+		}
+		if (parsed.sessionMaxCostUsdByModel && typeof parsed.sessionMaxCostUsdByModel === "object" && !Array.isArray(parsed.sessionMaxCostUsdByModel)) {
+			const map: Record<string, number> = {};
+			for (const [key, value] of Object.entries(parsed.sessionMaxCostUsdByModel)) {
+				if (!key.includes("/") || typeof value !== "number" || value < 0) continue;
+				map[key.replace(/@[a-z]+$/, "").trim()] = value;
+			}
+			cachedConfig.sessionMaxCostUsdByModel = map;
 		}
 		if (typeof parsed.verifyNarrowContext === "boolean") cachedConfig.verifyNarrowContext = parsed.verifyNarrowContext;
 		if (typeof parsed.secondPassMinLines === "number" && parsed.secondPassMinLines >= 0) {

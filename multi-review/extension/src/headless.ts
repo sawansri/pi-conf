@@ -27,6 +27,8 @@ export interface ReviewRequest {
 	pr_number?: number;
 	verify?: boolean;
 	quick?: boolean;
+	/** Swap in config.premiumSwaps; only when the user asked for those models. */
+	premium?: boolean;
 	/** Triage the PR's existing review comments (needs pr_number). */
 	pr_comments?: boolean;
 	/** Filter PR comments/reviews by GitHub author login(s), "bot", "human", or "!login". */
@@ -96,7 +98,7 @@ export async function runAgentLedReview(
 			checks: params.checks,
 		},
 		focus: params.scope === "area" ? undefined : (focus || topic),
-		flags: { verify: params.verify, quick: params.quick },
+		flags: { verify: params.verify, quick: params.quick, premium: params.premium },
 		deadlineMs,
 		detailHint,
 		traceDir,
@@ -155,7 +157,7 @@ export function parseReviewRequest(raw: unknown): ReviewRequest | { error: strin
 		}
 		str("intent"); str("spec_path"); str("focus"); str("topic");
 		strs("requirements"); strs("suspicions"); strs("context_files"); strs("checks"); strs("comment_authors");
-		bool("verify"); bool("quick"); bool("pr_comments"); bool("include_nits"); bool("include_resolved"); bool("socratic");
+		bool("verify"); bool("quick"); bool("premium"); bool("pr_comments"); bool("include_nits"); bool("include_resolved"); bool("socratic");
 		if (o.scope !== undefined) {
 			if (o.scope !== "diff" && o.scope !== "area") throw new Error(`"scope" must be "diff" or "area"`);
 			req.scope = o.scope;
@@ -219,7 +221,7 @@ function announceRun(progressPath: string, cwd: string): void {
 
 /**
  * Apply the boolean run-shape flags given on the command line over a parsed
- * brief. `--verify` / `--quick` are what a caller reaches for; everything else
+ * brief. `--verify` / `--quick` / `--premium` are what a caller reaches for; everything else
  * stays a brief field so the brief remains the record of what was asked.
  */
 export function applyCliFlags(req: ReviewRequest, args: string): ReviewRequest {
@@ -228,6 +230,7 @@ export function applyCliFlags(req: ReviewRequest, args: string): ReviewRequest {
 	if (verify.present) out.verify = true;
 	const quick = parseBoolFlag(verify.rest, "quick");
 	if (quick.present) out.quick = true;
+	if (parseBoolFlag(quick.rest, "premium").present) out.premium = true;
 	// Both compose, as they do on the slash command: a fast pass that still
 	// cross-checks.
 	return out;

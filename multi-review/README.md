@@ -451,6 +451,7 @@ its own option:
 | *(default)* | Sonnet 5.5 + gpt-6.1-sol + Kimi K3.1 Pro + Gemini 4 Argon with read-only tools → grouping → the main agent judges | Most reviews | ~1× · ~2–3 min on a 700-line diff |
 | `--verify` | Adds a cross-check round: each issue goes to `verifiersPerFinding` (1) reviewer **who did not raise it**, plus any `verifyOnly` models. With tools, they reply confirmed / refuted / uncertain plus code evidence | High-stakes changes; when false positives are expensive | ~1.5–2× |
 | `--quick` | `quickReviewers` pool (gpt-6-luna@low, Haiku 5.5, Gemini Flash@low), single completions, no tools | Small diffs, a cheap first look | ~0.2× · 10–50s |
+| `--premium` | `premiumSwaps`: Claude Fable 5.2 takes Sonnet's seat and GPT-6.2 Astra takes Kimi's, both @high; the other seats stay. Off unless the user asks for it | When you want the strongest models and accept the price | Fable and Astra list at $8/$40, 4x the seats they take; unmeasured as reviewers here |
 | `--direct` | No agent hand-off: the configured judge writes the synthesis (print/RPC modes always do this) | Scripting, or when you don't want the agent involved | +1 judge call |
 
 Options combine: `--quick --verify` is a fast pass that still cross-checks.
@@ -925,6 +926,14 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
   "judgeMaxTokens": 8000,
   "readMaxChars": 24000,
   "sessionMaxCostUsd": 1.5,
+  "sessionMaxCostUsdByModel": {
+    "amd-gateway-anthropic/Claude-Fable-5-2": 6,
+    "amd-gateway/GPT-6.2-Astra": 6
+  },
+  "premiumSwaps": {
+    "amd-gateway-anthropic/Claude-Sonnet-5.5": "amd-gateway-anthropic/Claude-Fable-5-2@high",
+    "amd-gateway/Kimi-K3.1-Pro": "amd-gateway/GPT-6.2-Astra@high"
+  },
   "promptCacheKeyModels": ["amd-gateway/Kimi-K3.1-Pro"],
   "verifyNarrowContext": false,
   "secondPassMinLines": 0,
@@ -959,6 +968,12 @@ second model behind it.
 a model's every session). Kimi defaults to 12k against the pool's 24k: in one
 real review it made 194 tool calls to Sonnet's 64 at the same list price and
 cost 8x, re-reading the same files up to 6 times.
+`premiumSwaps` maps a reviewer seat (`provider/id`, level ignored) to the
+spec that takes it in a `--premium` run (`premium: true` in the tool or
+brief). A premium model doesn't inherit its seat's second pass.
+`sessionMaxCostUsdByModel` overrides `sessionMaxCostUsd` per model
+(`provider/id`). The premium models get $6, the pool cap scaled by their 4x
+list price; no real run has billed them yet.
 `sessionMaxCostUsd` caps what one reviewer or verifier session may spend
 (default $1.50, priced at the gateway's billed rates with cache included; 0
 disables it). A session that reaches it is cut and harvested like one that ran

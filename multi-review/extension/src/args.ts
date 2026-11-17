@@ -1,7 +1,7 @@
 import type { ReviewFlags } from "./config.ts";
 
 /**
- * Pull `--verify`, `--quick`, `--author` (and legacy `--mode=…`) out of the args.
+ * Pull `--verify`, `--quick`, `--premium`, `--author` (and legacy `--mode=…`) out of the args.
  * Legacy modes map onto the flags: council → verify, triage → quick,
  * balanced/light → defaults (agent-led balanced subsumes both).
  */
@@ -14,6 +14,9 @@ export function parseReviewFlags(rawArgs: string, defaults: ReviewFlags): { flag
 	const quick = parseBoolFlag(rest, "quick");
 	rest = quick.rest;
 	if (quick.present) flags.quick = true;
+	const premium = parseBoolFlag(rest, "premium");
+	rest = premium.rest;
+	if (premium.present) flags.premium = true;
 	const legacy = parseValueFlag(rest, "mode");
 	rest = legacy.rest;
 	if (legacy.value?.toLowerCase() === "council") flags.verify = true;
@@ -126,6 +129,7 @@ const ARG_COMPLETIONS: Array<{ token: string; label: string; description: string
 	{ token: "--spec=", label: "--spec=<path>", description: "review or discuss against a spec file" },
 	{ token: "--verify", label: "--verify", description: "cross-check each finding with reviewers who didn't raise it" },
 	{ token: "--quick", label: "--quick", description: "fast reviewer pool, no tools" },
+	{ token: "--premium", label: "--premium", description: "Fable 5.2 and GPT-6.2 Astra take Sonnet's and Kimi's seats (~4x their price)" },
 	{ token: "--direct", label: "--direct", description: "skip the main agent; external judge synthesizes" },
 	{ token: "--pr-comments", label: "--pr-comments", description: "with a PR: verify its existing review comments (CodeRabbit, collaborators)" },
 	{ token: "--author=", label: "--author=<login[,login]>", description: "with --pr-comments: filter comments/reviews by author (or bot/human/!login)" },

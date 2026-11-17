@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { type ParsedReviewArgs, parseAuthorFlags, parseBoolFlag, parseReviewArgs, parseReviewFlags, parseSocraticFlags, parseValueFlag } from "./args.ts";
 import { type BriefInput, buildBrief, hasBriefInput, readSpecFile } from "./brief.ts";
 import { CXX_FILE, cxxAutoCheck, runChecks } from "./checks.ts";
-import { type Model, type ModelSpec, type MultiReviewConfig, type ReviewFlags, type ReviewerSpec, dedupeTarget, describeFlags, loadConfig, parseReviewerSpec, reviewerRunOptions, scaledMinToolCalls } from "./config.ts";
+import { type Model, type ModelSpec, type MultiReviewConfig, type ReviewFlags, type ReviewerSpec, applyPremiumSwaps, dedupeTarget, describeFlags, loadConfig, parseReviewerSpec, reviewerRunOptions, scaledMinToolCalls } from "./config.ts";
 import { type RunCost, addUsage, emptyRunCost, formatRunCost, runCostLine } from "./cost.ts";
 import { type HiddenClaim, type SuspicionResult, groupFindings } from "./grouping.ts";
 import { type JudgeResult, runJudge } from "./judge.ts";
@@ -166,9 +166,12 @@ export async function runMultiReviewFromArgs(
 	// tools, so they keep the quick pool.
 	const socraticSpecs = [...reviewOnlySpecs, ...cfg.verifyOnly]
 		.filter((raw, i, all) => all.findIndex((o) => parseReviewerSpec(o)?.spec === parseReviewerSpec(raw)?.spec) === i);
+	// --premium swaps seats in the configured pool; a picked pool or the
+	// quick pool is already what was asked for.
+	const configuredSpecs = isSocratic ? socraticSpecs : reviewOnlySpecs;
 	const effectiveReviewerSpecs: string[] = usingTransientReviewers
 		? transientReviewers
-		: flags.quick ? cfg.quickReviewers : isSocratic ? socraticSpecs : reviewOnlySpecs;
+		: flags.quick ? cfg.quickReviewers : flags.premium ? applyPremiumSwaps(configuredSpecs, cfg.premiumSwaps) : configuredSpecs;
 	if (usingTransientReviewers && transientReviewers === TRANSIENT_REVIEWERS) TRANSIENT_REVIEWERS = null;
 	if (effectiveReviewerSpecs.length === 0) {
 		return {
@@ -214,6 +217,7 @@ export async function runMultiReviewFromArgs(
 					...reviewerRunOptions(cfg),
 					minToolCalls: scaledMinToolCalls(cfg.minReviewToolCalls, whichChangedLines(target.diffText)),
 					readMaxCharsBySpec: cfg.readMaxCharsByModel,
+					maxCostUsdBySpec: cfg.sessionMaxCostUsdByModel,
 				}),
 			cleanups,
 		};

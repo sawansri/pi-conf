@@ -2,12 +2,12 @@
  * Multi-Review — multi-model code review led by the main agent (DESIGN: ../README.md · ../install.md)
  *
  * Surfaces:
- *   /multi-review [--spec=path] [--verify] [--quick] [--direct] [PR-number | focus]
+ *   /multi-review [--spec=path] [--verify] [--quick] [--premium] [--direct] [PR-number | focus]
  *     → hands off to the main agent (buildHandoffPrompt), which drafts the
  *       reviewer brief and calls the tool; --direct / print / RPC run the
  *       pipeline here with an external judge instead.
  *   multi_review (tool) — brief params (intent, spec_path, requirements,
- *     context_files, focus, scope) + verify/quick; returns findings +
+ *     context_files, focus, scope) + verify/quick/premium; returns findings +
  *     lead-judgment instructions to the agent.
  *
  * Pipeline:
@@ -180,7 +180,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("multi-review", {
 		description:
 			"Fan-out code review or Socratic discussion across configured models. Usage: " +
-			"/multi-review [--socratic [--rounds=2]] [--spec=path] [--verify] [--quick] [--direct] [PR-number [--pr-comments [--author=login[,login]] [--nits] [--resolved]] | free-text focus/topic]. " +
+			"/multi-review [--socratic [--rounds=2]] [--spec=path] [--verify] [--quick] [--premium] [--direct] [PR-number [--pr-comments [--author=login[,login]] [--nits] [--resolved]] | free-text focus/topic]. " +
 			"The main agent drafts the brief from your args (and spec), then judges or synthesizes the results. " +
 			"--direct skips the agent and uses the configured judge.",
 		// Argument autocomplete hints the call shape so users don't have to
@@ -298,6 +298,7 @@ export default function (pi: ExtensionAPI) {
 			"`context_files` are repo paths models should read in full (callers, types, tests) — not files already whole in the diff.",
 			"`checks` are up to 4 fast commands (type-check, targeted tests) run once in a sandbox (repo read-only, no network) before the fan-out; models see their output. C/C++ changes are compile-checked automatically.",
 			"Set verify=true for high-stakes reviews (independent cross-check of every finding); quick=true for small diffs or a cheap first look.",
+			"Set premium=true only when the user explicitly asks for premium reviewers, Fable or GPT-6.2 Astra; never on your own judgment.",
 			"For a PR that already has review comments (CodeRabbit, collaborators), set pr_comments=true to triage them (and pass `comment_authors` when filtering by specific GitHub login(s), `'bot'`, `'human'`, or `'!login'`): each is verified and you report valid/invalid per comment plus new issues, and draft replies to a local file. Never post to GitHub.",
 			"After results return, follow the lead-judgment or lead-moderator instructions in the result. Do not apply fixes unless asked.",
 		],
@@ -376,6 +377,9 @@ export default function (pi: ExtensionAPI) {
 			include_resolved: Type.Optional(Type.Boolean({ description: "With pr_comments: also check resolved review threads." })),
 			quick: Type.Optional(Type.Boolean({
 				description: "Fast reviewer pool, single completions without tools. For small diffs or a cheap first look.",
+			})),
+			premium: Type.Optional(Type.Boolean({
+				description: "Claude Fable 5.2 and GPT-6.2 Astra take Sonnet's and Kimi's seats, at ~4x their price. Only when the user explicitly asks for premium reviewers, Fable or Astra.",
 			})),
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {

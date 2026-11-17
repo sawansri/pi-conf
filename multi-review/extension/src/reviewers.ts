@@ -480,6 +480,8 @@ export interface ReviewerRunOptions {
 	 * the cap follows the model.
 	 */
 	readMaxCharsBySpec?: Record<string, number>;
+	/** Per-spec overrides for `maxCostUsd` (config.sessionMaxCostUsdByModel). */
+	maxCostUsdBySpec?: Record<string, number>;
 	/** The fan-out's straggler cutoff; set by runAllReviewers. */
 	cutoff?: StragglerCutoff;
 	/** The session's name in the trace when not just its spec (a second pass's "#2"). */
@@ -505,6 +507,7 @@ export async function runReviewer(
 	// The cap follows the model: a bare spec key covers its review, second pass
 	// and verify sessions alike.
 	const readMaxChars = runOpts.readMaxCharsBySpec?.[reviewerSpec.spec] ?? runOpts.readMaxChars;
+	const maxCostUsd = runOpts.maxCostUsdBySpec?.[reviewerSpec.spec] ?? runOpts.maxCostUsd;
 	const verifying = runOpts.tracePhase === "verify";
 	// Reviewers run their own repros; verifiers run code to settle claims.
 	const canRun = Boolean(runOpts.sandbox);
@@ -524,7 +527,7 @@ export async function runReviewer(
 				minToolCalls: verifying ? undefined : runOpts.minToolCalls,
 				late: { deadline, userSignal: abortSignal, finalFormat: JSON_FINAL_FORMAT },
 				readMaxChars,
-				maxCostUsd: runOpts.maxCostUsd,
+				maxCostUsd,
 				spentBeforeUsd: before ? billedCost(before, model.cost?.input, model.id) : 0,
 				promptCacheKeyModels: runOpts.promptCacheKeyModels,
 			},
