@@ -61,7 +61,7 @@ import { Text } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
 import { completeReviewArgs, parseAuthorFlags, parseBoolFlag, parseReviewArgs, parseReviewFlags, parseSocraticFlags, parseValueFlag } from "./src/args.ts";
 import { readSpecFile } from "./src/brief.ts";
-import { DEFAULTS, cacheConfigForFreshRead, loadConfig } from "./src/config.ts";
+import { DEFAULTS, cacheConfigForFreshRead, formatModelList, loadConfig } from "./src/config.ts";
 import { runAgentLedReview, runHeadless } from "./src/headless.ts";
 import { buildHandoffPrompt, buildSocraticHandoffPrompt } from "./src/lead.ts";
 import { describePool } from "./src/models.ts";
@@ -213,6 +213,15 @@ export default function (pi: ExtensionAPI) {
 			"Brief fields mirror the multi_review tool. Writes findings + lead instructions to <out> and <out>.md.",
 		handler: async (args, ctx) => {
 			await runHeadless(pi, args, ctx);
+		},
+	});
+
+	pi.registerCommand("multi-review-models", {
+		description:
+			"List the models a review can use (for `reviewers` / `swaps`): provider/id, list price, and the role the config gives each. Prints to stdout.",
+		handler: async (_args, ctx) => {
+			const available = await ctx.modelRegistry.getAvailable();
+			console.log(formatModelList(available, loadConfig()));
 		},
 	});
 

@@ -498,7 +498,8 @@ export function resolveReviewerChoices(
 			if (knownIds.length === 1) ids = knownIds;
 		}
 		if (ids.length === 0) {
-			errors.push(`reviewer "${choice}": no available model matches`);
+			const near = nearModels(model, keys);
+			errors.push(`reviewer "${choice}": no available model matches${near.length > 0 ? ` (close: ${near.join(", ")})` : ""}`);
 			continue;
 		}
 		if (ids.length > 1) {
@@ -533,6 +534,44 @@ export function parseSwapPairs(value: string): Record<string, string> {
 		if (eq > 0 && seat && to) out[seat] = to;
 	}
 	return out;
+}
+
+/**
+ * Available models sharing a word with a choice that didn't resolve, so the
+ * caller can correct "claude-haiku-6" to what exists instead of guessing.
+ */
+function nearModels(choice: string, keys: string[]): string[] {
+	const words = choice.toLowerCase().split(/[^a-z]+/).filter((w) => w.length >= 3 && w !== "claude");
+	return keys.filter((k) => words.some((w) => squash(k.slice(k.indexOf("/") + 1)).includes(w))).slice(0, 8);
+}
+
+/**
+ * One line per available model for `/multi-review-models`: what a caller
+ * passes as `reviewers` or `swaps`, its list price, and the role the config
+ * gives it. Catalog prices only; the gateway also bills cache tokens (cost.ts).
+ */
+export function formatModelList(
+	models: Array<{ provider: string; id: string; reasoning?: boolean; cost?: { input?: number; output?: number } }>,
+	cfg: Pick<MultiReviewConfig, "reviewers" | "premiumSwaps" | "verifyOnly" | "quickReviewers" | "judge">,
+): string {
+	const roles = new Map<string, string[]>();
+	const tag = (raw: string, role: string) => {
+		const spec = parseReviewerSpec(raw)?.spec ?? raw;
+		const level = raw.match(/@([a-z]+)$/)?.[1];
+		roles.set(spec, [...(roles.get(spec) ?? []), level ? `${role} @${level}` : role]);
+	};
+	for (const raw of cfg.reviewers) tag(raw, "reviewer");
+	for (const raw of Object.values(cfg.premiumSwaps)) tag(raw, "premium");
+	for (const raw of cfg.verifyOnly) tag(raw, "verify-only");
+	for (const raw of cfg.quickReviewers) tag(raw, "quick");
+	tag(cfg.judge, "judge");
+	const price = (n?: number) => (n === undefined ? "?" : `$${n}`);
+	return models
+		.map((m) => `${m.provider}/${m.id}`.padEnd(48) +
+			` ${price(m.cost?.input)}/${price(m.cost?.output)} per Mtok` +
+			(m.reasoning ? "  thinking" : "") +
+			(roles.has(`${m.provider}/${m.id}`) ? `  [${roles.get(`${m.provider}/${m.id}`)!.join(", ")}]` : ""))
+		.join("\n");
 }
 
 /** Split a comma-separated model list (`--reviewers=fable,gpt-6.1-sol`). */

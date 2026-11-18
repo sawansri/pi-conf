@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { parseReviewFlags } from "../src/args.ts";
-import { DEFAULTS, applySwaps, describeFlags, parseReviewerSpec, parseSwapPairs, resolveReviewerChoices } from "../src/config.ts";
+import { DEFAULTS, applySwaps, describeFlags, parseReviewerSpec, formatModelList, parseSwapPairs, resolveReviewerChoices } from "../src/config.ts";
 import { applyCliFlags, parseReviewRequest } from "../src/headless.ts";
 
 // What the registry has: the default pool, the premium models and Opus.
@@ -152,4 +152,20 @@ test("--reviewers is parsed on every surface and turns premium off", () => {
 	assert.deepEqual(parseReviewRequest({ intent: "x", reviewers: ["fable"] }).reviewers, ["fable"]);
 	assert.match((parseReviewRequest({ intent: "x", reviewers: "fable" }) as { error: string }).error, /array of strings/);
 	assert.equal(describeFlags({ verify: false, quick: false, premium: true, reviewers: ["fable"] }), "balanced");
+});
+
+test("a model name that doesn't resolve names the close ones", () => {
+	const [error] = resolveReviewerChoices(["claude-haiku-6"], [...AVAILABLE, "amd-gateway-anthropic/Claude-Haiku-5.5"]).errors;
+	assert.match(error, /close: amd-gateway-anthropic\/Claude-Haiku-5\.5\)/);
+	// The way a user says it resolves directly.
+	assert.deepEqual(resolveReviewerChoices(["haiku 5.5"], [...AVAILABLE, "amd-gateway-anthropic/Claude-Haiku-5.5"]).specs, ["amd-gateway-anthropic/Claude-Haiku-5.5"]);
+});
+
+test("the model list marks what the config uses each model for", () => {
+	const list = formatModelList([
+		{ provider: "amd-gateway-anthropic", id: "Claude-Fable-5-2", reasoning: true, cost: { input: 8, output: 40 } },
+		{ provider: "amd-gateway", id: "Some-Other", cost: {} },
+	], DEFAULTS).split("\n");
+	assert.match(list[0], /^amd-gateway-anthropic\/Claude-Fable-5-2 +\$8\/\$40 per Mtok  thinking  \[premium @medium\]$/);
+	assert.match(list[1], / \?\/\? per Mtok$/);
 });

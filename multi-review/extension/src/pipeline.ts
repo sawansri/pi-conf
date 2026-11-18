@@ -178,7 +178,7 @@ export async function runMultiReviewFromArgs(
 		if (chosen.errors.length > 0) {
 			return {
 				kind: "notify",
-				notifyMessage: `multi-review: ${chosen.errors.join("; ")}. Nothing was run; name the model as provider/id or a fuller id.`,
+				notifyMessage: `multi-review: ${chosen.errors.join("; ")}. Nothing was run; name the model as provider/id or a fuller id (/multi-review-models lists them).`,
 				notifyLevel: "error",
 			};
 		}
