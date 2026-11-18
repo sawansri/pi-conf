@@ -485,8 +485,14 @@ export function resolveReviewerChoices(
 		const at = choice.match(/^(.+?)(?:@([a-z]+))?$/);
 		const model = at?.[1] ?? "";
 		const wantedLevel = at?.[2] && (THINKING_LEVEL_ALIASES as readonly string[]).includes(at[2]) ? at[2] : undefined;
+		if (at?.[2] && !wantedLevel) {
+			errors.push(`reviewer "${choice}": unknown thinking level "${at[2]}" (${THINKING_LEVEL_ALIASES.join(", ")})`);
+			continue;
+		}
 		let candidates: string[];
-		if (model.includes("/")) {
+		if (!squash(model)) {
+			candidates = [];
+		} else if (model.includes("/")) {
 			candidates = keys.filter((k) => k === model);
 		} else {
 			candidates = keys.filter((k) => idOf(k) === squash(model));

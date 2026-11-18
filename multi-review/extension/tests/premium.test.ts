@@ -140,6 +140,9 @@ test("--reviewers fails on a model it can't resolve or can't tell apart, instead
 	assert.match(resolveReviewerChoices(["amd-gateway/Claude-Fable-5-2"], AVAILABLE).errors[0], /no available model matches/);
 	// "claude" names Sonnet, Opus and Fable; none of them is the obvious one.
 	assert.match(resolveReviewerChoices(["claude"], AVAILABLE).errors[0], /ambiguous/);
+	// A typo in the level or a name with nothing to match on is an error too.
+	assert.match(resolveReviewerChoices(["fable@turbo"], AVAILABLE).errors[0], /unknown thinking level "turbo"/);
+	assert.match(resolveReviewerChoices(["-"], AVAILABLE).errors[0], /no available model matches/);
 });
 
 test("--reviewers is parsed on every surface and turns premium off", () => {
