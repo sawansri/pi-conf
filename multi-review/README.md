@@ -448,7 +448,7 @@ its own option:
 
 | Option | What it does | When | Cost / time (4-reviewer pool) |
 |--------|-------------|------|------------------------------|
-| *(default)* | Sonnet 5.5 + gpt-6.1-sol + Kimi K3.1 Pro + Gemini 4 Argon with read-only tools → grouping → the main agent judges | Most reviews | ~1× · ~2–3 min on a 700-line diff |
+| *(default)* | Sonnet 5.5 + gpt-6.1-sol + Kimi K3.1 Pro + Gemini 4 Argon + Gemini 4 Hydrogen with read-only tools → grouping → the main agent judges | Most reviews | ~1× · ~2–3 min on a 700-line diff |
 | `--verify` | Adds a cross-check round: each issue goes to `verifiersPerFinding` (1) reviewer **who did not raise it**, plus any `verifyOnly` models. With tools, they reply confirmed / refuted / uncertain plus code evidence | High-stakes changes; when false positives are expensive | ~1.5–2× |
 | `--quick` | `quickReviewers` pool (gpt-6-luna@low, Haiku 5.5, Gemini Flash@low), single completions, no tools | Small diffs, a cheap first look | ~0.2× · 10–50s |
 | `--premium` | `premiumSwaps`: Claude Fable 5.2 takes Sonnet's seat and GPT-6.2 Astra takes Kimi's, both @medium; the other seats stay. Off unless the user asks for it | When you want the strongest models and accept the price | Fable and Astra list at $8/$40, 4x the seats they take; unmeasured as reviewers here |
@@ -737,6 +737,12 @@ Findings:
   session starts over under the error retries (up to 3, 15s apart), and
   after those that reviewer is reported as failed and the rest of the pool
   carries on.
+- **Gemini 4 Hydrogen joined the default pool on its release day**
+  (2026-11-18) at `@medium`, and hasn't been measured as a reviewer yet.
+  It is a second Google seat at well under Argon's price ($1.5/$7.5 vs
+  $4/$20 per 1M on the gateway). The no-quote addendum covers it too,
+  since it matches any `gemini` id. `concurrency` went to 6 so all five
+  reviewers and Sonnet's second pass still run at once.
 - **DeepSeek V4.1 Flash** (the gateway's pre-1017 checkpoint) works with
   tools and thinking but was too slow to review: cut as a straggler at
   `@high`, timed out at 900s at `@max` after ~200k characters of reasoning.
@@ -897,11 +903,12 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
     "amd-gateway-anthropic/Claude-Sonnet-5.5@high",
     "amd-gateway/gpt-6.1-sol@high",
     "amd-gateway/Kimi-K3.1-Pro@high",
-    "amd-gateway/gemini-4-argon@medium"
+    "amd-gateway/gemini-4-argon@medium",
+    "amd-gateway/gemini-4-hydrogen@medium"
   ],
   "judge": "amd-gateway-anthropic/Claude-Opus-5.5",
   "judgeThinking": "high",
-  "concurrency": 5,
+  "concurrency": 6,
   "temperature": 0.2,
   "verify": false,
   "verifiersPerFinding": 1,
