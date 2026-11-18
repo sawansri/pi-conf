@@ -168,7 +168,45 @@ test("the model list marks what the config uses each model for", () => {
 	const list = formatModelList([
 		{ provider: "amd-gateway-anthropic", id: "Claude-Fable-5-2", reasoning: true, cost: { input: 8, output: 40 } },
 		{ provider: "amd-gateway", id: "Some-Other", cost: {} },
-	], DEFAULTS).split("\n");
+	], DEFAULTS, { all: true }).split("\n");
 	assert.match(list[0], /^amd-gateway-anthropic\/Claude-Fable-5-2 +\$8\/\$40 per Mtok  thinking  \[premium @medium\]$/);
 	assert.match(list[1], / \?\/\? per Mtok$/);
+});
+
+test("the model list leaves out older versions, second providers and non-thinking models", () => {
+	const m = (spec: string, reasoning = true, input = 1) => ({ provider: spec.slice(0, spec.indexOf("/")), id: spec.slice(spec.indexOf("/") + 1), reasoning, cost: { input } });
+	const list = formatModelList([
+		m("anthropic/claude-opus-4-5"),
+		m("amd-gateway-anthropic/Claude-Opus-5.5"),
+		m("anthropic/claude-sonnet-4-5-20250929"),
+		m("anthropic/claude-sonnet-5-5"),
+		m("amd-gateway-anthropic/Claude-Sonnet-5.5"),
+		m("amd-gateway/gpt-6-sol"),
+		m("amd-gateway/gpt-6.1-sol"),
+		m("amd-gateway/GPT-6.2-Sol"),
+		m("huggingface/meta-llama/Llama-3.3-70B-Instruct", false),
+		m("huggingface/Qwen/Qwen3-235B-A22B"),
+		m("huggingface/Qwen/Qwen3.8-27B"),
+		m("huggingface/openai/gpt-oss-120b"),
+		m("huggingface/deepseek-ai/DeepSeek-V3.2"),
+		m("amd-gateway/DeepSeek-V4-Pro"),
+		m("amd-gateway/DeepSeek-V4.1-Flash"),
+		m("huggingface/zai-org/GLM-5.3-Flash", true, 0.15),
+		m("amd-gateway-onprem/GLM-5.3-Flash", true, 0),
+	], DEFAULTS).split("\n").map((l) => l.split(" ")[0]);
+	assert.deepEqual(list, [
+		"amd-gateway-anthropic/Claude-Opus-5.5",
+		"amd-gateway-anthropic/Claude-Sonnet-5.5",
+		// Older than 6.2, but a reviewer in the config.
+		"amd-gateway/gpt-6.1-sol",
+		"amd-gateway/GPT-6.2-Sol",
+		"huggingface/Qwen/Qwen3.8-27B",
+		// "120b" is a size, not a version.
+		"huggingface/openai/gpt-oss-120b",
+		// A newer Flash doesn't replace the older Pro.
+		"amd-gateway/DeepSeek-V4-Pro",
+		"amd-gateway/DeepSeek-V4.1-Flash",
+		"amd-gateway-onprem/GLM-5.3-Flash",
+		"(8",
+	]);
 });

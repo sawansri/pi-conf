@@ -551,14 +551,80 @@ function nearModels(choice: string, keys: string[]): string[] {
 	return keys.filter((k) => words.some((w) => squash(k.slice(k.indexOf("/") + 1)).includes(w))).slice(0, 8);
 }
 
+type ListedModel = { provider: string; id: string; reasoning?: boolean; cost?: { input?: number; output?: number } };
+
 /**
- * One line per available model for `/multi-review-models`: what a caller
- * passes as `reviewers` or `swaps`, its list price, and the role the config
- * gives it. Catalog prices only; the gateway also bills cache tokens (cost.ts).
+ * A model id's series, family and version: "claude-opus-4-5" is series
+ * `claude-opus-`, family `claude-opus-#`, version [4, 5]; "Qwen3.5-122B-A10B"
+ * is `qwen`, `qwen#-122b-a10b`, [3, 5]. Sizes ("120b", "2.4t") aren't
+ * versions, and dated snapshots ("-20251001", "-0905") share their base's
+ * version. Only the id's last path segment, so `moonshotai/Kimi-K3` and
+ * `Kimi-K3` compare. An id without a version is its own family and series.
+ */
+function modelVersion(id: string): { series: string; family: string; version: number[] } {
+	const base = id.slice(id.lastIndexOf("/") + 1).toLowerCase().replace(/-(?:\d{8}|\d{4})$/, "");
+	const m = base.match(/\d+(?:\.\d+)*(?:-\d+(?![\d.a-z]))*(?![\d.]|[bkmt](?:-|$))/);
+	if (!m || m.index === undefined) return { series: base, family: base, version: [] };
+	return {
+		series: base.slice(0, m.index),
+		family: base.slice(0, m.index) + "#" + base.slice(m.index + m[0].length),
+		version: m[0].split(/[.-]/).map(Number),
+	};
+}
+
+function compareVersions(a: number[], b: number[]): number {
+	for (let i = 0; i < Math.max(a.length, b.length); i++) {
+		const d = (a[i] ?? 0) - (b[i] ?? 0);
+		if (d !== 0) return d;
+	}
+	return 0;
+}
+
+/** A smaller tier of its series, which doesn't replace an older full model. */
+const isLite = (id: string): boolean => /(?:^|[-_/])(?:flash|mini|lite|small|air|nano|luna)(?:$|[-_])/i.test(id);
+
+/**
+ * The models worth offering as reviewers: the registry also carries every
+ * older version (claude-opus-4-5 … 5-5, Qwen3 next to Qwen3.8), the same
+ * model under several providers (anthropic/claude-sonnet-5-5 and the
+ * gateway's Claude-Sonnet-5.5) and non-thinking models (Llama 3, gemma-3,
+ * local GGUFs). Keeps thinking models that no newer version of their series
+ * replaces, one provider each, plus every model the config gives a role. A
+ * newer Flash doesn't replace an older full model (DeepSeek-V4.1-Flash and
+ * V4-Pro both stay).
+ */
+export function currentModels<T extends ListedModel>(models: T[], roles: ReadonlyMap<string, unknown>): T[] {
+	const key = (m: ListedModel) => `${m.provider}/${m.id}`;
+	const configProviders = new Set([...roles.keys()].map((k) => k.slice(0, k.indexOf("/"))));
+	const candidates = models.filter((m) => roles.has(key(m)) || m.reasoning).map((m) => ({ m, ...modelVersion(m.id), lite: isLite(m.id) }));
+	const replaced = (c: (typeof candidates)[number]) =>
+		c.version.length > 0 && candidates.some((n) =>
+			n.series === c.series && compareVersions(n.version, c.version) > 0 && !(n.lite && !c.lite));
+	// One provider per family and version: the one the config uses, then a
+	// provider the config uses, then the cheapest.
+	const rank = (m: ListedModel) => [roles.has(key(m)) ? 0 : 1, configProviders.has(m.provider) ? 0 : 1, m.cost?.input ?? Infinity];
+	const best = new Map<string, T>();
+	for (const c of candidates) {
+		if (!roles.has(key(c.m)) && replaced(c)) continue;
+		const slot = `${c.family}@${c.version.join(".")}`;
+		const held = best.get(slot);
+		if (!held || compareVersions(rank(c.m), rank(held)) < 0) best.set(slot, c.m);
+	}
+	const kept = new Set(best.values());
+	// A model with a role is listed even when another provider's copy won its slot.
+	return models.filter((m) => kept.has(m) || roles.has(key(m)));
+}
+
+/**
+ * One line per model for `/multi-review-models`: what a caller passes as
+ * `reviewers` or `swaps`, its list price, and the role the config gives it.
+ * Only current models (`currentModels`) unless `all`. Catalog prices only;
+ * the gateway also bills cache tokens (cost.ts).
  */
 export function formatModelList(
-	models: Array<{ provider: string; id: string; reasoning?: boolean; cost?: { input?: number; output?: number } }>,
+	models: ListedModel[],
 	cfg: Pick<MultiReviewConfig, "reviewers" | "premiumSwaps" | "verifyOnly" | "quickReviewers" | "judge">,
+	opts: { all?: boolean } = {},
 ): string {
 	const roles = new Map<string, string[]>();
 	const tag = (raw: string, role: string) => {
@@ -571,13 +637,16 @@ export function formatModelList(
 	for (const raw of cfg.verifyOnly) tag(raw, "verify-only");
 	for (const raw of cfg.quickReviewers) tag(raw, "quick");
 	tag(cfg.judge, "judge");
+	const shown = opts.all ? models : currentModels(models, roles);
 	const price = (n?: number) => (n === undefined ? "?" : `$${n}`);
-	return models
+	const lines = shown
 		.map((m) => `${m.provider}/${m.id}`.padEnd(48) +
 			` ${price(m.cost?.input)}/${price(m.cost?.output)} per Mtok` +
 			(m.reasoning ? "  thinking" : "") +
-			(roles.has(`${m.provider}/${m.id}`) ? `  [${roles.get(`${m.provider}/${m.id}`)!.join(", ")}]` : ""))
-		.join("\n");
+			(roles.has(`${m.provider}/${m.id}`) ? `  [${roles.get(`${m.provider}/${m.id}`)!.join(", ")}]` : ""));
+	const hidden = models.length - shown.length;
+	if (hidden > 0) lines.push(`(${hidden} older, duplicate or non-thinking models not shown; /multi-review-models --all lists them)`);
+	return lines.join("\n");
 }
 
 /** Split a comma-separated model list (`--reviewers=fable,gpt-6.1-sol`). */

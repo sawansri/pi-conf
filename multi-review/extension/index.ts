@@ -218,10 +218,10 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("multi-review-models", {
 		description:
-			"List the models a review can use (for `reviewers` / `swaps`): provider/id, list price, and the role the config gives each. Prints to stdout.",
-		handler: async (_args, ctx) => {
+			"List the current models a review can use (for `reviewers` / `swaps`): provider/id, list price, and the role the config gives each. --all adds older versions, duplicates and non-thinking models. Prints to stdout.",
+		handler: async (args, ctx) => {
 			const available = await ctx.modelRegistry.getAvailable();
-			console.log(formatModelList(available, loadConfig()));
+			console.log(formatModelList(available, loadConfig(), { all: parseBoolFlag(args, "all").present }));
 		},
 	});
 
