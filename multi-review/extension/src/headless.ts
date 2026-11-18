@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { type ParsedReviewArgs, parseBoolFlag, parseValueFlag } from "./args.ts";
-import { parseSwapPairs } from "./config.ts";
+import { parseModelList, parseSwapPairs } from "./config.ts";
 import { leadJudgmentInstructions } from "./lead.ts";
 import { TRANSIENT_REVIEWERS, runMultiReviewFromArgs } from "./pipeline.ts";
 import { normalizeAuthorFilter } from "./pr-comments.ts";
@@ -32,6 +32,8 @@ export interface ReviewRequest {
 	premium?: boolean;
 	/** Reviewer seat → model for this run (config.applySwaps); unavailable models keep the seat's original. */
 	swaps?: Record<string, string>;
+	/** The exact reviewer models for this run (config.resolveReviewerChoices); replaces the pool. */
+	reviewers?: string[];
 	/** Triage the PR's existing review comments (needs pr_number). */
 	pr_comments?: boolean;
 	/** Filter PR comments/reviews by GitHub author login(s), "bot", "human", or "!login". */
@@ -101,7 +103,7 @@ export async function runAgentLedReview(
 			checks: params.checks,
 		},
 		focus: params.scope === "area" ? undefined : (focus || topic),
-		flags: { verify: params.verify, quick: params.quick, premium: params.premium, swaps: params.swaps },
+		flags: { verify: params.verify, quick: params.quick, premium: params.premium, swaps: params.swaps, reviewers: params.reviewers },
 		deadlineMs,
 		detailHint,
 		traceDir,
@@ -159,7 +161,7 @@ export function parseReviewRequest(raw: unknown): ReviewRequest | { error: strin
 			o.socratic = true;
 		}
 		str("intent"); str("spec_path"); str("focus"); str("topic");
-		strs("requirements"); strs("suspicions"); strs("context_files"); strs("checks"); strs("comment_authors");
+		strs("requirements"); strs("suspicions"); strs("context_files"); strs("checks"); strs("comment_authors"); strs("reviewers");
 		bool("verify"); bool("quick"); bool("premium"); bool("pr_comments"); bool("include_nits"); bool("include_resolved"); bool("socratic");
 		if (o.swaps !== undefined) {
 			if (typeof o.swaps !== "object" || Array.isArray(o.swaps) || !Object.values(o.swaps as object).every((x) => typeof x === "string")) {
@@ -230,7 +232,7 @@ function announceRun(progressPath: string, cwd: string): void {
 
 /**
  * Apply the boolean run-shape flags given on the command line over a parsed
- * brief. `--verify` / `--quick` / `--premium` / `--swap` are what a caller reaches for; everything else
+ * brief. `--verify` / `--quick` / `--premium` / `--swap` / `--reviewers` are what a caller reaches for; everything else
  * stays a brief field so the brief remains the record of what was asked.
  */
 export function applyCliFlags(req: ReviewRequest, args: string): ReviewRequest {
@@ -245,6 +247,10 @@ export function applyCliFlags(req: ReviewRequest, args: string): ReviewRequest {
 	for (let swap = parseValueFlag(rest, "swap"); swap.value !== undefined; swap = parseValueFlag(rest, "swap")) {
 		rest = swap.rest;
 		out.swaps = { ...out.swaps, ...parseSwapPairs(swap.value) };
+	}
+	for (let pool = parseValueFlag(rest, "reviewers"); pool.value !== undefined; pool = parseValueFlag(rest, "reviewers")) {
+		rest = pool.rest;
+		out.reviewers = [...(out.reviewers ?? []), ...parseModelList(pool.value)];
 	}
 	// Both compose, as they do on the slash command: a fast pass that still
 	// cross-checks.

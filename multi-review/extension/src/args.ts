@@ -1,7 +1,7 @@
-import { type ReviewFlags, parseSwapPairs } from "./config.ts";
+import { type ReviewFlags, parseModelList, parseSwapPairs } from "./config.ts";
 
 /**
- * Pull `--verify`, `--quick`, `--premium`, `--swap`, `--author` (and legacy `--mode=…`) out of the args.
+ * Pull `--verify`, `--quick`, `--premium`, `--swap`, `--reviewers`, `--author` (and legacy `--mode=…`) out of the args.
  * Legacy modes map onto the flags: council → verify, triage → quick,
  * balanced/light → defaults (agent-led balanced subsumes both).
  */
@@ -20,6 +20,10 @@ export function parseReviewFlags(rawArgs: string, defaults: ReviewFlags): { flag
 	for (let swap = parseValueFlag(rest, "swap"); swap.value !== undefined; swap = parseValueFlag(rest, "swap")) {
 		rest = swap.rest;
 		flags.swaps = { ...flags.swaps, ...parseSwapPairs(swap.value) };
+	}
+	for (let pool = parseValueFlag(rest, "reviewers"); pool.value !== undefined; pool = parseValueFlag(rest, "reviewers")) {
+		rest = pool.rest;
+		flags.reviewers = [...(flags.reviewers ?? []), ...parseModelList(pool.value)];
 	}
 	const legacy = parseValueFlag(rest, "mode");
 	rest = legacy.rest;
@@ -134,6 +138,7 @@ const ARG_COMPLETIONS: Array<{ token: string; label: string; description: string
 	{ token: "--verify", label: "--verify", description: "cross-check each finding with reviewers who didn't raise it" },
 	{ token: "--quick", label: "--quick", description: "fast reviewer pool, no tools" },
 	{ token: "--premium", label: "--premium", description: "Fable 5.2 and GPT-6.2 Astra take Sonnet's and Kimi's seats (~4x their price)" },
+	{ token: "--reviewers=", label: "--reviewers=<model[,model]>", description: "review with exactly these models this run, e.g. fable or sonnet,gpt-6.1-sol; replaces the whole pool" },
 	{ token: "--swap=", label: "--swap=<seat>=<model>", description: "give a reviewer seat to another model this run, e.g. sonnet=amd-gateway-anthropic/Claude-Opus-5.5; unavailable models keep the original" },
 	{ token: "--direct", label: "--direct", description: "skip the main agent; external judge synthesizes" },
 	{ token: "--pr-comments", label: "--pr-comments", description: "with a PR: verify its existing review comments (CodeRabbit, collaborators)" },

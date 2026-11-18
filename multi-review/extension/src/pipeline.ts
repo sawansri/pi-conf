@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { type ParsedReviewArgs, parseAuthorFlags, parseBoolFlag, parseReviewArgs, parseReviewFlags, parseSocraticFlags, parseValueFlag } from "./args.ts";
 import { type BriefInput, buildBrief, hasBriefInput, readSpecFile } from "./brief.ts";
 import { CXX_FILE, cxxAutoCheck, runChecks } from "./checks.ts";
-import { type Model, type ModelSpec, type MultiReviewConfig, type ReviewFlags, type ReviewerSpec, applySwaps, dedupeTarget, describeFlags, loadConfig, parseReviewerSpec, reviewerRunOptions, scaledMinToolCalls } from "./config.ts";
+import { type Model, type ModelSpec, type MultiReviewConfig, type ReviewFlags, type ReviewerSpec, applySwaps, dedupeTarget, describeFlags, loadConfig, parseReviewerSpec, resolveReviewerChoices, reviewerRunOptions, scaledMinToolCalls } from "./config.ts";
 import { type RunCost, addUsage, emptyRunCost, formatRunCost, runCostLine } from "./cost.ts";
 import { type HiddenClaim, type SuspicionResult, groupFindings } from "./grouping.ts";
 import { type JudgeResult, runJudge } from "./judge.ts";
@@ -154,10 +154,12 @@ export async function runMultiReviewFromArgs(
 		const spec = readSpecFile(ctx.cwd, briefInput.specPath);
 		if ("error" in spec) return { kind: "notify", notifyMessage: `multi-review: ${spec.error}`, notifyLevel: "error" };
 	}
-	// A transient pool (picker, not persisted) overrides the configured one
-	// for this run only; --quick swaps in the fast pool.
-	const usingTransientReviewers = transientReviewers !== null && transientReviewers.length > 0;
-	const poolName = usingTransientReviewers ? "transient" : flags.quick ? "quickReviewers" : "reviewers";
+	// The user's --reviewers win over everything; then a transient pool
+	// (picker, not persisted) for this run only; --quick swaps in the fast pool.
+	const chosenReviewers = flags.reviewers ?? [];
+	const usingChosenReviewers = chosenReviewers.length > 0;
+	const usingTransientReviewers = !usingChosenReviewers && transientReviewers !== null && transientReviewers.length > 0;
+	const poolName = usingChosenReviewers ? "reviewers you chose" : usingTransientReviewers ? "transient" : flags.quick ? "quickReviewers" : "reviewers";
 	// verifyOnly wins over reviewers: a model listed in both only verifies.
 	const verifyOnlyIds = new Set(cfg.verifyOnly.map((raw) => parseReviewerSpec(raw)?.spec));
 	const reviewOnlySpecs = cfg.reviewers.filter((raw) => !verifyOnlyIds.has(parseReviewerSpec(raw)?.spec));
@@ -169,12 +171,27 @@ export async function runMultiReviewFromArgs(
 	let effectiveReviewerSpecs: string[] = usingTransientReviewers
 		? transientReviewers
 		: flags.quick ? cfg.quickReviewers : isSocratic ? socraticSpecs : reviewOnlySpecs;
-	// Premium seats (never in the quick pool), then the user's own swaps. A
-	// replacement the registry doesn't have leaves the original in its seat.
-	const swapNotes: string[] = [];
-	if ((flags.premium && !flags.quick) || Object.keys(flags.swaps ?? {}).length > 0) {
+	if (usingChosenReviewers) {
 		const available = (await ctx.modelRegistry.getAvailable()).map((m) => `${m.provider}/${m.id}`);
-		for (const swaps of [flags.premium && !flags.quick ? cfg.premiumSwaps : {}, flags.swaps ?? {}]) {
+		const known = [...cfg.reviewers, ...Object.values(cfg.premiumSwaps), ...cfg.verifyOnly, ...cfg.quickReviewers];
+		const chosen = resolveReviewerChoices(chosenReviewers, available, known);
+		if (chosen.errors.length > 0) {
+			return {
+				kind: "notify",
+				notifyMessage: `multi-review: ${chosen.errors.join("; ")}. Nothing was run; name the model as provider/id or a fuller id.`,
+				notifyLevel: "error",
+			};
+		}
+		effectiveReviewerSpecs = chosen.specs;
+	}
+	// Premium seats (never in the quick pool, nor in a pool the user chose),
+	// then the user's own swaps. A replacement the registry doesn't have
+	// leaves the original in its seat.
+	const premiumApplies = flags.premium && !flags.quick && !usingChosenReviewers;
+	const swapNotes: string[] = [];
+	if (premiumApplies || Object.keys(flags.swaps ?? {}).length > 0) {
+		const available = (await ctx.modelRegistry.getAvailable()).map((m) => `${m.provider}/${m.id}`);
+		for (const swaps of [premiumApplies ? cfg.premiumSwaps : {}, flags.swaps ?? {}]) {
 			const swapped = applySwaps(effectiveReviewerSpecs, swaps, available);
 			effectiveReviewerSpecs = swapped.specs;
 			swapNotes.push(...swapped.notes);
@@ -330,7 +347,9 @@ export async function runMultiReviewFromArgs(
 		// run for a straggler's partial findings. Quick runs have no tools, so
 		// verify-only models (picked for tool use) sit out.
 		const verifies = !flags.quick && (flags.verify || prCommentOpts !== undefined || runOpts.useTools);
-		const verifyOnly = verifies ? await resolveReviewerPoolStructured(ctx, cfg.verifyOnly) : { entries: [], missing: [] };
+		// A pool the user chose verifies itself: verify-only models are models
+		// they didn't ask for.
+		const verifyOnly = verifies && !usingChosenReviewers ? await resolveReviewerPoolStructured(ctx, cfg.verifyOnly) : { entries: [], missing: [] };
 		if (verifyOnly.missing.length > 0) target.warnings.push(`verifyOnly models not in registry, skipped: ${verifyOnly.missing.join(", ")}`);
 		const verifierRows = verifyOnly.entries.map((r) => ({ rs: r.rs, model: r.model, clamped: r.clamped }));
 		const result = await runReviewPipeline(ctx, cfg, flags, target, resolvedRows, verifierRows, runOpts, judge, agentLead, signal, progress, runOptions.deadlineMs, hintWithTrace, prReport);

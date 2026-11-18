@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { parseReviewFlags } from "../src/args.ts";
-import { DEFAULTS, applySwaps, describeFlags, parseReviewerSpec, parseSwapPairs } from "../src/config.ts";
+import { DEFAULTS, applySwaps, describeFlags, parseReviewerSpec, parseSwapPairs, resolveReviewerChoices } from "../src/config.ts";
 import { applyCliFlags, parseReviewRequest } from "../src/headless.ts";
 
 // What the registry has: the default pool, the premium models and Opus.
@@ -114,4 +114,42 @@ test("a bare id resolves under the seat's own provider, not another provider wit
 	// anthropic/claude-sonnet-5-5, off the gateway the rest of the run used.
 	const { specs } = applySwaps(["amd-gateway-anthropic/Claude-Haiku-5.5", "amd-gateway/gpt-6.1-sol@high"], { haiku: "claude-sonnet-5.5", sol: "claude-opus-5.5" }, AVAILABLE);
 	assert.deepEqual(specs, ["amd-gateway-anthropic/Claude-Sonnet-5.5", "amd-gateway-anthropic/Claude-Opus-5.5@high"]);
+});
+
+test("--reviewers picks the exact pool from a part of an id, with the level the config gives that model", () => {
+	const known = [...DEFAULTS.reviewers, ...Object.values(DEFAULTS.premiumSwaps)];
+	assert.deepEqual(resolveReviewerChoices(["fable"], AVAILABLE, known), {
+		specs: ["amd-gateway-anthropic/Claude-Fable-5-2@medium"],
+		errors: [],
+	});
+	// A bare id prefers the provider the config uses, and an explicit level wins.
+	assert.deepEqual(resolveReviewerChoices(["claude-sonnet-5.5@low", "amd-gateway/gpt-6.1-sol", "gpt-6.1-sol"], AVAILABLE, known), {
+		specs: ["amd-gateway-anthropic/Claude-Sonnet-5.5@low", "amd-gateway/gpt-6.1-sol@high"],
+		errors: [],
+	});
+	// Two Fables: the one the config names, unless neither is named.
+	const twoFables = [...AVAILABLE, "amd-gateway-anthropic/Claude-Fable-5-1"];
+	assert.deepEqual(resolveReviewerChoices(["fable"], twoFables, known).specs, ["amd-gateway-anthropic/Claude-Fable-5-2@medium"]);
+	assert.match(resolveReviewerChoices(["fable"], twoFables).errors[0], /ambiguous/);
+	// No config entry: the model's default level.
+	assert.deepEqual(resolveReviewerChoices(["opus"], AVAILABLE, known).specs, ["amd-gateway-anthropic/Claude-Opus-5.5"]);
+});
+
+test("--reviewers fails on a model it can't resolve or can't tell apart, instead of substituting", () => {
+	assert.match(resolveReviewerChoices(["no-such-model"], AVAILABLE).errors[0], /no available model matches/);
+	assert.match(resolveReviewerChoices(["amd-gateway/Claude-Fable-5-2"], AVAILABLE).errors[0], /no available model matches/);
+	// "claude" names Sonnet, Opus and Fable; none of them is the obvious one.
+	assert.match(resolveReviewerChoices(["claude"], AVAILABLE).errors[0], /ambiguous/);
+});
+
+test("--reviewers is parsed on every surface and turns premium off", () => {
+	const defaults = { verify: false, quick: false };
+	const parsed = parseReviewFlags("--reviewers=fable --verify #12", defaults);
+	assert.deepEqual(parsed.flags.reviewers, ["fable"]);
+	assert.equal(parsed.rest, "#12");
+	assert.deepEqual(parseReviewFlags("--reviewers=sonnet,kimi --reviewers=argon", defaults).flags.reviewers, ["sonnet", "kimi", "argon"]);
+	assert.deepEqual(applyCliFlags({ intent: "x" }, "--reviewers=fable").reviewers, ["fable"]);
+	assert.deepEqual(parseReviewRequest({ intent: "x", reviewers: ["fable"] }).reviewers, ["fable"]);
+	assert.match((parseReviewRequest({ intent: "x", reviewers: "fable" }) as { error: string }).error, /array of strings/);
+	assert.equal(describeFlags({ verify: false, quick: false, premium: true, reviewers: ["fable"] }), "balanced");
 });

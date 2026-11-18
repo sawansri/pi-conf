@@ -250,11 +250,13 @@ export interface ReviewFlags {
 	premium?: boolean;
 	/** The user's own seat swaps for this run (see applySwaps); applied after premium. */
 	swaps?: Record<string, string>;
+	/** The user's own reviewer pool for this run (see resolveReviewerChoices); replaces the configured one. */
+	reviewers?: string[];
 	authors?: string[];
 }
 
 export function describeFlags(flags: ReviewFlags): string {
-	return [flags.quick ? "quick" : "balanced", flags.premium && !flags.quick ? "premium" : "", flags.verify ? "verify" : ""].filter(Boolean).join("+");
+	return [flags.quick ? "quick" : "balanced", flags.premium && !flags.quick && !flags.reviewers?.length ? "premium" : "", flags.verify ? "verify" : ""].filter(Boolean).join("+");
 }
 
 /**
@@ -456,6 +458,69 @@ export function applySwaps(
 }
 
 /**
+ * The user's own reviewer pool for one run ("review with only Fable"),
+ * replacing the configured pool outright: no premium seats, no verify-only
+ * models. Each choice is `provider/id[@level]`, a bare id, or part of an id
+ * ("fable"). A part that matches several models picks the one the config
+ * already names (`known`), and is an error otherwise. A choice without a level
+ * takes the level `known` gives that model (Fable reviews @medium in
+ * premiumSwaps), else the model's default.
+ *
+ * Unlike a swap, a choice that doesn't resolve is an error, not a fallback:
+ * the user named the models, so running others would ignore them.
+ */
+export function resolveReviewerChoices(
+	choices: string[],
+	available: Iterable<string>,
+	known: readonly string[] = [],
+): { specs: string[]; errors: string[] } {
+	const keys = [...available];
+	const idOf = (spec: string): string => squash(spec.slice(spec.indexOf("/") + 1));
+	const providerOf = (spec: string): string => spec.slice(0, spec.indexOf("/"));
+	const knownSpecs = known.map((raw) => parseReviewerSpec(raw)?.spec ?? raw.replace(/@[a-z]+$/, ""));
+	const knownProviders = new Set(knownSpecs.map(providerOf));
+	const specs: string[] = [];
+	const errors: string[] = [];
+	for (const choice of choices.map((c) => c.trim()).filter(Boolean)) {
+		const at = choice.match(/^(.+?)(?:@([a-z]+))?$/);
+		const model = at?.[1] ?? "";
+		const wantedLevel = at?.[2] && (THINKING_LEVEL_ALIASES as readonly string[]).includes(at[2]) ? at[2] : undefined;
+		let candidates: string[];
+		if (model.includes("/")) {
+			candidates = keys.filter((k) => k === model);
+		} else {
+			candidates = keys.filter((k) => idOf(k) === squash(model));
+			if (candidates.length === 0) candidates = keys.filter((k) => idOf(k).includes(squash(model)));
+		}
+		let ids = [...new Set(candidates.map(idOf))];
+		if (ids.length > 1) {
+			const knownIds = ids.filter((id) => knownSpecs.some((k) => idOf(k) === id));
+			if (knownIds.length === 1) ids = knownIds;
+		}
+		if (ids.length === 0) {
+			errors.push(`reviewer "${choice}": no available model matches`);
+			continue;
+		}
+		if (ids.length > 1) {
+			const names = [...new Set(candidates.map((k) => k.slice(k.indexOf("/") + 1)))];
+			errors.push(`reviewer "${choice}" is ambiguous: ${names.join(", ")}`);
+			continue;
+		}
+		const same = candidates.filter((k) => idOf(k) === ids[0]);
+		// A bare id can exist under several providers: prefer the one the config
+		// uses for this model, then any provider the config uses.
+		const found = same.find((k) => knownSpecs.includes(k))
+			?? same.find((k) => knownProviders.has(providerOf(k)))
+			?? same[0];
+		const knownLevel = known.find((raw) => (parseReviewerSpec(raw)?.spec ?? raw) === found)?.match(/@([a-z]+)$/)?.[1];
+		const level = wantedLevel ?? knownLevel;
+		const spec = level ? `${found}@${level}` : found;
+		if (!specs.includes(spec)) specs.push(spec);
+	}
+	return { specs, errors };
+}
+
+/**
  * Parse `seat=model` pairs, comma-separated (`--swap=sonnet=x,kimi=y`). Pairs
  * without both halves are dropped.
  */
@@ -468,6 +533,11 @@ export function parseSwapPairs(value: string): Record<string, string> {
 		if (eq > 0 && seat && to) out[seat] = to;
 	}
 	return out;
+}
+
+/** Split a comma-separated model list (`--reviewers=fable,gpt-6.1-sol`). */
+export function parseModelList(value: string): string[] {
+	return value.split(",").map((x) => x.trim()).filter(Boolean);
 }
 
 /**

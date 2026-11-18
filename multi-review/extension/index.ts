@@ -2,7 +2,7 @@
  * Multi-Review — multi-model code review led by the main agent (DESIGN: ../README.md · ../install.md)
  *
  * Surfaces:
- *   /multi-review [--spec=path] [--verify] [--quick] [--premium] [--swap=seat=model] [--direct] [PR-number | focus]
+ *   /multi-review [--spec=path] [--verify] [--quick] [--premium] [--swap=seat=model] [--reviewers=model[,model]] [--direct] [PR-number | focus]
  *     → hands off to the main agent (buildHandoffPrompt), which drafts the
  *       reviewer brief and calls the tool; --direct / print / RPC run the
  *       pipeline here with an external judge instead.
@@ -180,7 +180,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("multi-review", {
 		description:
 			"Fan-out code review or Socratic discussion across configured models. Usage: " +
-			"/multi-review [--socratic [--rounds=2]] [--spec=path] [--verify] [--quick] [--premium] [--swap=seat=model] [--direct] [PR-number [--pr-comments [--author=login[,login]] [--nits] [--resolved]] | free-text focus/topic]. " +
+			"/multi-review [--socratic [--rounds=2]] [--spec=path] [--verify] [--quick] [--premium] [--swap=seat=model] [--reviewers=model[,model]] [--direct] [PR-number [--pr-comments [--author=login[,login]] [--nits] [--resolved]] | free-text focus/topic]. " +
 			"The main agent drafts the brief from your args (and spec), then judges or synthesizes the results. " +
 			"--direct skips the agent and uses the configured judge.",
 		// Argument autocomplete hints the call shape so users don't have to
@@ -298,7 +298,8 @@ export default function (pi: ExtensionAPI) {
 			"`context_files` are repo paths models should read in full (callers, types, tests) — not files already whole in the diff.",
 			"`checks` are up to 4 fast commands (type-check, targeted tests) run once in a sandbox (repo read-only, no network) before the fan-out; models see their output. C/C++ changes are compile-checked automatically.",
 			"Set verify=true for high-stakes reviews (independent cross-check of every finding); quick=true for small diffs or a cheap first look.",
-			"Set premium=true only when the user explicitly asks for premium reviewers, Fable or GPT-6.2 Astra; never on your own judgment.",
+			"Set premium=true only when the user explicitly asks for premium reviewers alongside the rest of the pool; never on your own judgment.",
+			"When the user names the only models to use (\"review with only Fable\", \"just Sonnet and Kimi\"), pass exactly those as `reviewers` and nothing else; to replace one seat and keep the rest, use `swaps`.",
 			"For a PR that already has review comments (CodeRabbit, collaborators), set pr_comments=true to triage them (and pass `comment_authors` when filtering by specific GitHub login(s), `'bot'`, `'human'`, or `'!login'`): each is verified and you report valid/invalid per comment plus new issues, and draft replies to a local file. Never post to GitHub.",
 			"After results return, follow the lead-judgment or lead-moderator instructions in the result. Do not apply fixes unless asked.",
 		],
@@ -385,6 +386,13 @@ export default function (pi: ExtensionAPI) {
 				description:
 					"Only when the user names models to swap: reviewer seat → replacement for this run, e.g. {\"sonnet\": \"amd-gateway-anthropic/Claude-Opus-5.5@high\"}. " +
 					"A seat is a provider/id or part of a model id; a replacement is provider/id[@level] or a bare id. One that isn't available leaves the original model in its seat.",
+			})),
+			reviewers: Type.Optional(Type.Array(Type.String(), {
+				description:
+					"Only when the user names the models to review with (\"review with only Fable\", \"just Sonnet and Kimi\"): exactly these reviewers, replacing the whole pool, e.g. [\"fable\"] or [\"amd-gateway/gpt-6.1-sol@high\"]. " +
+					"Each is provider/id[@level], a bare id, or part of one. Premium and verify-only models are left out; the reviewers verify each other. A model that doesn't resolve fails the run rather than substituting.",
+				minItems: 1,
+				maxItems: 8,
 			})),
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
