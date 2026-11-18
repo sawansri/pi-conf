@@ -17,7 +17,7 @@ moment — the automation just stops on top of you.
    ↓  auto-detected when grill-me's checkpoint is approved
 write failing tests           ← GPT-5.5 medium, scoped to approved plan
    ↓  detected when last assistant message contains "Test Command: ..."
-loop until green              ← Fireworks deepseek-v4-pro @ xhigh thinking
+loop until green              ← AMD gateway gpt-6.1-sol @ xhigh thinking
    ↓  detected when last assistant message contains "Status: Green"
 verify                        ← status widget shows "ready for review"
 ```
@@ -246,9 +246,8 @@ custom entries are upserted by `id`.
 
 Already true in your environment per `~/.pi/agent/models.json`:
 
-- `fireworks` provider with `accounts/fireworks/models/minimax-m3` and
-  `accounts/fireworks/models/deepseek-v4-pro` listed (`reasoning: true`)
-- Fireworks API key present (env `FIREWORKS_API_KEY` or `auth.json`)
+- `amd-gateway` provider with `gpt-6.1-sol` listed (`reasoning: true`)
+- AMD gateway credentials present (env or `auth.json`)
 - OpenAI API key present (env `OPENAI_API_KEY` or `auth.json`)
 
 Already installed (or trivial to install):
@@ -304,7 +303,7 @@ files never break the pipeline.
   "plannerThinking": "high",
   "testerModel": "openai-codex/gpt-5.4-mini",
   "testerThinking": "medium",
-  "implementerModel": "fireworks/accounts/fireworks/models/glm-5p2",
+  "implementerModel": "amd-gateway/gpt-6.1-sol",
   "implementerThinking": "xhigh"
 }
 ```
@@ -322,7 +321,7 @@ tokens separated by spaces. Either the model or the `@thinking` part is
 optional; the unchanged field keeps its previous value.
 
 ```
-> /build-models impl=fireworks/accounts/fireworks/models/glm-5p2@xhigh
+> /build-models impl=amd-gateway/gpt-6.1-sol@xhigh
 > /build-models planner=openai-codex/gpt-5.5@high tester=glm-5.4-mini@medium
 > /build-models planner=gpt-5.5@high tester=gpt-5.4-mini@medium impl=glm-5p2@xhigh
 ```
@@ -346,8 +345,8 @@ Live cycle:
 > /build add /healthz endpoint              # uses tdd-pipeline.json then
                                             #   in-code defaults as fallback
 > /build-status                            # Phase: plan · openai-codex/gpt-5.5@high
-> /build-models impl=minimax-m3@xhigh       # override, BEFORE the implementer phase
-> /build-status                            # ...Implementer: fireworks/.../minimax-m3@xhigh
+> /build-models impl=Kimi-K3.1-Pro@xhigh    # override, BEFORE the implementer phase
+> /build-status                            # ...Implementer: amd-gateway/Kimi-K3.1-Pro@xhigh
 ```
 
 ## Why this answer is "an extension" not "a skill"

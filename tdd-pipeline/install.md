@@ -2,13 +2,12 @@
 
 ## Prereqs (you already have these per your `~/.pi/agent/`)
 
-- `fireworks` provider in `~/.pi/agent/models.json` with these reasoning-capable models:
-  - `accounts/fireworks/models/minimax-m3`
-  - `accounts/fireworks/models/deepseek-v4-pro`
+- `amd-gateway` provider in `~/.pi/agent/models.json` with the reasoning-capable
+  model `gpt-6.1-sol` (`reasoning: true`).
 - `openai` provider reachable (GPT-5.5 family).
 - API keys:
   - `OPENAI_API_KEY` (env or `~/.pi/agent/auth.json`)
-  - `FIREWORKS_API_KEY` (env or `~/.pi/agent/auth.json`)
+  - AMD gateway credentials (env or `~/.pi/agent/auth.json`)
 
 If any are missing, set them first. `pi --list-models` should show them as
 available.
@@ -55,16 +54,19 @@ Also verify the model-setter works by listing:
 
 or just type `/build` and you should see autocomplete with the description.
 
-## 3. Optional: pin Fireworks thinking to a level that works
+## 3. Optional: pin the implementer's thinking level
 
-Reasoning-capable Fireworks models accept `reasoning_effort` ∈ {low, medium,
-high}. `xhigh` is not always honored on Fireworks. If you want to be safe,
-edit the `defaultState()` in `index.ts` and set `implementerThinking: "high"`.
-Or override per-run with `/build-model fireworks/accounts/fireworks/models/deepseek-v4-pro`
-*before* entering implement phase (the phase already started, it re-applies
-the model).
+The default implementer is `amd-gateway/gpt-6.1-sol` at `xhigh`, which that
+model's `thinkingLevelMap` maps straight through (`xhigh` → `xhigh`). If you
+switch the implementer to a Fireworks model instead, note that reasoning-capable
+Fireworks models accept `reasoning_effort` ∈ {low, medium, high} and `xhigh` is
+not always honored there. In that case set `implementerThinking: "high"` in the
+`defaultState()` of `index.ts`, or override per-run with
+`/build-model <provider/id>` before entering implement phase (the phase already
+started, it re-applies the model).
 
-Or, more permanently, add a `compat.reasoningEffortMap` in `models.json`:
+Or, more permanently for such a model, add a `compat.reasoningEffortMap` in
+`models.json`:
 
 ```json
 {
@@ -92,15 +94,14 @@ This collapses pi's "xhigh" to Fireworks' "high", avoiding 400s.
 
 ## 4. Optional: choose a different implementer model
 
-Default is `fireworks/accounts/fireworks/models/deepseek-v4-pro` because it's
-strong on coding tasks. To swap:
+Default is `amd-gateway/gpt-6.1-sol` because it is strong on coding tasks. To swap:
 
 - Once during install: edit `defaultState()` in `index.ts`.
-- During a run: `/build-model fireworks/accounts/fireworks/models/minimax-m3`
+- During a run: `/build-model amd-gateway/Kimi-K3.1-Pro`
   while in implement phase.
 
-You can also add `kimi-k2.6` etc. to your `models.json` if your account lists
-them, then `/build-model fireworks/<that-id>` at runtime.
+Anything already in `models.json` works as a `/build-model` target, e.g.
+`/build-model fireworks/<that-id>` if your Fireworks account lists it.
 
 ## 5. Optional: pin defaults per phase via JSON
 
@@ -114,7 +115,7 @@ cat > ~/.pi/agent/tdd-pipeline.json << 'EOF'
   "plannerThinking": "high",
   "testerModel": "openai-codex/gpt-5.4-mini",
   "testerThinking": "medium",
-  "implementerModel": "fireworks/accounts/fireworks/models/glm-5p2",
+  "implementerModel": "amd-gateway/gpt-6.1-sol",
   "implementerThinking": "xhigh",
   "autonomous": false
 }
@@ -128,7 +129,7 @@ fall back silently to in-code — the file is never load-bearing.
 Override per-phase models at runtime with `/build-models`:
 
 ```
-> /build-models impl=fireworks/accounts/fireworks/models/minimax-m3@xhigh
+> /build-models impl=amd-gateway/gpt-6.1-sol@xhigh
 ```
 
 Validates against `ctx.modelRegistry.find()` *before* writing anything;

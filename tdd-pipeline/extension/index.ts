@@ -111,7 +111,7 @@ function defaultState(): PipelineState {
 		plannerThinking: "high",
 		testerModel: "openai-codex/gpt-5.4-mini",
 		testerThinking: "medium",
-		implementerModel: "fireworks/accounts/fireworks/models/deepseek-v4-pro",
+		implementerModel: "amd-gateway/gpt-6.1-sol",
 		implementerThinking: "xhigh",
 		startedAt: 0,
 		updatedAt: 0,
@@ -738,7 +738,7 @@ export default function (pi: ExtensionAPI) {
 					"Usage: /build-models planner=<provider>/<model>[@thinking] " +
 						"tester=<provider>/<model>[@thinking] impl=<provider>/<model>[@thinking]\n" +
 						"Phase aliases: planner|plan, tester|test, impl|implement|implementer\n" +
-						"Example: /build-models impl=fireworks/accounts/fireworks/models/glm-5p2@xhigh",
+						"Example: /build-models impl=amd-gateway/gpt-6.1-sol@xhigh",
 					"error",
 				);
 				return;
