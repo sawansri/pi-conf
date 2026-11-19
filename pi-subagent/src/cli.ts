@@ -4,14 +4,22 @@
  *   pi-agent list [--json]
  *   pi-agent run <agent|none> [options] [--] <task…|->
  *   pi-agent resume <run-dir> [options] [--] <follow-up…|->
+ *   pi-agent start <agent|run-dir> [options] [--] <task…|->   (detached; prints JSON)
+ *   pi-agent wait <events-file> [--from n] [--until-tool id]
+ *   pi-agent stop <run-dir>
  *
  * `run` resolves the agent definition (src/agents.ts), spawns
  * `pi --mode json -p` with its model, tools and system prompt, folds the
  * event stream (src/stream.ts), and prints the agent's final answer on stdout
  * with a one-line summary. Each run gets a directory holding the pi session,
  * so `resume` can send a follow-up with the whole conversation intact and
- * `pi --session <file>` can open it interactively. `--stream-json` is the
- * form the pi-subagent Claude Code mod (claude-code-mod/) reads.
+ * `pi --session <file>` can open it interactively.
+ *
+ * `start`, `wait` and `stop` serve the pi-subagent Claude Code mod
+ * (claude-code-mod/). `start` runs `run`/`resume` detached with `--events`,
+ * so the run outlives any one hook; `wait` blocks until the events file has
+ * the next assistant message (or the named tool's result), so a hook waits
+ * inside a child process, which costs it none of its 10 s budget.
  */
 
 import { spawn } from "node:child_process";
@@ -20,7 +28,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
 import { type AgentConfig, discoverAgents, parseThinking, THINKING_LEVELS } from "./agents.ts";
-import { applyEvent, emptyState, isFailed, type RateLookup, type RunState, toolSummary } from "./stream.ts";
+import { applyEvent, emptyState, type EventLine, isFailed, type RateLookup, type RunState, toEventLine, toolSummary } from "./stream.ts";
 
 /** Fits a foreground Claude Code Bash call (10-minute cap) with time to report. */
 export const DEFAULT_TIMEOUT_S = 540;
@@ -155,11 +163,9 @@ interface TurnOptions {
 	nesting: boolean;
 	verbose: boolean;
 	env: NodeJS.ProcessEnv;
-	/** One line of progress: a tool call starting, or text the agent wrote between tool calls. */
-	onProgress?: (p: Progress) => void;
+	/** Each assistant message and tool result, as it happens. */
+	onEvent?: (line: EventLine) => void;
 }
-
-export type Progress = { type: "tool"; text: string } | { type: "text"; text: string };
 
 /** Runs one pi turn (a new task or a follow-up) to completion and records its result. */
 export async function runTurn(o: TurnOptions): Promise<RunResult & { text: string }> {
@@ -193,17 +199,15 @@ export async function runTurn(o: TurnOptions): Promise<RunResult & { text: strin
 			} catch {
 				return;
 			}
+			const eventLine = toEventLine(event);
+			if (eventLine) o.onEvent?.(eventLine);
 			if (!applyEvent(state, event, rate)) return;
 			const e = event as { type?: string; message?: { stopReason?: string } };
-			if (e.type === "tool_execution_start" && state.runningTool) {
-				if (o.verbose) process.stderr.write(`  [${o.meta.agent}] ${state.runningTool}\n`);
-				o.onProgress?.({ type: "tool", text: state.runningTool });
+			if (o.verbose && e.type === "tool_execution_start" && state.runningTool) {
+				process.stderr.write(`  [${o.meta.agent}] ${state.runningTool}\n`);
 			}
-			// The final answer is the result; only text written on the way there is progress.
-			if (e.type === "message_end" && e.message?.stopReason === "toolUse" && state.text) {
-				o.onProgress?.({ type: "text", text: state.text });
-				state.text = "";
-			}
+			// The answer is the last message's text, not text written on the way there.
+			if (e.type === "message_end" && e.message?.stopReason === "toolUse") state.text = "";
 		};
 		child.stdout.on("data", (d: Buffer) => {
 			buffer += d.toString();
@@ -284,6 +288,9 @@ const USAGE = `Usage:
   pi-agent list [--json]
   pi-agent run <agent|none> [options] [--] <task…|->
   pi-agent resume <run-dir> [options] [--] <follow-up…|->
+  pi-agent start <agent|none|run-dir> [options] [--] <task…|->
+  pi-agent wait <events-file> [--from n] [--until-tool id]
+  pi-agent stop <run-dir>
 
 Options:
   --model <provider/id[:level]>  Model (default: the agent's, else pi's default)
@@ -295,7 +302,9 @@ Options:
   --out <dir>                    Run directory (default: ${"$XDG_DATA_HOME"}/pi-subagent/runs/<stamp>-<agent>)
   --nesting                      Let the agent use pi's own subagent tool
   --verbose                      Print each tool call on stderr
-  --stream-json                  stdout is JSON lines: start, tool, text, done (for the Claude Code mod)
+  --stream-json                  stdout is JSON lines: start, message, tool_end, done
+  --events <file>                Also append those lines to <file>
+wait: --from <n> (first line to read), --until-tool <id> (stop at that tool's result)
   --json                         list: print JSON`;
 
 function printAgents(agents: AgentConfig[], json: boolean): void {
@@ -336,6 +345,9 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
 			nesting: { type: "boolean" },
 			verbose: { type: "boolean" },
 			"stream-json": { type: "boolean" },
+			events: { type: "string" },
+			from: { type: "string" },
+			"until-tool": { type: "string" },
 			json: { type: "boolean" },
 		},
 	});
@@ -345,6 +357,9 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
 		printAgents(discoverAgents(cwd, env), !!values.json);
 		return 0;
 	}
+	if (command === "wait") return waitEvents(positionals[0], Number(values.from ?? 0), values["until-tool"]);
+	if (command === "stop") return stopRun(positionals[0]);
+	if (command === "start") return startDetached(rest, values, positionals, env);
 	if (command !== "run" && command !== "resume") {
 		console.error(`pi-agent: unknown command "${command}"\n\n${USAGE}`);
 		return 2;
@@ -402,9 +417,15 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
 	}
 
 	const streamJson = !!values["stream-json"];
-	const emit = (line: object) => process.stdout.write(`${JSON.stringify(line)}\n`);
+	const eventsFile = values.events;
+	const emit = (line: object) => {
+		const text = `${JSON.stringify(line)}\n`;
+		if (streamJson) process.stdout.write(text);
+		if (eventsFile) fs.appendFileSync(eventsFile, text);
+	};
+	const streaming = streamJson || !!eventsFile;
 	process.stderr.write(`pi-agent: ${meta.agent} on ${meta.model ?? "pi's default model"} → ${runDir}\n`);
-	if (streamJson) emit({ type: "start", agent: meta.agent, model: meta.model, runDir });
+	if (streaming) emit({ type: "start", agent: meta.agent, model: meta.model, runDir });
 	let result: RunResult & { text: string };
 	try {
 		result = await runTurn({
@@ -416,17 +437,15 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
 			nesting: !!values.nesting,
 			verbose: !!values.verbose,
 			env,
-			onProgress: streamJson ? emit : undefined,
+			onEvent: streaming ? emit : undefined,
 		});
 	} catch (err) {
-		if (streamJson) emit({ type: "done", ok: false, error: (err as Error).message, runDir });
+		if (streaming) emit({ type: "done", ok: false, error: (err as Error).message, runDir });
 		console.error(`pi-agent: ${(err as Error).message}`);
 		return 1;
 	}
-	if (streamJson) {
-		emit({ type: "done", ...result, summary: summaryLine(result) });
-		return result.ok ? 0 : 1;
-	}
+	if (streaming) emit({ type: "done", ...result, summary: summaryLine(result) });
+	if (streamJson) return result.ok ? 0 : 1;
 
 	if (result.text) console.log(result.text);
 	else if (result.ok) console.log("(the agent gave no text answer)");
@@ -437,6 +456,130 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
 	console.log(`run: ${runDir}`);
 	if (result.sessionFile) console.log(`session: ${result.sessionFile}`);
 	return result.ok ? 0 : 1;
+}
+
+/**
+ * Starts `run` (a new task) or `resume` (when the target is a run directory)
+ * as a detached process writing `<run>/events-<n>.jsonl`, and prints
+ * `{ runDir, events, pid }` as JSON. The task goes through a file, so no
+ * argument parsing can mangle it.
+ */
+function startDetached(
+	rest: string[],
+	values: Record<string, string | boolean | undefined>,
+	positionals: string[],
+	env: NodeJS.ProcessEnv,
+): number {
+	const [target, ...taskWords] = positionals;
+	if (!target) {
+		console.error("pi-agent: start needs an agent name or a run directory");
+		return 2;
+	}
+	const task = readTask(taskWords, values["task-file"] as string | undefined);
+	if (!task) {
+		console.error("pi-agent: no task given");
+		return 2;
+	}
+	const isResume = fs.existsSync(path.join(target, "meta.json"));
+	const runDir = path.resolve(
+		isResume ? target : ((values.out as string | undefined) ?? path.join(runsDir(env), `${stamp(new Date())}-${target}-${Math.random().toString(36).slice(2, 6)}`)),
+	);
+	fs.mkdirSync(runDir, { recursive: true });
+	const n = fs.readdirSync(runDir).filter((f) => /^events-\d+\.jsonl$/.test(f)).length + 1;
+	const events = path.join(runDir, `events-${n}.jsonl`);
+	const taskFile = path.join(runDir, `task-${n}.md`);
+	fs.writeFileSync(taskFile, task);
+	fs.writeFileSync(events, "");
+	const passOn: string[] = [];
+	for (const key of ["model", "thinking", "tools", "cwd", "timeout"]) {
+		if (typeof values[key] === "string") passOn.push(`--${key}`, values[key] as string);
+	}
+	if (values.nesting) passOn.push("--nesting");
+	const args = [
+		"--no-warnings",
+		import.meta.filename,
+		isResume ? "resume" : "run",
+		isResume ? runDir : target,
+		...passOn,
+		...(isResume ? [] : ["--out", runDir]),
+		"--events", events,
+		"--task-file", taskFile,
+	];
+	const log = fs.openSync(path.join(runDir, `detached-${n}.log`), "a");
+	const child = spawn(process.execPath, args, { cwd: (values.cwd as string | undefined) ?? process.cwd(), env, detached: true, stdio: ["ignore", log, log] });
+	child.unref();
+	fs.writeFileSync(path.join(runDir, "pid"), String(child.pid));
+	console.log(JSON.stringify({ runDir, events, pid: child.pid }));
+	return 0;
+}
+
+function isAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Prints the events file's lines from line `from` on, each as
+ * `{ "n": <line>, "event": {…} }`, and returns once it printed an assistant
+ * message or the run's end. With `untilTool` it returns after that tool's
+ * result instead, and stops short of the next message, which is the step's
+ * to read. If the run's process died without a `done` line, it prints one.
+ */
+export async function waitEvents(file: string | undefined, from: number, untilTool?: string): Promise<number> {
+	if (!file) {
+		console.error("pi-agent: wait needs an events file");
+		return 2;
+	}
+	const pidFile = path.join(path.dirname(file), "pid");
+	let n = Number.isFinite(from) && from > 0 ? from : 0;
+	const out = (event: unknown) => process.stdout.write(`${JSON.stringify({ n: n++, event })}\n`);
+	for (let idle = 0; ; ) {
+		let lines: string[] = [];
+		try {
+			const text = fs.readFileSync(file, "utf-8");
+			lines = text.slice(0, text.lastIndexOf("\n") + 1).split("\n").slice(0, -1);
+		} catch {
+			// Not there yet.
+		}
+		for (; n < lines.length; ) {
+			let event: { type?: string; id?: string };
+			try {
+				event = JSON.parse(lines[n] ?? "");
+			} catch {
+				n++;
+				continue;
+			}
+			if (untilTool && (event.type === "message" || event.type === "done")) return 0;
+			out(event);
+			if (untilTool ? event.type === "tool_end" && event.id === untilTool : event.type === "message" || event.type === "done") return 0;
+		}
+		// Every ~2s, check the run is still alive; a crash leaves no done line.
+		if (++idle % 20 === 0) {
+			const pid = Number(fs.existsSync(pidFile) ? fs.readFileSync(pidFile, "utf-8") : NaN);
+			if (Number.isFinite(pid) && !isAlive(pid)) {
+				// Its last lines may have landed after the read above.
+				const text = fs.readFileSync(file, "utf-8");
+				if (text.split("\n").filter(Boolean).length > n) continue;
+				out({ type: "done", ok: false, error: `the pi-agent process (pid ${pid}) ended without a result; see ${path.dirname(file)}/detached-*.log` });
+				return 0;
+			}
+		}
+		await new Promise((r) => setTimeout(r, 100));
+	}
+}
+
+function stopRun(runDir: string | undefined): number {
+	if (!runDir) {
+		console.error("pi-agent: stop needs a run directory");
+		return 2;
+	}
+	const pid = Number(fs.readFileSync(path.join(runDir, "pid"), "utf-8"));
+	if (Number.isFinite(pid) && isAlive(pid)) process.kill(pid, "SIGTERM");
+	return 0;
 }
 
 if (import.meta.main) {

@@ -137,3 +137,54 @@ export function toolSummary(state: RunState): string {
 		.map(([name, n]) => `${name}×${n}`)
 		.join(" ");
 }
+
+/** One tool call of an assistant message. */
+export interface ToolCallLine {
+	id: string;
+	name: string;
+	args: unknown;
+}
+
+/**
+ * What `--stream-json` and `--events` write for each pi event that matters:
+ * every assistant message whole (thinking, text, tool calls), and every tool
+ * result. The mod replays these as the subagent's own responses and tool rows.
+ */
+export type EventLine =
+	| { type: "message"; thinking: string; text: string; toolCalls: ToolCallLine[]; stopReason?: string; errorMessage?: string }
+	| { type: "tool_end"; id: string; name: string; isError: boolean; text: string };
+
+/** A tool result longer than this is cut; the transcript doesn't need megabytes of `cat`. */
+export const TOOL_TEXT_MAX = 50_000;
+
+function partsText(content: unknown, type: "text" | "thinking"): string {
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((p) => p?.type === type && typeof p[type] === "string")
+		.map((p) => p[type] as string)
+		.join("\n")
+		.trim();
+}
+
+export function toEventLine(event: any): EventLine | undefined {
+	if (event?.type === "message_end" && event.message?.role === "assistant") {
+		const msg = event.message;
+		const content: any[] = Array.isArray(msg.content) ? msg.content : [];
+		return {
+			type: "message",
+			thinking: partsText(content, "thinking"),
+			text: partsText(content, "text"),
+			toolCalls: content
+				.filter((p) => p?.type === "toolCall")
+				.map((p) => ({ id: String(p.id ?? ""), name: String(p.name ?? "tool"), args: p.arguments ?? {} })),
+			stopReason: msg.stopReason,
+			errorMessage: msg.errorMessage,
+		};
+	}
+	if (event?.type === "tool_execution_end") {
+		let text = partsText(event.result?.content, "text");
+		if (text.length > TOOL_TEXT_MAX) text = `${text.slice(0, TOOL_TEXT_MAX)}\n… (${text.length - TOOL_TEXT_MAX} more characters; the full result is in the pi session)`;
+		return { type: "tool_end", id: String(event.toolCallId ?? ""), name: String(event.toolName ?? "tool"), isError: !!event.isError, text };
+	}
+	return undefined;
+}

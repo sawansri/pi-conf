@@ -46,10 +46,17 @@ by name ("use the pi explore agent to …", "run pi-subagent:reviewer in the
 background on this diff"), or let Claude pick from the descriptions, which
 start with `[pi · model · tools]`.
 
-- **Tasks list and transcript.** The run shows in the tasks list like any
-  subagent. Its transcript holds the task, one notice per pi tool call
-  (`→ grep TODO src`), any text pi wrote between calls, a summary line with
-  turns, tools, time and billed cost, and the answer.
+- **Tasks list and transcript, like a Claude subagent's.** The run shows in
+  the tasks list. Its transcript replays pi turn by turn. Each assistant
+  message shows its text, and its thinking streams live (Claude Code
+  displays a hook's thinking but doesn't record it). Each pi tool call is a
+  real tool row with its input and pi's output, for example
+  `pi-subagent - grep (pattern: "TODO", path: "src")`. The mod's display
+  tools (`mcp__pi-subagent__read`, `grep`, `find`, `ls`, `bash`, `edit`,
+  `write`, `web_search`, `web_extract`, and `tool` for any other pi tool)
+  run nothing; the mod answers each call with the result pi got. A notice
+  gives the pi run directory, and a summary line at the end gives turns,
+  tools, time and billed cost.
 - **Background.** It works the same way the Agent tool's background mode
   does for other agents.
 - **Follow-ups.** A message sent to a finished pi subagent (SendMessage)
@@ -57,8 +64,12 @@ start with `[pi · model · tools]`.
 - **Model per task.** A first line `pi-model: provider/id[:level]` in the
   task overrides the agent's model.
 - **Interrupting** the subagent kills pi.
-- **No Claude tokens.** A `turn.step` hook answers the subagent's model
-  requests itself by running `pi-agent run --stream-json`. The agent type
+- **No Claude tokens.** pi runs detached (`pi-agent start`) and appends
+  each message and tool result to `<run>/events-<n>.jsonl`. A `turn.step`
+  hook answers each of the subagent's model requests with pi's next
+  message. Hooks wait for pi inside a `pi-agent wait` child, because a
+  hook's own code gets only 10 s but time spent in a `$` call doesn't
+  count. The agent type
   still has to name a model, so it names `haiku` with one harmless tool.
   Haiku would only run if the mod failed to serve a turn, and then it
   replies that pi didn't run. In a live run (2026-11-19, explore on
@@ -88,7 +99,12 @@ pi-agent run reviewer --model amd-gateway/gpt-6.1-sol:high --task-file brief.md
 pi-agent resume ~/.local/share/pi-subagent/runs/<run> -- "And the tests for it?"
 ```
 
-It prints pi's final answer on stdout, followed by a summary line
+`start`, `wait` and `stop` are what the mod uses. `start` runs `run` or
+`resume` detached and prints `{ runDir, events, pid }`. `wait` blocks until
+the events file has the next message (or one tool's result) and prints it.
+`stop` ends the run.
+
+`run` and `resume` print pi's final answer on stdout, followed by a summary line
 (`pi-agent: ok · explore · <model> · 3 turns · grep×2 read×1 · 14s · $0.02 billed`),
 the run directory and the session file. The exit code is 0 for ok, 1 when
 the run failed or timed out, and 2 for a usage error. `pi-agent --help`

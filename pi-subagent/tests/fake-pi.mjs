@@ -22,8 +22,12 @@ if (mode === "hang") setInterval(() => {}, 1000);
 else if (mode === "error") {
   out({ type: "message_end", message: assistant([], "error", { errorMessage: "gateway 400" }) });
 } else {
-  out({ type: "message_end", message: assistant([{ type: "text", text: "Let me look." }, { type: "toolCall", name: "grep" }], "toolUse") });
-  out({ type: "tool_execution_start", toolName: "grep", args: { pattern: "foo", path: "src" } });
-  out({ type: "tool_execution_end", toolName: "grep", isError: false });
+  out({ type: "message_end", message: assistant([
+    { type: "thinking", thinking: "Plan: grep." },
+    { type: "text", text: "Let me look." },
+    { type: "toolCall", id: "call_1", name: "grep", arguments: { pattern: "foo", path: "src" } },
+  ], "toolUse") });
+  out({ type: "tool_execution_start", toolCallId: "call_1", toolName: "grep", args: { pattern: "foo", path: "src" } });
+  out({ type: "tool_execution_end", toolCallId: "call_1", toolName: "grep", isError: false, result: { content: [{ type: "text", text: "src/a.ts:1: foo" }] } });
   out({ type: "message_end", message: assistant([{ type: "text", text: `answer to: ${task}` }], "stop") });
 }

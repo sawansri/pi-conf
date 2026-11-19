@@ -95,15 +95,70 @@ test("run then resume: answer on stdout, same pi session, follow-up sees it", ()
 	assert.equal(c1.name, null);
 });
 
-test("--stream-json: start, progress, done", () => {
+test("--stream-json: each message whole, each tool result, then done", () => {
 	const { run } = sandbox();
 	const r = run(["run", "none", "--stream-json", "--", "hi"]);
 	const lines = r.stdout.trim().split("\n").map((l) => JSON.parse(l));
-	assert.deepEqual(lines.map((l) => l.type), ["start", "text", "tool", "done"]);
-	assert.equal(lines[1].text, "Let me look.");
-	assert.equal(lines[2].text, "grep foo");
-	assert.equal(lines[3].ok, true);
-	assert.equal(lines[3].text, "answer to: hi");
+	assert.deepEqual(lines.map((l) => l.type), ["start", "message", "tool_end", "message", "done"]);
+	assert.deepEqual(lines[1], {
+		type: "message", thinking: "Plan: grep.", text: "Let me look.", stopReason: "toolUse",
+		toolCalls: [{ id: "call_1", name: "grep", args: { pattern: "foo", path: "src" } }],
+	});
+	assert.deepEqual(lines[2], { type: "tool_end", id: "call_1", name: "grep", isError: false, text: "src/a.ts:1: foo" });
+	assert.equal(lines[4].ok, true);
+	assert.equal(lines[4].text, "answer to: hi", "the answer is the last message's text alone");
+});
+
+/** Runs `pi-agent wait` and returns the events it printed. */
+function waitFor(run: ReturnType<typeof sandbox>["run"], args: string[]) {
+	const r = run(["wait", ...args]);
+	assert.equal(r.status, 0, r.stderr);
+	return r.stdout.trim().split("\n").filter(Boolean).map((l) => JSON.parse(l) as { n: number; event: { type: string; id?: string; text?: string } });
+}
+
+test("start runs detached; wait reads message by message; a second start resumes", () => {
+	const { run, calls } = sandbox();
+	const started = JSON.parse(run(["start", "explore", "--", "find foo"]).stdout);
+	assert.match(started.events, /events-1\.jsonl$/);
+
+	const first = waitFor(run, [started.events]);
+	assert.deepEqual(first.map((l) => [l.n, l.event.type]), [[0, "start"], [1, "message"]]);
+	const tool = waitFor(run, [started.events, "--from", "2", "--until-tool", "call_1"]);
+	assert.deepEqual(tool.map((l) => [l.n, l.event.type, l.event.id]), [[2, "tool_end", "call_1"]]);
+	const final = waitFor(run, [started.events, "--from", "3"]);
+	assert.deepEqual(final.map((l) => [l.n, l.event.type, l.event.text]), [[3, "message", "answer to: find foo"]]);
+	assert.deepEqual(waitFor(run, [started.events, "--from", "4"]).map((l) => l.event.type), ["done"]);
+
+	const again = JSON.parse(run(["start", started.runDir, "--", "and bar?"]).stdout);
+	assert.equal(again.runDir, started.runDir);
+	assert.match(again.events, /events-2\.jsonl$/);
+	assert.equal(waitFor(run, [again.events]).at(-1)?.event.text, "Let me look.");
+	assert.equal(waitFor(run, [again.events, "--from", "2"]).at(-1)?.event.text, "answer to: and bar?");
+	const c2 = calls()[1];
+	assert.ok(c2.args.includes("--session"), "the second start resumed the pi session");
+});
+
+test("--until-tool stops short of the next message, which is the step's", () => {
+	const { root, run } = sandbox();
+	const events = path.join(root, "events-1.jsonl");
+	fs.writeFileSync(events, [{ type: "start" }, { type: "message" }, { type: "message" }].map((e) => JSON.stringify(e)).join("\n") + "\n");
+	assert.deepEqual(waitFor(run, [events, "--from", "1", "--until-tool", "x"]), []);
+});
+
+test("stop ends a run; wait reports a run that died without a result", () => {
+	const { root, run } = sandbox();
+	const started = JSON.parse(run(["start", "none", "--", "x"], { FAKE_PI_MODE: "hang" }).stdout);
+	assert.equal(run(["stop", started.runDir]).status, 0);
+	const done = waitFor(run, [started.events]).at(-1)?.event as { type: string; ok: boolean };
+	assert.deepEqual([done.type, done.ok], ["done", false]);
+
+	const dead = path.join(root, "dead");
+	fs.mkdirSync(dead);
+	fs.writeFileSync(path.join(dead, "events-1.jsonl"), `${JSON.stringify({ type: "start" })}\n`);
+	const exited = spawnSync("true");
+	fs.writeFileSync(path.join(dead, "pid"), String(exited.pid));
+	const crashed = waitFor(run, [path.join(dead, "events-1.jsonl"), "--from", "1"]);
+	assert.match(String((crashed[0]?.event as { error?: string }).error), /ended without a result/);
 });
 
 test("failures: model error, no model turn, timeout, unknown agent", () => {
