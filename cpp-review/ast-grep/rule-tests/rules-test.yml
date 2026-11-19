@@ -1,0 +1,42 @@
+id: empty-catch
+valid:
+  - "void f() { try { g(); } catch (...) { /* best effort: g may not exist */ } }"
+  - "void f() { try { g(); } catch (const std::exception& e) { log(e); } }"
+invalid:
+  - "void f() { try { g(); } catch (...) {} }"
+  - "void f() { try { g(); } catch (const std::exception&) {  } }"
+---
+id: manual-mutex-lock
+valid:
+  - "void f() { std::lock_guard<std::mutex> l(m); }"
+invalid:
+  - "void f() { m.lock(); }"
+  - "void f() { mp->lock(); }"
+---
+id: thread-detach
+valid:
+  - "void f() { t.join(); }"
+invalid:
+  - "void f() { t.detach(); }"
+  - "void f() { std::thread([]{}).detach(); }"
+---
+id: sleep-for
+valid:
+  - "void f() { cv.wait_for(l, 5ms); }"
+invalid:
+  - "void f() { std::this_thread::sleep_for(std::chrono::milliseconds(5)); }"
+  - "void f() { std::this_thread::sleep_until(t); }"
+---
+id: shell-command
+valid:
+  - "void f() { run_process(args); }"
+invalid:
+  - "void f() { FILE* p = popen(cmd.c_str(), \"r\"); }"
+  - "void f() { std::system(cmd); }"
+  - "void f() { _popen(cmd, \"r\"); }"
+---
+id: using-namespace-in-header
+valid:
+  - "using std::string;"
+invalid:
+  - "using namespace std;"

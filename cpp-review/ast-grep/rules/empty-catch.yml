@@ -1,0 +1,10 @@
+id: empty-catch
+language: cpp
+severity: warning
+message: Exception swallowed with no comment, log or rethrow.
+note: If ignoring is intended, say why in a comment inside the block.
+rule:
+  kind: catch_clause
+  has:
+    kind: compound_statement
+    regex: '^\{\s*\}$'

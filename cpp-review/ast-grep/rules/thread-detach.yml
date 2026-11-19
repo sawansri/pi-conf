@@ -1,0 +1,8 @@
+id: thread-detach
+language: cpp
+severity: warning
+message: Detached thread; nothing joins it at shutdown and it may outlive what it captures.
+rule:
+  any:
+    - pattern: $T.detach()
+    - pattern: $T->detach()

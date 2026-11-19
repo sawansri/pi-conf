@@ -1,0 +1,154 @@
+{
+  "version": 5,
+  "configurePresets": [
+    {
+      "name": "review-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "$env{HOME}/.cache/lemonade-build/${sourceDirName}-${presetName}",
+      "cacheVariables": {
+        "BUILD_TESTING": "ON",
+        "BUILD_WEB_APP": "OFF",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "asan",
+      "displayName": "ASan + UBSan (unit tests)",
+      "inherits": "review-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_C_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined",
+        "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address,undefined",
+        "CMAKE_SHARED_LINKER_FLAGS": "-fsanitize=address,undefined"
+      }
+    },
+    {
+      "name": "tsan",
+      "displayName": "TSan (threaded unit tests)",
+      "inherits": "review-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_C_FLAGS": "-fsanitize=thread -fno-omit-frame-pointer",
+        "CMAKE_CXX_FLAGS": "-fsanitize=thread -fno-omit-frame-pointer",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=thread",
+        "CMAKE_SHARED_LINKER_FLAGS": "-fsanitize=thread"
+      }
+    },
+    {
+      "name": "coverage",
+      "displayName": "gcov coverage (for gcovr + diff-cover)",
+      "inherits": "review-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_FLAGS": "--coverage -O0 -fprofile-update=atomic",
+        "CMAKE_CXX_FLAGS": "--coverage -O0 -fprofile-update=atomic",
+        "CMAKE_EXE_LINKER_FLAGS": "--coverage",
+        "CMAKE_SHARED_LINKER_FLAGS": "--coverage"
+      }
+    },
+    {
+      "name": "fuzz",
+      "displayName": "clang libFuzzer + ASan/UBSan (needs clang)",
+      "inherits": "review-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_C_FLAGS": "-fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer",
+        "CMAKE_CXX_FLAGS": "-fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address,undefined",
+        "CMAKE_SHARED_LINKER_FLAGS": "-fsanitize=address,undefined"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "asan",
+      "configurePreset": "asan",
+      "targets": [
+        "cpp-ci-tests"
+      ]
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan",
+      "targets": [
+        "cpp-ci-tests"
+      ]
+    },
+    {
+      "name": "coverage",
+      "configurePreset": "coverage",
+      "targets": [
+        "cpp-ci-tests"
+      ]
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "asan",
+      "configurePreset": "asan",
+      "filter": {
+        "include": {
+          "label": "^cpp-ci$"
+        },
+        "exclude": {
+          "name": "^GlibcAllocatorPolicyTest$"
+        }
+      },
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "jobs": 16
+      },
+      "environment": {
+        "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=0:strict_string_checks=1",
+        "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1",
+        "TMPDIR": "$env{HOME}/.cache/tmp"
+      }
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan",
+      "filter": {
+        "include": {
+          "label": "^cpp-ci$"
+        },
+        "exclude": {
+          "name": "^(GlibcAllocatorPolicyTest|RepositoryFixtureTest|ProcessManagerTest)$"
+        }
+      },
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "jobs": 8
+      },
+      "environment": {
+        "TSAN_OPTIONS": "second_deadlock_stack=1:halt_on_error=1",
+        "TMPDIR": "$env{HOME}/.cache/tmp"
+      }
+    },
+    {
+      "name": "coverage",
+      "configurePreset": "coverage",
+      "filter": {
+        "include": {
+          "label": "^cpp-ci$"
+        }
+      },
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "jobs": 16
+      },
+      "environment": {
+        "TMPDIR": "$env{HOME}/.cache/tmp"
+      }
+    }
+  ]
+}

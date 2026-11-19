@@ -1,0 +1,9 @@
+id: sleep-for
+language: cpp
+severity: hint
+message: Sleep in code; check it isn't standing in for a condition variable or a sync point.
+rule:
+  kind: call_expression
+  has:
+    field: function
+    regex: '^(std::)?(this_thread::)?sleep_(for|until)$'

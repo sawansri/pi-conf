@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Symlink the review configs into a lemonade clone or worktree and hide them
+# from git via info/exclude, so they're never committed.
+#   link-into ~/Projects/lemonade-foo
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+repo=$(git -C "${1:-.}" rev-parse --show-toplevel)
+exclude=$(git -C "$repo" rev-parse --path-format=absolute --git-path info/exclude)
+mkdir -p "$(dirname "$exclude")"
+for pair in "lemonade/CMakeUserPresets.json:CMakeUserPresets.json" "clang-tidy.yaml:.clang-tidy"; do
+    src=$here/${pair%%:*} dst=$repo/${pair##*:}
+    if [ -e "$dst" ] && [ ! -L "$dst" ]; then
+        echo "skip $dst: a real file is there" >&2
+        continue
+    fi
+    ln -sfn "$src" "$dst"
+    grep -qxF "/${pair##*:}" "$exclude" 2>/dev/null || echo "/${pair##*:}" >> "$exclude"
+    echo "linked $dst"
+done

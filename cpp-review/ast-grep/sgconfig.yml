@@ -1,0 +1,6 @@
+# ast-grep project config for reviewing lemonade C++.
+# Run from anywhere: ast-grep scan -c ~/Projects/pi-conf/cpp-review/ast-grep/sgconfig.yml <paths>
+ruleDirs:
+  - rules
+testConfigs:
+  - testDir: rule-tests

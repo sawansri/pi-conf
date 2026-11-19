@@ -1,0 +1,9 @@
+id: shell-command
+language: cpp
+severity: warning
+message: Runs a shell command; check no request or model data reaches the string.
+rule:
+  kind: call_expression
+  has:
+    field: function
+    regex: '^(std::)?(system|popen|_popen|_wpopen)$'

@@ -1,0 +1,9 @@
+# User-level clangd config (~/.config/clangd/config.yaml -> here).
+# Merges with lemonade's own .clangd. clang-tidy checks come from the
+# .clang-tidy that link-into symlinks into the clone.
+If:
+  PathMatch: .*/lemonade[^/]*/src/cpp/.*
+CompileFlags:
+  # clang's -Wshadow skips constructor params named like members, which were
+  # 27 of gcc's 28 -Wshadow hits in the 2026-11-18 trial.
+  Add: [-Wshadow, -Wnon-virtual-dtor, -Woverloaded-virtual]

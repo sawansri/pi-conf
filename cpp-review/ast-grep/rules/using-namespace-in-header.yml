@@ -1,0 +1,10 @@
+id: using-namespace-in-header
+language: cpp
+severity: warning
+message: using namespace in a header leaks into every includer.
+files:
+  - "**/*.h"
+  - "**/*.hpp"
+rule:
+  kind: using_declaration
+  regex: '^using\s+namespace'

@@ -1,0 +1,36 @@
+# Curated for lemonade review: bug and performance checks that fired on real
+# code (pull.cpp, llamacpp_server.cpp, 2026-11-18 trial), minus the ones that
+# were all false positives or flag-enum noise there. Run on changed lines only (see README).
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-exception-escape,
+  -bugprone-throwing-static-initialization,
+  -bugprone-reserved-identifier,
+  -bugprone-suspicious-missing-comma,
+  -bugprone-command-processor,
+  -bugprone-std-exception-baseclass,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-signed-char-misuse,
+  -bugprone-signed-bitwise,
+  clang-analyzer-*,
+  concurrency-*,
+  -concurrency-mt-unsafe,
+  performance-*,
+  -performance-enum-size,
+  -performance-avoid-endl,
+  -performance-faster-string-find,
+  -performance-prefer-single-char-overloads,
+  modernize-use-emplace,
+  readability-container-contains,
+  readability-container-size-empty,
+  readability-else-after-return
+WarningsAsErrors: ''
+HeaderFilterRegex: 'src/cpp/(include|server|cli|tray)/'
+# aixlog.hpp is vendored.
+ExcludeHeaderFilterRegex: 'aixlog\.hpp'
+CheckOptions:
+  # Flag enums (1 << n) and int64 -> double progress maths were all of the
+  # signed-bitwise (118) and most narrowing (28) hits in the trial.
+  bugprone-narrowing-conversions.WarnOnIntegerToFloatingPointNarrowingConversion: false

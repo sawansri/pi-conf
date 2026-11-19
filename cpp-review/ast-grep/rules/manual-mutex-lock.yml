@@ -1,0 +1,10 @@
+id: manual-mutex-lock
+language: cpp
+severity: hint
+message: Manual lock(); an early return or exception leaves it held.
+note: Prefer std::lock_guard / std::scoped_lock, or std::unique_lock if it must unlock early.
+rule:
+  kind: expression_statement
+  any:
+    - pattern: $M.lock();
+    - pattern: $M->lock();

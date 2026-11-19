@@ -29,6 +29,11 @@ points to them instead of repeating them:
   loc-breakdown/tests` (stdlib only; cloc/sem/lizard are skipped or mocked).
   cloc here is upstream's single-file 2.06 in `~/.local/bin`; apt's 1.98
   needs Perl modules that aren't installed.
+- `cpp-review/` holds local C++ review configs for lemonade (clang-tidy
+  checks, ast-grep rules, sanitizer/coverage CMake presets, clangd config).
+  `cpp-review/link-into <clone>` symlinks them into a lemonade clone and adds
+  them to its `info/exclude`. Its README lists every tool and command.
+  ast-grep rule tests: `cd cpp-review/ast-grep && ast-grep test --skip-snapshot-tests`.
 - pi is installed at `~/.pi/agent/install/releases/$(cat ~/.pi/agent/install/current-version)`.
   The compiled binary is no use for learning pi's behaviour; read
   `node_modules/@earendil-works/pi-coding-agent/dist/core/*.d.ts` and
