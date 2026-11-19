@@ -151,6 +151,8 @@ test("stop ends a run; wait reports a run that died without a result", () => {
 	assert.equal(run(["stop", started.runDir]).status, 0);
 	const done = waitFor(run, [started.events]).at(-1)?.event as { type: string; ok: boolean };
 	assert.deepEqual([done.type, done.ok], ["done", false]);
+	assert.equal(fs.existsSync(path.join(started.runDir, "pid")), false, "an ended run leaves no pid to reuse");
+	assert.equal(run(["stop", started.runDir]).status, 0, "stopping an ended run is a no-op");
 
 	const dead = path.join(root, "dead");
 	fs.mkdirSync(dead);

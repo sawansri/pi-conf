@@ -444,6 +444,11 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
 		console.error(`pi-agent: ${(err as Error).message}`);
 		return 1;
 	}
+	// A detached run's pid file goes once it ends, before its done line, so
+	// `stop` and `wait` never act on a reused pid (a pi agent found this, run
+	// 20261119-110221-explore).
+	const pidFile = path.join(runDir, "pid");
+	if (fs.existsSync(pidFile) && fs.readFileSync(pidFile, "utf-8").trim() === String(process.pid)) fs.rmSync(pidFile);
 	if (streaming) emit({ type: "done", ...result, summary: summaryLine(result) });
 	if (streamJson) return result.ok ? 0 : 1;
 
@@ -564,6 +569,8 @@ export async function waitEvents(file: string | undefined, from: number, untilTo
 				// Its last lines may have landed after the read above.
 				const text = fs.readFileSync(file, "utf-8");
 				if (text.split("\n").filter(Boolean).length > n) continue;
+				// It died without cleaning up; its pid may be reused from now on.
+				fs.rmSync(pidFile, { force: true });
 				out({ type: "done", ok: false, error: `the pi-agent process (pid ${pid}) ended without a result; see ${path.dirname(file)}/detached-*.log` });
 				return 0;
 			}
@@ -577,7 +584,9 @@ function stopRun(runDir: string | undefined): number {
 		console.error("pi-agent: stop needs a run directory");
 		return 2;
 	}
-	const pid = Number(fs.readFileSync(path.join(runDir, "pid"), "utf-8"));
+	const pidFile = path.join(runDir, "pid");
+	if (!fs.existsSync(pidFile)) return 0; // already ended
+	const pid = Number(fs.readFileSync(pidFile, "utf-8"));
 	if (Number.isFinite(pid) && isAlive(pid)) process.kill(pid, "SIGTERM");
 	return 0;
 }
