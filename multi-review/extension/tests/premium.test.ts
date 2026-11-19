@@ -16,6 +16,7 @@ const AVAILABLE = [
 	"amd-gateway/Kimi-K3.1-Pro",
 	"amd-gateway/GPT-6.2-Astra",
 	"amd-gateway/gemini-4-argon",
+	"amd-gateway/gemini-4-carbon",
 	"amd-gateway/gemini-4-hydrogen",
 ];
 
@@ -26,7 +27,7 @@ test("premium swaps Sonnet for Fable and Kimi for Astra, and keeps the other sea
 		"amd-gateway-anthropic/Claude-Fable-5-2@medium",
 		"amd-gateway/gpt-6.1-sol@high",
 		"amd-gateway/GPT-6.2-Astra@medium",
-		"amd-gateway/gemini-4-argon@medium",
+		"amd-gateway/gemini-4-carbon@medium",
 		"amd-gateway/gemini-4-hydrogen@medium",
 	]);
 	// The default pool itself never changes.
@@ -76,7 +77,7 @@ test("a premium model the registry doesn't have leaves the original in its seat"
 });
 
 test("a user swap names its seat by part of the id and its model by bare id, keeping the seat's level", () => {
-	const { specs, notes } = applySwaps(DEFAULTS.reviewers, { sonnet: "claude-opus-5.5", Argon: "amd-gateway/gpt-6.1-sol@low" }, AVAILABLE);
+	const { specs, notes } = applySwaps(DEFAULTS.reviewers, { sonnet: "claude-opus-5.5", Carbon: "amd-gateway/gpt-6.1-sol@low" }, AVAILABLE);
 	assert.deepEqual(notes, []);
 	assert.deepEqual(specs, [
 		"amd-gateway-anthropic/Claude-Opus-5.5@high",

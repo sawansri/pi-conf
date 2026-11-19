@@ -277,6 +277,9 @@ export function describeFlags(flags: ReviewFlags): string {
  * Gemini 4 Hydrogen@medium joined on its release day (2026-11-18), unmeasured
  * as a reviewer: a second Google seat at well under Argon's price ($1.5/$7.5
  * vs $4/$20 per 1M on the gateway). A tool-calling smoke test took 6s.
+ * Gemini 4 Carbon@medium took Argon's seat the same day, also unmeasured as a
+ * reviewer: the newer Google frontier model at Argon's price ($4/$20 per 1M).
+ * Its tool-calling smoke test took 32s. Argon stays registered for --swap.
  * Kimi K3.1 Pro@high replaced gpt-6-luna@high: over 45 real reviews luna
  * raised half as many findings as gpt-6.1-sol (56 vs 107, 14 vs 34 uniquely
  * confirmed) and failed or timed out in 8; head to head on PR #4041 luna
@@ -306,7 +309,7 @@ export const DEFAULTS: MultiReviewConfig = {
 		"amd-gateway-anthropic/Claude-Sonnet-5.5@high",
 		"amd-gateway/gpt-6.1-sol@high",
 		"amd-gateway/Kimi-K3.1-Pro@high",
-		"amd-gateway/gemini-4-argon@medium",
+		"amd-gateway/gemini-4-carbon@medium",
 		"amd-gateway/gemini-4-hydrogen@medium",
 	],
 	judge: "amd-gateway-anthropic/Claude-Opus-5.5",
