@@ -18,6 +18,7 @@ const AVAILABLE = [
 	"amd-gateway/gemini-4-argon",
 	"amd-gateway/gemini-4-carbon",
 	"amd-gateway/gemini-4-hydrogen",
+	"amd-gateway/gemini-4-neon",
 ];
 
 test("premium swaps Sonnet for Fable and Kimi for Astra, and keeps the other seats", () => {
@@ -28,7 +29,7 @@ test("premium swaps Sonnet for Fable and Kimi for Astra, and keeps the other sea
 		"amd-gateway/gpt-6.1-sol@high",
 		"amd-gateway/GPT-6.2-Astra@medium",
 		"amd-gateway/gemini-4-carbon@medium",
-		"amd-gateway/gemini-4-hydrogen@medium",
+		"amd-gateway/gemini-4-neon@medium",
 	]);
 	// The default pool itself never changes.
 	assert.ok(DEFAULTS.reviewers.includes("amd-gateway-anthropic/Claude-Sonnet-5.5@high"));
@@ -84,7 +85,7 @@ test("a user swap names its seat by part of the id and its model by bare id, kee
 		"amd-gateway/gpt-6.1-sol@high",
 		"amd-gateway/Kimi-K3.1-Pro@high",
 		"amd-gateway/gpt-6.1-sol@low",
-		"amd-gateway/gemini-4-hydrogen@medium",
+		"amd-gateway/gemini-4-neon@medium",
 	]);
 });
 

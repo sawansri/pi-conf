@@ -448,7 +448,7 @@ its own option:
 
 | Option | What it does | When | Cost / time (4-reviewer pool) |
 |--------|-------------|------|------------------------------|
-| *(default)* | Sonnet 5.5 + gpt-6.1-sol + Kimi K3.1 Pro + Gemini 4 Carbon + Gemini 4 Hydrogen with read-only tools → grouping → the main agent judges | Most reviews | ~1× · ~2–3 min on a 700-line diff |
+| *(default)* | Sonnet 5.5 + gpt-6.1-sol + Kimi K3.1 Pro + Gemini 4 Carbon + Gemini 4 Neon with read-only tools → grouping → the main agent judges | Most reviews | ~1× · ~2–3 min on a 700-line diff |
 | `--verify` | Adds a cross-check round: each issue goes to `verifiersPerFinding` (1) reviewer **who did not raise it**, plus any `verifyOnly` models. With tools, they reply confirmed / refuted / uncertain plus code evidence | High-stakes changes; when false positives are expensive | ~1.5–2× |
 | `--quick` | `quickReviewers` pool (gpt-6-luna@low, Haiku 5.5, Gemini Flash@low), single completions, no tools | Small diffs, a cheap first look | ~0.2× · 10–50s |
 | `--premium` | `premiumSwaps`: Claude Fable 5.2 takes Sonnet's seat and GPT-6.2 Astra takes Kimi's, both @medium; the other seats stay. Off unless the user asks for it | When you want the strongest models and accept the price | Fable and Astra list at $8/$40, 4x the seats they take; unmeasured as reviewers here |
@@ -749,6 +749,12 @@ Findings:
   read tool call and answered in 32s (Hydrogen: 6s). Argon is still in
   `models.json`, so `--swap=carbon=gemini-4-argon` brings it back for a
   review.
+- **Gemini 4 Neon took Hydrogen's seat** on its release day (2026-11-19),
+  at `@medium` and unmeasured as a reviewer. It costs $3/$15 per 1M on the
+  gateway, between Hydrogen ($1.5/$7.5) and Carbon ($4/$20). A pi smoke
+  test made a read tool call and answered in 6s. Hydrogen is still in
+  `models.json`, so `--swap=neon=gemini-4-hydrogen` brings it back for a
+  review.
 - **DeepSeek V4.1 Flash** (the gateway's pre-1017 checkpoint) works with
   tools and thinking but was too slow to review: cut as a straggler at
   `@high`, timed out at 900s at `@max` after ~200k characters of reasoning.
@@ -910,7 +916,7 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
     "amd-gateway/gpt-6.1-sol@high",
     "amd-gateway/Kimi-K3.1-Pro@high",
     "amd-gateway/gemini-4-carbon@medium",
-    "amd-gateway/gemini-4-hydrogen@medium"
+    "amd-gateway/gemini-4-neon@medium"
   ],
   "judge": "amd-gateway-anthropic/Claude-Opus-5.5",
   "judgeThinking": "high",
