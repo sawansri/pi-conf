@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
 import { discoverAgents, parseAgent, parseFrontmatter } from "../src/agents.ts";
-import { buildPiArgs, childEnv, resolveMeta } from "../src/cli.ts";
+import { buildPiArgs, childEnv, claudeCodeHint, resolveMeta } from "../src/cli.ts";
 import { applyEvent, emptyState, isFailed } from "../src/stream.ts";
 
 const CLI = path.join(import.meta.dirname, "..", "src", "cli.ts");
@@ -177,4 +177,12 @@ test("failures: model error, no model turn, timeout, unknown agent", () => {
 	const unknown = run(["run", "nope", "--", "x"]);
 	assert.equal(unknown.status, 2);
 	assert.match(unknown.stderr, /unknown agent "nope". Known: explore, none/);
+});
+
+test("from Claude Code's Bash, run points at the pi-subagent agent type; the mod's runs don't", () => {
+	assert.match(claudeCodeHint({ CLAUDECODE: "1" }, false, "none") ?? "", /subagent_type "pi-subagent:pi"/);
+	assert.equal(claudeCodeHint({ CLAUDECODE: "1" }, true, "explore"), undefined);
+	assert.equal(claudeCodeHint({}, false, "explore"), undefined);
+	const { run } = sandbox();
+	assert.match(run(["run", "explore", "--", "x"], { CLAUDECODE: "1" }).stderr, /subagent_type "pi-subagent:explore"/);
 });

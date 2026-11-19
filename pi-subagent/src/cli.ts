@@ -278,6 +278,19 @@ export async function runTurn(o: TurnOptions): Promise<RunResult & { text: strin
 	return { ...result, text: state.text };
 }
 
+/**
+ * When Claude Code runs `pi-agent run` through Bash, the run has no tasks-list
+ * entry and no transcript. Claude did this in a session started before the
+ * mod was installed (2026-11-19, PR 4102 discussion): with no
+ * `pi-subagent:*` types to pick, it fell back to Bash without saying why.
+ * The mod's own runs stream events and get no hint.
+ */
+export function claudeCodeHint(env: NodeJS.ProcessEnv, streaming: boolean, agent: string): string | undefined {
+	if (streaming || env.CLAUDECODE !== "1") return undefined;
+	const type = `pi-subagent:${agent === "none" ? "pi" : agent}`;
+	return `pi-agent: note for Claude Code: this run won't show in the tasks list or as a transcript. Use the Agent tool with subagent_type "${type}" instead (a first line "pi-model: <provider/id[:level]>" picks the model). If that type isn't available, the pi-subagent mod isn't loaded in this session: tell the user to install it (claude plugin install pi-subagent@pi-conf) and restart or run \`claude --resume\`. Mods installed mid-session don't load until then.`;
+}
+
 function readTask(positionals: string[], taskFile: string | undefined): string {
 	if (taskFile) return fs.readFileSync(taskFile, "utf-8").trim();
 	if (positionals.length === 1 && positionals[0] === "-") return fs.readFileSync(0, "utf-8").trim();
@@ -425,6 +438,8 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv = process.env)
 	};
 	const streaming = streamJson || !!eventsFile;
 	process.stderr.write(`pi-agent: ${meta.agent} on ${meta.model ?? "pi's default model"} → ${runDir}\n`);
+	const hint = claudeCodeHint(env, streaming, meta.agent);
+	if (hint) process.stderr.write(`${hint}\n`);
 	if (streaming) emit({ type: "start", agent: meta.agent, model: meta.model, runDir });
 	let result: RunResult & { text: string };
 	try {

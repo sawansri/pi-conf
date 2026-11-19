@@ -80,7 +80,13 @@ start with `[pi · model · tools]`.
   and a SendMessage follow-up resumed the same pi run.
 
 Agent definitions are read when the session starts. After adding one,
-start a new session (or `claude --resume`).
+start a new session (or `claude --resume`). The same goes for installing
+the mod: a session started before the install has no `pi-subagent:*`
+types until it is restarted or resumed (`/plugin` doesn't load a new
+plugin's hooks into a running session). Without them Claude may fall back
+to `pi-agent run` through Bash, which works but shows no tasks-list entry
+or transcript. When Claude Code runs `pi-agent run` that way, it prints a
+note on stderr naming the agent type to use and saying how to load the mod.
 
 ### Install
 
