@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# pi-agent: run a pi agent as a subagent (see src/cli.ts). Needs node >= 22.18
+# for TypeScript type stripping.
+exec node --no-warnings "$(dirname "$(readlink -f "$0")")/src/cli.ts" "$@"

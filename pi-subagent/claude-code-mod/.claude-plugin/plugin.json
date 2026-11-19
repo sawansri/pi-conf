@@ -1,0 +1,6 @@
+{
+  "name": "pi-subagent",
+  "version": "0.1.0",
+  "description": "Runs pi agents (~/.pi/agent/agents/*.md) as native Claude Code subagents: in the tasks list, in the background, with a viewable transcript; pi does the work, no Claude tokens",
+  "author": { "name": "Sawan Srivastava" }
+}

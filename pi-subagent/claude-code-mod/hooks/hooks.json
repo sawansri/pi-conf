@@ -1,0 +1,4 @@
+{
+  "description": "pi agents as Claude Code subagent types",
+  "modules": ["./register.ts"]
+}

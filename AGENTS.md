@@ -23,6 +23,14 @@ points to them instead of repeating them:
   after editing it. `/reload-plugins` doesn't upgrade a session that's already
   running; use `claude --resume`.
 - `tdd-pipeline/` is a separate pi pipeline.
+- `pi-subagent/` runs pi agents from Claude Code. `pi-agent` (symlinked into
+  `~/.local/bin`) is the CLI; `claude-code-mod/` is the `pi-subagent` mod,
+  which registers each `~/.pi/agent/agents/*.md` as an agent type and answers
+  those agents' `turn.step`s by running `pi-agent --stream-json`, so no Claude
+  model runs. Install and update it like the status mod
+  (`pi-subagent@pi-conf`). Tests: `pi-subagent/test.sh` (fake pi) and
+  `claude plugin test .` in the mod folder. Never set `PI_SUBAGENT_NAME` on a
+  pi child you want to resume: pi-lite-subagent then drops every later prompt.
 - `loc-breakdown/` is the `/loc` Claude Code skill (symlinked from
   `~/.claude/skills/loc`). `loc_breakdown.py` does all counting;
   the model only labels hunks. Tests: `python3 -m unittest discover -s

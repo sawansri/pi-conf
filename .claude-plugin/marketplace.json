@@ -7,6 +7,11 @@
       "name": "multi-review-status",
       "source": "./multi-review/claude-code-mod",
       "description": "Shows a running multi-review live above the prompt in Claude Code, like pi's progress widget, and warns when the code has moved on since the last review"
+    },
+    {
+      "name": "pi-subagent",
+      "source": "./pi-subagent/claude-code-mod",
+      "description": "Runs pi agents (~/.pi/agent/agents/*.md) as native Claude Code subagents: in the tasks list, in the background, with a viewable transcript; pi does the work"
     }
   ]
 }
