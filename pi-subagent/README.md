@@ -48,8 +48,11 @@ start with `[pi · model · tools]`.
 
 - **Tasks list and transcript, like a Claude subagent's.** The run shows in
   the tasks list. Its transcript replays pi turn by turn. Each assistant
-  message shows its text, and its thinking streams live (Claude Code
-  displays a hook's thinking but doesn't record it). Each pi tool call is a
+  message shows its text, preceded by a `∴ Thinking` notice holding pi's
+  reasoning. That has to be a notice: Claude Code shows thinking a hook
+  streams but records only thinking the model signed. In a live run
+  (DeepSeek-V4.1-Flash:high), ~22k characters of streamed thinking were
+  missing from the stored transcript, while the notices were kept. Each pi tool call is a
   real tool row with its input and pi's output, for example
   `pi-subagent - grep (pattern: "TODO", path: "src")`. The mod's display
   tools (`mcp__pi-subagent__read`, `grep`, `find`, `ls`, `bash`, `edit`,

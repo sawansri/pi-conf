@@ -10,11 +10,13 @@ import type { EngineInterface, Register, TurnStepChunk, TurnStepResult } from 'c
 // No Claude model runs for them. pi runs detached (`pi-agent start`) and
 // writes each assistant message and tool result to an events file. A
 // `turn.step` hook answers each of the subagent's model requests with pi's
-// next message: thinking (streamed live), text, and its tool calls as real
-// tool_use blocks naming this mod's tools (`mcp__pi-subagent__read`, …).
+// next message: its text and its tool calls as real tool_use blocks naming this mod's tools (`mcp__pi-subagent__read`, …).
 // The engine then "runs" those, and the `tool.call` hook answers each with
 // the result pi got, so the transcript shows every pi tool call with its
-// input and output, the way a Claude subagent's are shown. Hooks wait for pi
+// input and output, the way a Claude subagent's are shown. pi's thinking
+// goes in as a notice before each message: the engine shows thinking a hook
+// streams but records only thinking the model signed, so a streamed block
+// would vanish from the transcript once the run ended. Hooks wait for pi
 // inside a `pi-agent wait` child, which costs none of a hook's 10 s budget.
 // Interrupting the subagent stops pi; a follow-up (SendMessage) resumes the
 // same pi session.
@@ -222,7 +224,6 @@ export function messageChunks(event: Extract<PiEvent, { type: 'message' }>, idBa
   const chunks: TurnStepChunk[] = []
   const toolIds: Array<[string, string]> = []
   let index = 0
-  if (event.thinking) chunks.push({ kind: 'thinking', index: index++, text: event.thinking })
   if (event.text) chunks.push({ kind: 'text', index: index++, text: event.text })
   event.toolCalls.forEach((call, i) => {
     const id = safeId(call.id, idBase + i)
@@ -295,6 +296,10 @@ export const register: Register = on => {
           return yield* finish(`${answer.text ? `${answer.text}\n\n` : ''}The pi agent failed: ${why}\nRun: ${run.runDir}`)
         }
         line = { ...answer, text: answer.text || '(the pi agent gave no text answer)' }
+        if (answer.thinking) {
+          await notice($, agentId, `∴ Thinking\n${answer.thinking}`)
+          line = { ...line, thinking: '' }
+        }
       }
       if (!line) return yield* finish(`pi-agent wait returned nothing. Run: ${run.runDir}`)
       if (line.type === 'done') {
@@ -303,6 +308,7 @@ export const register: Register = on => {
       }
       if (line.type !== 'message') return yield* finish(`Unexpected pi event. Run: ${run.runDir}`)
 
+      if (line.thinking) await notice($, agentId, `∴ Thinking\n${line.thinking}`)
       const { chunks, toolIds } = messageChunks(line, run.piIds.size)
       for (const [engineId, piId] of toolIds) run.piIds.set(engineId, piId)
       for (const chunk of chunks) yield chunk

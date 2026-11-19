@@ -100,8 +100,8 @@ test("a pi agent's turn replays pi's messages and tool calls instead of calling 
   // Step 0: pi's first message, its grep as a tool_use of the mod's grep tool.
   const step0 = await drain($.turn.step({ turnId: 't1', index: 0, model: 'haiku', messageCount: 1, agentId: 'a1' }))
   expect(seen.runs.find(r => r[1] === 'start')).toEqual(['pi-agent', 'start', 'explore', '--timeout', '1800', '--model', 'amd-gateway/x:low', '--', 'Find foo'])
-  expect(step0.chunks.map(c => c.kind)).toEqual(['thinking', 'text', 'tool', 'input', 'stop'])
-  expect(step0.chunks[2]).toEqual({ kind: 'tool', index: 2, id: 'pi_call_1', name: 'mcp__pi-subagent__grep' })
+  expect(step0.chunks.map(c => c.kind)).toEqual(['text', 'tool', 'input', 'stop'])
+  expect(step0.chunks[1]).toEqual({ kind: 'tool', index: 1, id: 'pi_call_1', name: 'mcp__pi-subagent__grep' })
   expect(step0.result?.toolUses).toEqual([{ name: 'mcp__pi-subagent__grep', input: { pattern: 'foo' } }])
   expect(step0.result?.stopReason).toBe('tool_use')
 
@@ -114,7 +114,8 @@ test("a pi agent's turn replays pi's messages and tool calls instead of calling 
   const step1 = await drain($.turn.step({ turnId: 't1', index: 1, model: 'haiku', messageCount: 3, agentId: 'a1' }))
   expect(step1.result?.answer).toBe('Found it in src/a.ts:3')
   expect(step1.result?.stopReason).toBe('end_turn')
-  expect(seen.notices).toEqual(['pi run: /runs/r1', 'pi-agent: ok · explore'])
+  // Thinking is a notice, which the transcript keeps; a streamed block it wouldn't.
+  expect(seen.notices).toEqual(['pi run: /runs/r1', '∴ Thinking\nPlan: grep.', 'pi-agent: ok · explore'])
   expect(seen.engineSteps).toBe(0)
   expect(seen.engineToolCalls).toBe(0)
 
