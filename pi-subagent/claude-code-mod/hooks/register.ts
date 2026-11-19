@@ -88,25 +88,29 @@ async function registerAgents($: EngineInterface): Promise<void> {
   try {
     const r = await $.process.run(['pi-agent', 'list', '--json'])
     if (r.exitCode === 0) agents = JSON.parse(r.stdout)
-    else $.ui.log(`pi-subagent: pi-agent list failed: ${r.stderr.trim()}`, { to: 'debug' })
+    else $.ui.log(`pi-subagent: pi-agent list failed: ${r.stderr.trim()}`)
   } catch (err) {
-    $.ui.log(`pi-subagent: pi-agent isn't runnable (${String(err)}); only pi-subagent:pi is offered`, { to: 'debug' })
+    $.ui.log(`pi-subagent: pi-agent isn't runnable (${String(err)}); only pi-subagent:pi is offered`)
   }
   const all: PiAgent[] = [
     ...agents.filter(a => /^[\w-]{1,64}$/.test(a.name) && a.name !== DEFAULT_AGENT),
     { name: DEFAULT_AGENT, description: "pi's default coding agent, for any task you'd hand a general-purpose agent." },
   ]
+  const failed: string[] = []
   for (const a of all) {
     await $.agent.register({
       name: a.name,
       description: agentDescription(a),
-      // Never sent: the turn.step hook answers every request. The registration
-      // just needs a valid definition; no tools keeps the engine from offering any.
-      prompt: `You are the pi agent "${a.name}". pi runs this agent; this prompt is not used.`,
-      tools: [],
+      // The turn.step hook answers every request, so this model only runs if
+      // the mod didn't (unloaded mid-run, say). `tools: []` would mean every
+      // tool; one harmless tool and a prompt that says so keep that visible.
+      prompt: `Reply with exactly this and nothing else: "The pi-subagent mod didn't run pi for this task; nothing was done. Retry, or run \`pi-agent run ${a.name === DEFAULT_AGENT ? PI_AGENT_NONE : a.name} -- <task>\` with Bash."`,
+      tools: ['TaskList'],
       model: 'haiku',
-    })
+    }).catch((err: unknown) => failed.push(`${a.name} (${String(err)})`))
   }
+  if (failed.length) $.ui.log(`pi-subagent: couldn't register ${failed.join(', ')}`)
+  else $.ui.log(`pi-subagent: ${all.length} pi agents ready (${all.map(a => a.name).join(', ')})`, { to: 'debug' })
 }
 
 async function ours($: EngineInterface, agentId: string): Promise<boolean> {

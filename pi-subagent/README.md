@@ -59,8 +59,11 @@ start with `[pi · model · tools]`.
 - **Interrupting** the subagent kills pi.
 - **No Claude tokens.** A `turn.step` hook answers the subagent's model
   requests itself by running `pi-agent run --stream-json`. The agent type
-  names `haiku` only because a definition needs a model; that model is never
-  called.
+  still has to name a model, so it names `haiku` with one harmless tool.
+  Haiku would only run if the mod failed to serve a turn, and then it
+  replies that pi didn't run. In a live run (2026-11-19, explore on
+  Sonnet 5.5@low), the subagent answered in 3 s with 0 Claude tool calls,
+  and a SendMessage follow-up resumed the same pi run.
 
 Agent definitions are read when the session starts. After adding one,
 start a new session (or `claude --resume`).
