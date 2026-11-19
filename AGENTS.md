@@ -23,6 +23,12 @@ points to them instead of repeating them:
   after editing it. `/reload-plugins` doesn't upgrade a session that's already
   running; use `claude --resume`.
 - `tdd-pipeline/` is a separate pi pipeline.
+- `loc-breakdown/` is the `/loc` Claude Code skill (symlinked from
+  `~/.claude/skills/loc`). `loc_breakdown.py` does all counting;
+  the model only labels hunks. Tests: `python3 -m unittest discover -s
+  loc-breakdown/tests` (stdlib only; cloc/sem/lizard are skipped or mocked).
+  cloc here is upstream's single-file 2.06 in `~/.local/bin`; apt's 1.98
+  needs Perl modules that aren't installed.
 - pi is installed at `~/.pi/agent/install/releases/$(cat ~/.pi/agent/install/current-version)`.
   The compiled binary is no use for learning pi's behaviour; read
   `node_modules/@earendil-works/pi-coding-agent/dist/core/*.d.ts` and
