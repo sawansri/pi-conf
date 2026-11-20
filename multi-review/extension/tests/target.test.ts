@@ -47,3 +47,10 @@ test("a since ref git can't resolve is a warning, not an empty clean review", as
 	assert.equal(target.diffText, "");
 	assert.match(target.warnings.join("\n"), /git diff no-such-ref failed/);
 });
+
+test("ssh and https remotes name the same repo", async () => {
+	const { normalizeRemote } = await import("../src/target.ts");
+	assert.equal(normalizeRemote("git@github.com:Lemonade-SDK/lemonade.git\n"), "github.com/lemonade-sdk/lemonade");
+	assert.equal(normalizeRemote("https://github.com/lemonade-sdk/lemonade"), "github.com/lemonade-sdk/lemonade");
+	assert.equal(normalizeRemote("https://user@github.com/lemonade-sdk/lemonade.git"), "github.com/lemonade-sdk/lemonade");
+});

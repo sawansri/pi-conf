@@ -317,7 +317,7 @@ export async function runHeadless(pi: ExtensionAPI, args: string, ctx: Extension
 	}
 	if ("error" in out) return fail(out.error);
 	const { target, ...rest } = out.details;
-	const details = { ...rest, scope: target.label, warnings: target.warnings };
+	const details = { ...rest, scope: target.label, repo: target.repo, warnings: target.warnings };
 	fs.mkdirSync(path.dirname(outPath), { recursive: true });
 	fs.writeFileSync(outPath, JSON.stringify({ ok: true, text: out.text, markdown: out.markdown, details }, null, 2) + "\n");
 	fs.writeFileSync(mdPath, out.text + "\n");

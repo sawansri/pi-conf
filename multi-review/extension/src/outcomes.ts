@@ -23,6 +23,8 @@ export interface OutcomeRecord {
 	/** The run's directory: one record set per run. */
 	run: string;
 	scope: string;
+	/** The reviewed repository, as target.ts repoId() names it; missing in older records. */
+	repo?: string;
 	group: string;
 	spec: string;
 	pass?: number;
@@ -97,7 +99,7 @@ export function recordOutcomes(
 	file = outcomesPath(),
 	now = new Date(),
 ): { recorded: number; skipped: string[]; already: string[] } | { error: string } {
-	let result: { ok?: boolean; details?: { groups?: DedupeGroup[]; scope?: string } };
+	let result: { ok?: boolean; details?: { groups?: DedupeGroup[]; scope?: string; repo?: string } };
 	let buckets: Record<string, unknown>;
 	try {
 		result = JSON.parse(fs.readFileSync(path.join(dir, "result.json"), "utf8"));
@@ -130,7 +132,7 @@ export function recordOutcomes(
 		}
 		for (const m of g.members) {
 			records.push({
-				t: now.toISOString(), run, scope: result.details?.scope ?? "", group: g.id,
+				t: now.toISOString(), run, scope: result.details?.scope ?? "", ...(result.details?.repo ? { repo: result.details.repo } : {}), group: g.id,
 				spec: m.spec, ...(m.pass ? { pass: m.pass } : {}),
 				category: g.category, severity: m.severity,
 				...(m.parts?.evidenceKind ? { evidenceKind: m.parts.evidenceKind } : {}),
@@ -143,6 +145,34 @@ export function recordOutcomes(
 		fs.appendFileSync(file, records.map((r) => JSON.stringify(r)).join("\n") + "\n");
 	}
 	return { recorded: records.length, skipped, already };
+}
+
+/** Below this many judged findings of a category in one repo, its history says too little to act on. */
+export const MIN_REPO_HISTORY = 8;
+const REPO_HISTORY_DAYS = 180;
+const RARELY_ACTED_ON = 0.2;
+/** Categories never quieted by history: one missed finding costs more than many deferred ones. */
+const NEVER_QUIETED = new Set(["correctness", "security", "spec"]);
+
+/**
+ * Categories whose findings this repo's leads have rarely acted on lately.
+ * The rules come from the log each run, so one drops away by itself once
+ * leads start acting on its findings again.
+ */
+export function repoReviewRules(records: OutcomeRecord[], repo: string | undefined, now = new Date()): string[] {
+	if (!repo) return [];
+	const cutoff = now.getTime() - REPO_HISTORY_DAYS * 86_400_000;
+	const findings = new Map<string, OutcomeRecord>();
+	for (const r of records) {
+		if (r.repo === repo && Date.parse(r.t) >= cutoff && !NEVER_QUIETED.has(r.category)) findings.set(`${r.run}#${r.group}`, r);
+	}
+	const byCategory = new Map<string, OutcomeRecord[]>();
+	for (const r of findings.values()) byCategory.set(r.category, [...(byCategory.get(r.category) ?? []), r]);
+	return [...byCategory]
+		.map(([category, rs]) => ({ category, n: rs.length, acted: rs.filter((r) => r.bucket === "act_on").length }))
+		.filter((c) => c.n >= MIN_REPO_HISTORY && c.acted / c.n <= RARELY_ACTED_ON)
+		.sort((a, b) => b.n - a.n)
+		.map((c) => `- ${c.category}: ${c.acted} of ${c.n} past findings acted on; the rest were deferred or dismissed.`);
 }
 
 /** Below this many judged findings, a model's record says too little to show. */

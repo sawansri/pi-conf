@@ -149,6 +149,12 @@ export function buildReviewUserPrompt(target: ReviewTarget, opts: { reverseFiles
 		for (const g of brief.nonGoals) chunks.push(`- ${g}`);
 		chunks.push("");
 	}
+	if (target.reviewHistory?.length) {
+		chunks.push("## This repository's review history");
+		chunks.push("Leads here have rarely acted on findings in these categories. Report one only when it blocks merging and your evidence is executed or traced:");
+		chunks.push(...target.reviewHistory);
+		chunks.push("");
+	}
 	if (target.metaLines.length > 0) {
 		chunks.push("## Context");
 		chunks.push(...target.metaLines);

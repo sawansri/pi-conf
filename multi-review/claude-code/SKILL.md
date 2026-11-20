@@ -149,7 +149,7 @@ and run, exactly in this form:
 pi -p "/multi-review-outcomes --dir=<dir>" < /dev/null
 ```
 
-It appends to `~/.local/share/multi-review/outcomes.jsonl` and prints how many findings it recorded. Run it after your verdict is final; issues already recorded are skipped, so rerunning after bucketing more of them records just those. If the result has a **Reviewer track record** section, use it as a prior for how far to trust each model's findings, never as a reason to skip checking one.
+It appends to `~/.local/share/multi-review/outcomes.jsonl` and prints how many findings it recorded. Run it after your verdict is final; issues already recorded are skipped, so rerunning after bucketing more of them records just those. Outcomes are recorded per repository, and they feed back: when the leads of a repo have acted on at most 1 in 5 of its last 180 days' findings in a category (8 or more findings; never correctness, security or spec), reviewers are told to report that category only when it blocks merging with executed or traced evidence, and the result shows a **Review history applied** note. A rule drops away by itself once findings in its category get acted on again, so bucket honestly: Follow-ups and Dismissed both count as not acted on. If the result has a **Reviewer track record** section, use it as a prior for how far to trust each model's findings, never as a reason to skip checking one.
 
 ### With `--pr-comments`: triage and draft replies
 

@@ -54,3 +54,10 @@ test("each Act On item carries a patch that applies", async () => {
 	const { leadJudgmentInstructions } = await import("../src/lead.ts");
 	assert.match(leadJudgmentInstructions(false), /\*\*Patch\*\*: a unified diff of the smallest fix that applies with `git apply`/);
 });
+
+test("a repo's review history reaches reviewers as a higher bar for those categories", async () => {
+	const { buildReviewUserPrompt } = await import("../src/prompts.ts");
+	const target = { metaLines: [], files: [], diffText: "diff --git a/x b/x\n", reviewHistory: ["- design: 1 of 8 past findings acted on; the rest were deferred or dismissed."] } as never;
+	assert.match(buildReviewUserPrompt(target), /## This repository's review history\n[^\n]*only when it blocks merging[^\n]*\n- design: 1 of 8/);
+	assert.doesNotMatch(buildReviewUserPrompt({ ...(target as object), reviewHistory: [] } as never), /review history/);
+});

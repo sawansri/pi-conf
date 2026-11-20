@@ -108,3 +108,32 @@ test("a deferred finding is recorded as follow_up", () => {
 	recordOutcomes(runDir(GROUPS, { g2: "Follow-up", g4: "follow_up" }), log);
 	assert.deepEqual(readOutcomes(log).map((r) => [r.group, r.bucket]), [["g2", "follow_up"], ["g4", "follow_up"]]);
 });
+
+test("a repo's rarely acted-on categories become review rules, and correctness never does", async () => {
+	const { repoReviewRules, MIN_REPO_HISTORY } = await import("../src/outcomes.ts");
+	const now = new Date("2026-11-20T00:00:00Z");
+	const finding = (i: number, category: string, bucket: OutcomeRecord["bucket"], repo = "github.com/o/r", t = "2026-11-01T00:00:00Z"): OutcomeRecord =>
+		({ t, run: `/runs/${i}`, scope: "s", repo, group: "g1", spec: "p/a", category, severity: "low", verification: "", vetoed: false, bucket });
+	const n = MIN_REPO_HISTORY;
+	const records = [
+		...Array.from({ length: n }, (_, i) => finding(i, "design", i === 0 ? "act_on" : "follow_up")),
+		// a second reviewer on the same finding counts once
+		finding(1, "design", "follow_up"),
+		...Array.from({ length: n }, (_, i) => finding(100 + i, "correctness", "dismissed")),
+		...Array.from({ length: n }, (_, i) => finding(200 + i, "tests", i < 3 ? "act_on" : "dismissed")),
+		...Array.from({ length: n }, (_, i) => finding(300 + i, "perf", "dismissed", "github.com/other/repo")),
+		...Array.from({ length: n }, (_, i) => finding(400 + i, "docs", "dismissed", "github.com/o/r", "2025-01-01T00:00:00Z")),
+	];
+	assert.deepEqual(repoReviewRules(records, "github.com/o/r", now), [`- design: 1 of ${n} past findings acted on; the rest were deferred or dismissed.`]);
+	assert.deepEqual(repoReviewRules(records, undefined, now), []);
+});
+
+test("a run's repo is recorded with its outcomes", () => {
+	const log = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "mr-log-")), "outcomes.jsonl");
+	const dir = runDir(GROUPS, { g2: "noted" });
+	const result = JSON.parse(fs.readFileSync(path.join(dir, "result.json"), "utf8"));
+	result.details.repo = "github.com/o/r";
+	fs.writeFileSync(path.join(dir, "result.json"), JSON.stringify(result));
+	recordOutcomes(dir, log);
+	assert.equal(readOutcomes(log)[0].repo, "github.com/o/r");
+});

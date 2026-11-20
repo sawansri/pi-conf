@@ -28,10 +28,26 @@ export interface ReviewTarget {
 	reviewDir?: string;
 	/** Outcomes of the brief's checks, run before the fan-out. */
 	checkResults?: CheckResult[];
+	/** The repository under review (normalized origin URL, else its top-level path). */
+	repo?: string;
+	/** Categories this repo's leads rarely act on; see repoReviewRules. */
+	reviewHistory?: string[];
 }
 
 export async function exec(pi: ExtensionAPI, command: string, args: string[], cwd: string, timeoutMs = 30_000): Promise<ExecResult> {
 	return pi.exec(command, args, { cwd, timeout: timeoutMs });
+}
+
+/** "git@github.com:o/r.git" and "https://github.com/o/r" both become "github.com/o/r". */
+export function normalizeRemote(url: string): string {
+	return url.trim().replace(/\.git$/, "").replace(/^[a-z+]+:\/\/([^@/]+@)?/i, "").replace(/^[^@/]+@([^:]+):/, "$1/").toLowerCase();
+}
+
+export async function repoId(pi: ExtensionAPI, cwd: string): Promise<string | undefined> {
+	const url = await exec(pi, "git", ["remote", "get-url", "origin"], cwd, 5_000);
+	if (url.code === 0 && url.stdout.trim()) return normalizeRemote(url.stdout);
+	const top = await exec(pi, "git", ["rev-parse", "--show-toplevel"], cwd, 5_000);
+	return top.code === 0 && top.stdout.trim() ? top.stdout.trim() : undefined;
 }
 
 /**

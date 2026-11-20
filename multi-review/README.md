@@ -680,6 +680,17 @@ extglob — documented limitation.
    prior and the lead still judges every finding on its evidence.
    Leads in pi (the `multi_review` tool) don't record outcomes yet.
 
+   Records also carry the repository (its normalized `origin` URL), and
+   one thing does feed back per repo: a category whose findings were acted
+   on at most 1 time in 5 over the last 180 days (8+ findings) reaches
+   reviewers as "report only when merge-blocking with executed or traced
+   evidence", and the lead view notes it under **Review history
+   applied**. Nothing is dropped, only held to a higher bar, and
+   correctness, security and spec are never quieted. The rules are
+   recomputed from the log each run, so one goes away once its category's
+   findings get acted on again (as Bugbot disables learned rules with a
+   consistently negative signal).
+
 ## Model choice
 
 The default pool comes from an internal benchmark, not vendor numbers. The

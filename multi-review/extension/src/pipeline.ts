@@ -14,9 +14,9 @@ import type { MultiReviewDetails } from "./render.ts";
 import { type ReviewerRunOptions, allReviewersFailedResult, runAllReviewers, throwIfAborted } from "./reviewers.ts";
 import { type SandboxExtras, sandboxUnavailable } from "./sandbox.ts";
 import { DEFAULT_SOCRATIC_ROUNDS, MAX_SOCRATIC_ROUNDS, runSocraticDiscussion, runSocraticJudge, synthesizeSocraticLeadView } from "./socratic.ts";
-import { newRunDir, readOutcomes, trackRecordLines } from "./outcomes.ts";
+import { newRunDir, readOutcomes, repoReviewRules, trackRecordLines } from "./outcomes.ts";
 import { prClaimAsGroup, prCommentsMarkdown, suspicionAsGroup, suspicionMarkdown, synthesizeLeadView, synthesizeMarkdownFromGroups, synthesizeNoFindingsMarkdown } from "./synthesis.ts";
-import { type ReviewTarget, buildReviewTarget, exec, preparePrCheckout } from "./target.ts";
+import { type ReviewTarget, buildReviewTarget, exec, preparePrCheckout, repoId } from "./target.ts";
 import { ReviewTrace } from "./trace.ts";
 import { buildNarrowVerifyPrompt } from "./verdicts.ts";
 import { runVerification, selectForVerification } from "./verify.ts";
@@ -232,6 +232,8 @@ export async function runMultiReviewFromArgs(
 		progress.update({ phase: "resolving scope" });
 		const target = await buildReviewTarget(pi, parsed, ctx.cwd);
 		target.warnings.push(...swapNotes);
+		target.repo = await repoId(pi, ctx.cwd);
+		if (!isSocratic) target.reviewHistory = repoReviewRules(readOutcomes(), target.repo);
 		// A focus hint narrows attention within the diff; it never replaces the diff.
 		if (runOptions.focus?.trim()) {
 			target.focusHint = target.focusHint ? `${target.focusHint}\n\n${runOptions.focus.trim()}` : runOptions.focus.trim();
@@ -713,6 +715,7 @@ async function runReviewPipeline(
 		markdown = synthesizeLeadView(target, groups, runs, `${label} · you judge`, detailHint);
 		const track = trackRecordLines(readOutcomes(), [...new Set(runs.map((r) => r.spec))]);
 		if (track.length) markdown += `\n${track.join("\n")}`;
+		if (target.reviewHistory?.length) markdown += `\n\n**Review history applied.** Reviewers were told to report these categories only when merge-blocking with executed or traced evidence:\n${target.reviewHistory.join("\n")}`;
 	} else if (groups.length === 0) {
 		markdown = synthesizeNoFindingsMarkdown(target, runs, label);
 	} else if (judge) {
