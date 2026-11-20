@@ -170,17 +170,20 @@ Reply in its format: Topic · Participants · (Spec & Constraint Alignment) · D
 
 ## 5. If the user asks you to fix
 
-Don't edit until asked. Then work through `verdict.md`:
+Don't edit until asked. Then work through `verdict.md`. Fix only Act On items; Follow-ups stay for a later change unless the user moves one into Act On.
+0. **Baseline.** Record the change's size, `git diff --shortstat $(git merge-base origin/HEAD HEAD)`, in `verdict.md`. A fix that grows past what the verdict expected, or turns out to need machinery after all, stops for the user's call instead of growing the change.
 1. **Test first.** For each Act On item, write the test from its repro (start from your repro script), run it and see it **fail**, then fix and see it **pass**. A test that passes before the fix proves nothing; rewrite it. Tick the item in `verdict.md`.
 2. **Run the full test suite.**
 3. **Confirmation re-review.** Write a new brief and run step 3 again:
    - `intent`: "Fixes for the issues in <dir>/verdict.md: …" plus the original intent.
+   - `non_goals`: the original non-goals, plus each Follow-up, so the re-review doesn't raise them again.
    - `focus`: the areas the fixes touched.
    - `suspicions`: each fixed Act On item, phrased as a claim that it is still present (e.g. `"A1 still present: get() returns expired entries at cache.ts:6"`).
    - `verify`: true.
 
-   Reviewers hunt for new problems in the fixed diff while verifiers check each old issue.
-4. **Report** each Act On item as **fixed** (its suspicion was refuted and nobody raised it) or **still present**, plus any new issues the fixes introduced. Update `verdict.md` to match.
+   Reviewers hunt for new problems in the fixed diff while verifiers check each old issue. Judge new findings by the same Act On rule; only a problem a fix introduced can be Act On in this round, and the rest go to Follow-ups.
+4. **Report** each Act On item as **fixed** (its suspicion was refuted and nobody raised it) or **still present**, plus any new issues the fixes introduced, and the size now against the baseline (`--shortstat` before → after, and the lines each fix added). Update `verdict.md` to match.
+5. **Stop after two fix rounds.** If a second confirmation re-review still finds problems the fixes introduced, don't start a third: report them and let the user choose between another round, reverting the fix and deferring the issue, or rethinking the approach. A chain of fixes that each need the next one usually means a fix departed from existing behavior.
 
 ## Prerequisites
 

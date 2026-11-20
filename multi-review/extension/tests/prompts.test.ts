@@ -34,3 +34,11 @@ test("the lead keeps Act On to merge-blocking, introduced problems with a propor
 	assert.match(text, /no new machinery/);
 	assert.match(text, /### Act On[\s\S]*### Side effects[\s\S]*### Follow-ups[\s\S]*### Consider/);
 });
+
+test("fix rounds report the change's size and stop after two", async () => {
+	const { leadJudgmentInstructions } = await import("../src/lead.ts");
+	const text = leadJudgmentInstructions(false);
+	assert.match(text, /git diff --shortstat/);
+	assert.match(text, /`non_goals` = the original non-goals plus each Follow-up/);
+	assert.match(text, /Stop after two fix rounds/);
+});
