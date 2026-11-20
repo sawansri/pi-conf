@@ -137,6 +137,8 @@ Review: <dir>/result.md
 <one line each>
 ```
 
+If your instructions (CLAUDE.md or memory) name a parking-lot or follow-ups file, append each Follow-up there too, one line with its title, `file:line` and why it waits, so deferred findings outlive the run directory.
+
 Then record which bucket each issue went in, so later reviews can show each model's track record. Write `<dir>/outcomes.json`, one entry per issue id (`g1`, …; not suspicions or PR claims) with `"act_on"`, `"follow_up"`, `"consider"`, `"noted"` or `"dismissed"`:
 
 ```json
