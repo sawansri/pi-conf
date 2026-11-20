@@ -82,7 +82,8 @@ export function synthesizeLeadView(
 		const canon = canonicalMember(g);
 		const tally = verificationTally(g);
 		lines.push(`### ${g.id} · ${g.severity.toUpperCase()} · ${g.title} — ×${g.reviewerSpecs.length}${tally ? ` · ${tally}` : ""}`);
-		lines.push(`- **Where:** \`${g.file}:${formatRange(g.line_start, g.line_end)}\` · ${g.category}`);
+		const preExisting = g.members.filter((m) => m.parts?.origin === "pre-existing").length;
+		lines.push(`- **Where:** \`${g.file}:${formatRange(g.line_start, g.line_end)}\` · ${g.category}${preExisting ? ` · pre-existing per ${preExisting}/${g.members.length}` : ""}`);
 		lines.push(`- **Raised by:** ${g.members.map((m) => shortSpec(m.spec) + (m.pass ? ` #${m.pass}` : "") + (m.severity !== g.severity ? ` (says ${m.severity.toUpperCase()})` : "")).join(", ")}`);
 		lines.push(`- **What:** ${(canon.parts?.core ?? canon.comment).replace(/\s+/g, " ")}`);
 		const evidence = canon.parts?.evidence;

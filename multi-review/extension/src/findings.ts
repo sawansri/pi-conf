@@ -33,6 +33,17 @@ export interface FindingParts {
 	suggestion?: string;
 	/** How the reviewer knows: ran the repro, traced the whole path, or inferred. */
 	evidenceKind?: EvidenceKind;
+	/** Whether the change introduced the problem or it was there before. */
+	origin?: FindingOrigin;
+}
+
+export type FindingOrigin = "introduced" | "pre-existing";
+
+export function normalizeOrigin(raw: string): FindingOrigin | undefined {
+	const v = raw.toLowerCase();
+	if (/^(introduced|new|added|regress)/.test(v)) return "introduced";
+	if (/^(pre-?existing|existing|old|already|unchanged|legacy)/.test(v)) return "pre-existing";
+	return undefined;
 }
 
 export type EvidenceKind = "executed" | "traced" | "inferred";
@@ -199,10 +210,11 @@ export function parseReviewerJson(rawText: string): ReviewerFinding[] {
 		const suggestionText = pickText(raw, ["suggestion", "fix", "recommendation", "remediation"]);
 		const reproText = pickText(raw, ["repro", "reproduction", "trigger", "steps", "test_case", "example"]);
 		const evidenceKind = normalizeEvidenceKind(pickText(raw, ["evidence_kind", "evidenceKind", "evidence_type"]));
+		const origin = normalizeOrigin(pickText(raw, ["origin", "introduced_by", "provenance"]));
 		const evidence = evidenceText ? `\nEvidence${evidenceKind ? ` (${evidenceKind})` : ""}: ${evidenceText}` : "";
 		const repro = reproText ? `\nRepro: ${reproText}` : "";
 		const suggestion = suggestionText ? `\nSuggestion: ${suggestionText}` : "";
-		const comment = (core + evidence + repro + suggestion).slice(0, 2800);
+		const comment = (core + evidence + repro + suggestion + (origin === "pre-existing" ? "\nOrigin: pre-existing" : "")).slice(0, 2800);
 		const filePath = pickText(raw, ["file", "path", "filename", "file_path"]);
 		if (!filePath) continue;
 		findings.push({
@@ -214,6 +226,7 @@ export function parseReviewerJson(rawText: string): ReviewerFinding[] {
 				repro: reproText || undefined,
 				suggestion: suggestionText || undefined,
 				...(evidenceKind ? { evidenceKind } : {}),
+				...(origin ? { origin } : {}),
 			},
 		});
 	}

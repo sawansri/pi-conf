@@ -26,6 +26,7 @@ Output ONLY a JSON array:
     "comment": "<what is wrong, ≤400 chars>",
     "evidence": "<the execution path / spec clause / lines that prove it, ≤400 chars>",
     "evidence_kind": "executed"|"traced"|"inferred",
+    "origin": "introduced"|"pre-existing",
     "repro": "<steps someone can run as written: the exact command, test, or call sequence with concrete inputs, driving the changed code itself (not a re-implementation of it), then observed vs expected, e.g. \"cache.set('k', v, 1000); advance clock 500ms; cache.get('k') → undefined; expected v\". Omit only for pure design/docs findings. ≤400 chars>",
     "suggestion": "<optional concrete fix, ≤200 chars>"
   }
@@ -37,6 +38,7 @@ Rules:
 - line_start/line_end are post-change line numbers in the new file. Use null for file-level findings.
 - category "spec": a requirement that is missing, partially implemented, or contradicted. Quote the requirement in evidence.
 - evidence_kind says how you know: "executed" (you ran the repro and saw the failure; evidence cites the command and its output), "traced" (you followed the whole path in the code), "inferred" (part of the path, or reasoning about code you didn't read). Don't claim more than you did: an honest "inferred" is worth more than a false "executed".
+- origin says whether the change caused the problem: "introduced" if the change adds or alters the faulty code, or newly reaches existing code in a way that fails; "pre-existing" if the problem was there before the change and the change doesn't make it worse. Check with git blame or the base version when unsure.
 - Severity: critical (security hole, data loss, spec requirement fundamentally unmet), high (correctness bug, race, broken edge case), medium (perf cliff, fragile design that will bite soon), low (minor correctness/maintainability), info (style, docs).`;
 
 /** Appended when the reviewer runs as a nested agent with read-only tools. */

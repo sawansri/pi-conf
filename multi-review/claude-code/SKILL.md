@@ -100,6 +100,7 @@ pi -p "/multi-review-run --brief=<brief.json> --out=<dir>/result.json" < /dev/nu
 
 Read `<dir>/result.md`. It is the compact lead view. Each issue has one canonical description with **Evidence**, **Repro** and **Fix**, other reviewers' framings as one-liners, and its verification tally and evidence. Then come your suspicions, warnings, and a **Lead judgment** section. Follow that section:
 - verify single-reviewer findings by reading the code;
+- a finding whose **Where** line says pre-existing (the problem was there before the change and the change doesn't make it worse) doesn't go in Act On, however severe: check the claim against the base version, then note it as a follow-up;
 - **run each finding's repro yourself**, in this session rather than a subagent, so the results stay in your context:
   - first correct the reviewer's steps against the code: the right entry point, inputs that reach the flagged line, the real expected value;
   - drive the code under review (import it, call it, run the binary or an existing test), never a re-implementation of it;

@@ -19,3 +19,13 @@ test("a missing or unknown evidence_kind is left out", () => {
 		assert.match(f.comment, /\nEvidence: ran it/);
 	}
 });
+
+test("origin is parsed, and only a pre-existing one is spelled out in the comment", () => {
+	const [pre] = parseReviewerJson(finding({ origin: "Pre-existing" }));
+	assert.equal(pre.parts?.origin, "pre-existing");
+	assert.match(pre.comment, /\nOrigin: pre-existing$/);
+	const [intro] = parseReviewerJson(finding({ origin: "introduced" }));
+	assert.equal(intro.parts?.origin, "introduced");
+	assert.doesNotMatch(intro.comment, /Origin/);
+	assert.equal(parseReviewerJson(finding({ origin: "dunno" }))[0].parts?.origin, undefined);
+});
