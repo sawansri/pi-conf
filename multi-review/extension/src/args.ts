@@ -101,7 +101,7 @@ export function parseSocraticFlags(rawArgs: string): { socratic: boolean; rounds
 export type ParsedReviewArgs =
 	| { kind: "pr"; number: number; raw: string }
 	| { kind: "text"; value: string }
-	| { kind: "default" };
+	| { kind: "default"; since?: string };
 
 export function parseReviewArgs(raw: string): ParsedReviewArgs {
 	const trimmed = raw.trim();

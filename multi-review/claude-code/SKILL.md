@@ -79,6 +79,7 @@ For a **Socratic discussion** (when `--socratic` / `--discuss` is passed, or whe
 | `suspicions` | Your specific bug hypotheses or devil's-advocate challenges, one per item. Hidden in Round 1. In review mode they're matched against independent findings and cross-checked with `verify`; in Socratic mode they're posed as Round 2 challenges. |
 | `scope` | `"area"` when there is no change to review and `focus`/`topic` describes the area/topic (default for `socratic: true` with a topic); `"diff"` when reviewing or discussing the uncommitted working-tree diff. |
 | `pr_number` | For PR reviews or PR discussions. |
+| `since` | A git ref (the commit before your fixes). Reviewers get only what changed since it, committed or staged. For the confirmation re-review of a fix round; not with `pr_number`, `scope: "area"` or `socratic`. |
 | `verify`, `quick`, `premium`, `swaps`, `reviewers` | From the arguments. Set `premium`, `swaps` and `reviewers` only when the user asked for them. |
 | `pr_comments`, `comment_authors`, `include_nits`, `include_resolved` | Author filtering is on by default in any scenario (regular review, `--pr-comments`, or Socratic discussion): passing `"comment_authors"` (or `"author"` / `"authors"`, e.g. `["coderabbitai"]`, `["alice", "bob"]`, `["human"]`, `["bot"]`, `["!bot"]`) automatically enables `pr_comments` without needing `"pr_comments": true` separately. Omit `comment_authors` to check all authors when `pr_comments: true`. **Do not copy PR comments into the brief** (not `focus`, not `suspicions`): models must investigate independently. |
 
@@ -171,11 +172,12 @@ Reply in its format: Topic · Participants · (Spec & Constraint Alignment) · D
 ## 5. If the user asks you to fix
 
 Don't edit until asked. Then work through `verdict.md`. Fix only Act On items; Follow-ups stay for a later change unless the user moves one into Act On.
-0. **Baseline.** Record the change's size, `git diff --shortstat $(git merge-base origin/HEAD HEAD)`, in `verdict.md`. A fix that grows past what the verdict expected, or turns out to need machinery after all, stops for the user's call instead of growing the change.
+0. **Baseline.** Before editing, record `git rev-parse HEAD` (the fix base) and the change's size, `git diff --shortstat $(git merge-base origin/HEAD HEAD)`, in `verdict.md`. A fix that grows past what the verdict expected, or turns out to need machinery after all, stops for the user's call instead of growing the change.
 1. **Test first.** For each Act On item, write the test from its repro (start from your repro script), run it and see it **fail**, then fix and see it **pass**. A test that passes before the fix proves nothing; rewrite it. Tick the item in `verdict.md`.
 2. **Run the full test suite.**
 3. **Confirmation re-review.** Write a new brief and run step 3 again:
    - `intent`: "Fixes for the issues in <dir>/verdict.md: …" plus the original intent.
+   - `since`: the fix base from step 0, so reviewers see only the fixes (stage new files: an untracked file isn't in the diff). The rest of the branch was reviewed already; reviewers still read it with their tools when a fix depends on it.
    - `non_goals`: the original non-goals, plus each Follow-up, so the re-review doesn't raise them again.
    - `focus`: the areas the fixes touched.
    - `suspicions`: each fixed Act On item, phrased as a claim that it is still present (e.g. `"A1 still present: get() returns expired entries at cache.ts:6"`).

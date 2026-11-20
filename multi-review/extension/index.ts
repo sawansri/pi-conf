@@ -350,6 +350,10 @@ export default function (pi: ExtensionAPI) {
 					"Reviewers don't report findings that only ask for these or whose fix would need them.",
 				maxItems: 12,
 			})),
+			since: Type.Optional(Type.String({
+				description: "A git ref (the commit before your fixes). Reviewers get only what changed since it, for a confirmation re-review of fixes. Not with pr_number or scope='area'.",
+				maxLength: 200,
+			})),
 			context_files: Type.Optional(Type.Array(Type.String(), {
 				description: "Repo-relative paths reviewers should see in full beyond the diff (callers, types, tests). Max 12.",
 				maxItems: 12,

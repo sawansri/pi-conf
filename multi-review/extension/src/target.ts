@@ -239,6 +239,25 @@ async function buildDefaultTarget(pi: ExtensionAPI, cwd: string): Promise<Review
 }
 
 /**
+ * A fix round: only what changed since `since` (committed or not). The rest
+ * of the branch was reviewed already, so reviewers read it with their tools
+ * when a fix depends on it rather than reviewing it again.
+ */
+async function buildSinceTarget(pi: ExtensionAPI, cwd: string, since: string): Promise<ReviewTarget> {
+	const target: ReviewTarget = { kind: "default", label: `changes since ${since}`, focusHint: "", files: [], diffText: "", metaLines: [], warnings: [] };
+	const diff = await exec(pi, "git", ["diff", since], cwd, 30_000);
+	if (diff.code !== 0) {
+		target.warnings.push(`git diff ${since} failed: ${diff.stderr.trim() || `exit ${diff.code}`}`);
+		return target;
+	}
+	if (!diff.stdout.trim()) target.warnings.push(`nothing changed since ${since}`);
+	target.metaLines.push(`fix round: the diff is only what changed since ${since}; the rest of the branch was reviewed before. Report problems in this diff, including ones it causes in code it calls or that calls it.`);
+	target.diffText = diff.stdout;
+	target.files = summarizeDiff(diff.stdout).files;
+	return target;
+}
+
+/**
  * Free-text focus: no diff. We list source files in cwd so reviewers at
  * least have a directory map when the user-supplied hint references places.
  */
@@ -275,6 +294,6 @@ async function buildTextTarget(pi: ExtensionAPI, cwd: string, hint: string): Pro
 
 export async function buildReviewTarget(pi: ExtensionAPI, parsed: ParsedReviewArgs, cwd: string): Promise<ReviewTarget> {
 	if (parsed.kind === "pr") return buildPrTarget(pi, parsed, cwd);
-	if (parsed.kind === "default") return buildDefaultTarget(pi, cwd);
+	if (parsed.kind === "default") return parsed.since ? buildSinceTarget(pi, cwd, parsed.since) : buildDefaultTarget(pi, cwd);
 	return buildTextTarget(pi, cwd, parsed.value);
 }

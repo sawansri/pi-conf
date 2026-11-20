@@ -22,6 +22,8 @@ export interface ReviewRequest {
 	requirements?: string[];
 	suspicions?: string[];
 	non_goals?: string[];
+	/** Review only what changed since this git ref (a fix round). */
+	since?: string;
 	context_files?: string[];
 	checks?: string[];
 	focus?: string;
@@ -73,6 +75,12 @@ export async function runAgentLedReview(
 	if (wantPrComments && typeof params.pr_number !== "number") {
 		return { error: "multi_review: pr_comments / comment_authors needs pr_number" };
 	}
+	if (params.since !== undefined && (typeof params.pr_number === "number" || params.scope === "area" || params.socratic)) {
+		return { error: "multi_review: since reviews the local changes since a ref; it can't be combined with pr_number, scope='area' or socratic." };
+	}
+	if (params.since !== undefined && (!params.since.trim() || params.since.startsWith("-"))) {
+		return { error: `multi_review: since must be a git ref, got ${JSON.stringify(params.since)}` };
+	}
 	let targetOverride: ParsedReviewArgs | undefined;
 	if (typeof params.pr_number === "number") {
 		parts.push(String(params.pr_number));
@@ -92,6 +100,8 @@ export async function runAgentLedReview(
 		if (!focus) return { error: "multi_review: scope='area' needs `focus` describing the area to review." };
 		parts.push(focus);
 		targetOverride = { kind: "text", value: focus };
+	} else if (params.since) {
+		targetOverride = { kind: "default", since: params.since };
 	}
 	const result = await runMultiReviewFromArgs(pi, ctx, parts.join(" "), signal, TRANSIENT_REVIEWERS, onUpdate, {
 		agentLead: true,
@@ -162,7 +172,7 @@ export function parseReviewRequest(raw: unknown): ReviewRequest | { error: strin
 		if (typeof o.mode === "string" && ["socratic", "discuss"].includes(o.mode.toLowerCase()) && o.socratic === undefined) {
 			o.socratic = true;
 		}
-		str("intent"); str("spec_path"); str("focus"); str("topic");
+		str("intent"); str("spec_path"); str("since"); str("focus"); str("topic");
 		strs("requirements"); strs("suspicions"); strs("non_goals"); strs("context_files"); strs("checks"); strs("comment_authors"); strs("reviewers");
 		bool("verify"); bool("quick"); bool("premium"); bool("pr_comments"); bool("include_nits"); bool("include_resolved"); bool("socratic");
 		if (o.swaps !== undefined) {

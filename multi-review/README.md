@@ -36,7 +36,7 @@ judge model writes the synthesis.
 | Slash command | `/multi-review [--socratic [--rounds=2]] [--spec=path] [--verify] [--quick] [--direct] [PR-number [--pr-comments [--author=login[,login]] [--nits] [--resolved]] \| free-text focus/topic]` |
 | Slash command | `/socratic [--rounds=2] [--spec=path] [--quick] [--direct] <topic or question>`: shortcut for `/multi-review --socratic` |
 | Slash command | `/multi-review-pick`: open the multi-select TUI picker to choose reviewer models from your registry (optionally saved to `multi-review.json`) |
-| LLM-callable tool | `multi_review({socratic?, topic?, rounds?, intent?, non_goals?, spec_path?, requirements?, suspicions?, context_files?, checks?, focus?, scope?, pr_number?, verify?, quick?, pr_comments?, comment_authors?, include_nits?, include_resolved?})`. The agent can call it on its own too |
+| LLM-callable tool | `multi_review({socratic?, topic?, rounds?, intent?, non_goals?, since?, spec_path?, requirements?, suspicions?, context_files?, checks?, focus?, scope?, pr_number?, verify?, quick?, pr_comments?, comment_authors?, include_nits?, include_resolved?})`. The agent can call it on its own too |
 
 Tool parameters:
 
@@ -53,6 +53,7 @@ Tool parameters:
 | `suspicions` | The lead's own bug hypotheses or devil's-advocate challenges (≤ 20). **Never shown in Round 1.** In review mode they're matched against independent findings and cross-checked with `verify`; in Socratic mode they're posed in Round 2 for every participant to test against the code. |
 | `scope` | `diff` (default for review: working tree vs default branch, or the PR) or `area` (default for Socratic with a topic: no diff; explore the codebase with tools). |
 | `pr_number` | As for the slash command. |
+| `since` | A git ref, usually the commit before a round of fixes. Reviewers get only `git diff <since>` (committed and staged changes since it) and are told the rest of the branch was reviewed already. For confirmation re-reviews; not with `pr_number`, `scope: "area"` or `socratic`. |
 | `verify`, `quick` | Same as `--verify` / `--quick`. |
 | `pr_comments`, `comment_authors`, `include_nits`, `include_resolved` | With `pr_number`: triage the PR's existing review comments, optionally filtered by `comment_authors` (see below). |
 
