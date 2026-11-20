@@ -450,7 +450,7 @@ its own option:
 
 | Option | What it does | When | Cost / time (4-reviewer pool) |
 |--------|-------------|------|------------------------------|
-| *(default)* | Sonnet 5.5 + gpt-6.1-sol + Kimi K3.1 Pro + Gemini 4 Carbon + Gemini 4 Neon with read-only tools → grouping → the main agent judges | Most reviews | ~1× · ~2–3 min on a 700-line diff |
+| *(default)* | Sonnet 5.5 + gpt-6.1-sol + Kimi K3.1 Pro + Gemini 4 Neon with read-only tools → grouping → the main agent judges | Most reviews | ~1× · ~2–3 min on a 700-line diff |
 | `--verify` | Adds a cross-check round: each issue goes to `verifiersPerFinding` (1) reviewer **who did not raise it**, plus any `verifyOnly` models. With tools, they reply confirmed / refuted / uncertain plus code evidence | High-stakes changes; when false positives are expensive | ~1.5–2× |
 | `--quick` | `quickReviewers` pool (gpt-6-luna@low, Haiku 5.5, Gemini Flash@low), single completions, no tools | Small diffs, a cheap first look | ~0.2× · 10–50s |
 | `--premium` | `premiumSwaps`: Claude Fable 5.2 takes Sonnet's seat and GPT-6.2 Astra takes Kimi's, both @medium; the other seats stay. Off unless the user asks for it | When you want the strongest models and accept the price | Fable and Astra list at $8/$40, 4x the seats they take; unmeasured as reviewers here |
@@ -770,6 +770,13 @@ Findings:
   test made a read tool call and answered in 6s. Hydrogen is still in
   `models.json`, so `--swap=neon=gemini-4-hydrogen` brings it back for a
   review.
+- **Carbon left the pool and Sonnet stopped reviewing twice** (2026-11-20).
+  Over the 9 logged runs with a second pass, it raised 13 findings no other
+  seat did (5 acted on, under the old rule that put every reproduced
+  finding in Act On) for a sixth session per review. Carbon had one logged
+  run and no unique findings; Neon keeps the Google seat at a lower price.
+  `"secondPass": ["amd-gateway-anthropic/Claude-Sonnet-5.5"]` in
+  `multi-review.json` and `--swap=neon=gemini-4-carbon` bring them back.
 - **DeepSeek V4.1 Flash** (the gateway's pre-1017 checkpoint) works with
   tools and thinking but was too slow to review: cut as a straggler at
   `@high`, timed out at 900s at `@max` after ~200k characters of reasoning.
@@ -930,7 +937,6 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
     "amd-gateway-anthropic/Claude-Sonnet-5.5@high",
     "amd-gateway/gpt-6.1-sol@high",
     "amd-gateway/Kimi-K3.1-Pro@high",
-    "amd-gateway/gemini-4-carbon@medium",
     "amd-gateway/gemini-4-neon@medium"
   ],
   "judge": "amd-gateway-anthropic/Claude-Opus-5.5",
@@ -943,7 +949,7 @@ in-code defaults silently, same convention as `tdd-pipeline.json`):
   "verifiers": ["amd-gateway-anthropic/Claude-Sonnet-5.5", "amd-gateway/gpt-6.1-sol"],
   "maxGroupsPerVerifier": 5,
   "verifyConsensus": false,
-  "secondPass": ["amd-gateway-anthropic/Claude-Sonnet-5.5"],
+  "secondPass": [],
   "quickReviewers": [
     "amd-gateway/gpt-6-luna@low",
     "amd-gateway-anthropic/Claude-Haiku-5.5",

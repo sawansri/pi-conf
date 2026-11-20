@@ -9,7 +9,7 @@
 - One or more models registered in your pi config with valid credentials.
   Anywhere `ctx.modelRegistry.getAvailable()` returns a model is fair game
   (any provider with credentials). The default pool expects
-  `amd-gateway/gemini-4-carbon`, `amd-gateway/gemini-4-neon` and
+  `amd-gateway/gemini-4-neon` and
   `amd-gateway/Kimi-K3.1-Pro` in
   `models.json` (`openai-completions` entries shaped like
   `gemini-3.8-flash` and `Kimi-K2.7-Code`; Kimi K3.1 Pro takes every
@@ -102,7 +102,6 @@ cat > ~/.pi/agent/multi-review.json << 'EOF'
     "amd-gateway-anthropic/Claude-Sonnet-5.5@high",
     "amd-gateway/gpt-6.1-sol@high",
     "amd-gateway/Kimi-K3.1-Pro@high",
-    "amd-gateway/gemini-4-carbon@medium",
     "amd-gateway/gemini-4-neon@medium"
   ],
   "judge": "amd-gateway-anthropic/Claude-Opus-5.5",
@@ -112,7 +111,7 @@ cat > ~/.pi/agent/multi-review.json << 'EOF'
   "verify": false,
   "verifiersPerFinding": 2,
   "verifyOnly": [],
-  "secondPass": ["amd-gateway-anthropic/Claude-Sonnet-5.5"],
+  "secondPass": [],
   "quickReviewers": [
     "amd-gateway/gpt-6-luna@low",
     "amd-gateway-anthropic/Claude-Haiku-5.5",

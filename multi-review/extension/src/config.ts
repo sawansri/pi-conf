@@ -284,6 +284,12 @@ export function describeFlags(flags: ReviewFlags): string {
  * unmeasured as a reviewer: $3/$15 per 1M, between Hydrogen ($1.5/$7.5) and
  * Carbon. Its tool-calling smoke test took 6s. Hydrogen stays registered for
  * --swap.
+ * On 2026-11-20 Carbon left the pool and Sonnet stopped reviewing twice. Over
+ * the 9 logged runs with a second pass, it raised 13 findings no other seat
+ * did (5 acted on, under the old rule where every reproduced finding was
+ * Act On), while taking a sixth session; Carbon had one logged run and no
+ * unique findings, and Neon, a Google seat at a lower price, stays. Both are
+ * one config line away: `"secondPass": [...]` and `--swap=neon=gemini-4-carbon`.
  * Kimi K3.1 Pro@high replaced gpt-6-luna@high: over 45 real reviews luna
  * raised half as many findings as gpt-6.1-sol (56 vs 107, 14 vs 34 uniquely
  * confirmed) and failed or timed out in 8; head to head on PR #4041 luna
@@ -313,12 +319,11 @@ export const DEFAULTS: MultiReviewConfig = {
 		"amd-gateway-anthropic/Claude-Sonnet-5.5@high",
 		"amd-gateway/gpt-6.1-sol@high",
 		"amd-gateway/Kimi-K3.1-Pro@high",
-		"amd-gateway/gemini-4-carbon@medium",
 		"amd-gateway/gemini-4-neon@medium",
 	],
 	judge: "amd-gateway-anthropic/Claude-Opus-5.5",
 	judgeThinking: "high",
-	// The 5 reviewers plus Sonnet's second pass, all at once.
+	// The whole pool at once, with room for a bigger --reviewers pool.
 	concurrency: 6,
 	temperature: 0.2,
 	verify: false,
@@ -327,8 +332,7 @@ export const DEFAULTS: MultiReviewConfig = {
 	verifiers: ["amd-gateway-anthropic/Claude-Sonnet-5.5", "amd-gateway/gpt-6.1-sol"],
 	maxGroupsPerVerifier: 5,
 	verifyConsensus: false,
-	// Sonnet: the best recall per second in the pool.
-	secondPass: ["amd-gateway-anthropic/Claude-Sonnet-5.5"],
+	secondPass: [],
 	quickReviewers: [
 		"amd-gateway/gpt-6-luna@low",
 		"amd-gateway-anthropic/Claude-Haiku-5.5",

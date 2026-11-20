@@ -168,8 +168,8 @@ python3 -c "import json;[print(e['t'][11:19],e['reviewer'].split('/')[-1],e['kin
   wording in a prompt ("your tools are now disabled, do not…") triggers the
   gateway's `content_filter`, so keep harvest-style prompts plain (see
   `harvestPrompt`). Its reasoning text doesn't show in traces.
-- **gemini-4-argon** (out of the pool since 2026-11-18; gemini-4-carbon,
-  unmeasured, took its seat). It is slow (355–512s on large diffs) and is usually
+- **gemini-4-argon** (out of the pool since 2026-11-18; gemini-4-carbon took
+  its seat and left the pool on 2026-11-20, leaving Neon as the Google seat). It is slow (355–512s on large diffs) and is usually
   the session that gets cut. It is prone to `content_filter` in verify. With
   too little prodding it answers `[]` after a few tool calls, which is what
   `minReviewToolCalls` addresses.
