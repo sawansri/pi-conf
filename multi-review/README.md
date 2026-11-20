@@ -36,7 +36,7 @@ judge model writes the synthesis.
 | Slash command | `/multi-review [--socratic [--rounds=2]] [--spec=path] [--verify] [--quick] [--direct] [PR-number [--pr-comments [--author=login[,login]] [--nits] [--resolved]] \| free-text focus/topic]` |
 | Slash command | `/socratic [--rounds=2] [--spec=path] [--quick] [--direct] <topic or question>`: shortcut for `/multi-review --socratic` |
 | Slash command | `/multi-review-pick`: open the multi-select TUI picker to choose reviewer models from your registry (optionally saved to `multi-review.json`) |
-| LLM-callable tool | `multi_review({socratic?, topic?, rounds?, intent?, spec_path?, requirements?, suspicions?, context_files?, checks?, focus?, scope?, pr_number?, verify?, quick?, pr_comments?, comment_authors?, include_nits?, include_resolved?})`. The agent can call it on its own too |
+| LLM-callable tool | `multi_review({socratic?, topic?, rounds?, intent?, non_goals?, spec_path?, requirements?, suspicions?, context_files?, checks?, focus?, scope?, pr_number?, verify?, quick?, pr_comments?, comment_authors?, include_nits?, include_resolved?})`. The agent can call it on its own too |
 
 Tool parameters:
 
@@ -44,6 +44,7 @@ Tool parameters:
 |-------|---------|
 | `socratic`, `topic`, `rounds` | Run a multi-round Socratic discussion (`socratic: true`, default `rounds: 2`, max 5) on `topic` (or `focus`) instead of a defect-finding review. Participants keep their tool-enabled sessions across rounds (see [Socratic discussion](#socratic-discussion)). |
 | `intent` | What the change must accomplish, plus facts reviewers can't find in the repo (external API behaviour, constraints, out-of-scope items). Goals, not a narration of the implementation. Reviewers challenge the execution, not the intent. |
+| `non_goals` | What the change deliberately leaves out (≤ 12). Reviewers see them as out of scope and don't report findings that only ask for one, or whose fix would need one; the direct-mode judge sees them too. |
 | `spec_path` | Repo-relative spec/design doc, passed to reviewers verbatim as the source of truth (60k char cap). |
 | `requirements` | Checkable requirements, one per item. Reviewers report unmet ones as category `spec`. |
 | `context_files` | Up to 12 paths reviewers get in full (callers, types, tests). |

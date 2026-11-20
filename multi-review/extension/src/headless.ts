@@ -21,6 +21,7 @@ export interface ReviewRequest {
 	spec_path?: string;
 	requirements?: string[];
 	suspicions?: string[];
+	non_goals?: string[];
 	context_files?: string[];
 	checks?: string[];
 	focus?: string;
@@ -99,6 +100,7 @@ export async function runAgentLedReview(
 			specPath: params.spec_path,
 			requirements: params.requirements,
 			suspicions: params.suspicions,
+			nonGoals: params.non_goals,
 			contextFiles: params.context_files,
 			checks: params.checks,
 		},
@@ -161,7 +163,7 @@ export function parseReviewRequest(raw: unknown): ReviewRequest | { error: strin
 			o.socratic = true;
 		}
 		str("intent"); str("spec_path"); str("focus"); str("topic");
-		strs("requirements"); strs("suspicions"); strs("context_files"); strs("checks"); strs("comment_authors"); strs("reviewers");
+		strs("requirements"); strs("suspicions"); strs("non_goals"); strs("context_files"); strs("checks"); strs("comment_authors"); strs("reviewers");
 		bool("verify"); bool("quick"); bool("premium"); bool("pr_comments"); bool("include_nits"); bool("include_resolved"); bool("socratic");
 		if (o.swaps !== undefined) {
 			if (typeof o.swaps !== "object" || Array.isArray(o.swaps) || !Object.values(o.swaps as object).every((x) => typeof x === "string")) {

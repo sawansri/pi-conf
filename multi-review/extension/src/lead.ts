@@ -32,13 +32,14 @@ export function buildHandoffPrompt(
 		lines.push("2. **Intent.** Work out what the change is supposed to do from this conversation, commit messages, and the PR description. If you genuinely can't tell, ask the user instead of calling the tool.");
 	}
 	lines.push("3. **Brief.** Call the `multi_review` tool once. Reviewers are other model families with read-only repo access; they do NOT see this conversation, so the brief must carry what they can't discover — but NOT where you think the bugs are. Independent discovery is the point: hypotheses in the brief anchor every reviewer on the same spots, turn \"consensus\" into an echo of your prompt, and copy your blind spots into theirs.");
-	lines.push("   - `intent`: what the change must accomplish, plus facts reviewers can't find in the repo (external tool/API behaviour, deployment constraints, what's deliberately out of scope). State goals, not a narration of the implementation — reviewers should verify what the code does, not take your description of it as given. Reviewers challenge the execution, not the intent.");
+	lines.push("   - `intent`: what the change must accomplish, plus facts reviewers can't find in the repo (external tool/API behaviour, deployment constraints). State goals, not a narration of the implementation — reviewers should verify what the code does, not take your description of it as given. Reviewers challenge the execution, not the intent.");
 	if (specPath) {
 		lines.push("   - `requirements`: every concrete, checkable requirement / acceptance criterion in the spec, one per item, quoted or tightly paraphrased. Include the edge cases and error behaviour the spec pins down.");
 		lines.push(`   - \`spec_path\`: "${specPath}" (the full spec is passed to reviewers verbatim).`);
 	} else {
 		lines.push("   - `requirements`: only if the user stated explicit acceptance criteria.");
 	}
+	lines.push("   - `non_goals`: what the change deliberately leaves out, one per item (\"no background install path\", \"native backends unchanged\"), from the conversation, the PR description, or a spec's out-of-scope section. Reviewers won't report findings that only ask for these, so a review can't grow the change past its scope. Leave it out when nothing was ruled out.");
 	lines.push("   - `context_files`: up to 8 repo paths reviewers should read in full beyond the diff — callers, types/interfaces, tests that pin the behaviour. Skip files the diff already shows whole.");
 	lines.push("   - `checks`: up to 4 fast commands that type-check or run the tests covering the change. They run once in a sandbox (repo read-only, no network) before the review and every reviewer sees the output. Pick commands that finish in well under 2 minutes and don't write into the repo; never the full suite. Changed C/C++ files are compile-checked automatically.");
 	lines.push(`   - \`focus\`: risk AREAS only (e.g. "API-key handling across agents", "config-file merge lifecycle", "test isolation"), never hypotheses ("does X compile?", "is Y null when Z?")${focus ? `, plus the user's request: "${focus}"` : ""}.`);

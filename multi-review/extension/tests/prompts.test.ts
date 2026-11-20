@@ -15,3 +15,14 @@ test("reviewers aim for recall and leave the filtering to verification", async (
 	assert.match(REVIEWER_SYSTEM_PROMPT, /report it anyway and say in evidence what you traced and what you couldn't/);
 	assert.doesNotMatch(REVIEWER_SYSTEM_PROMPT, /Don't inflate nits|An empty review is a valid outcome/);
 });
+
+test("non-goals reach reviewers as out of scope, and an empty list adds nothing", async () => {
+	const { buildReviewUserPrompt } = await import("../src/prompts.ts");
+	const { buildBrief } = await import("../src/brief.ts");
+	const brief = buildBrief(process.cwd(), { intent: "pick an image", nonGoals: [" no background install path ", ""] }, []);
+	const target = { brief, metaLines: [], files: [], diffText: "diff --git a/x b/x\n" } as never;
+	const prompt = buildReviewUserPrompt(target);
+	assert.match(prompt, /## Out of scope \(non-goals\)[\s\S]*Don't report a finding that only asks for one of them[\s\S]*- no background install path\n/);
+	const none = buildReviewUserPrompt({ ...(target as object), brief: buildBrief(process.cwd(), { intent: "x" }, []) } as never);
+	assert.doesNotMatch(none, /Out of scope/);
+});

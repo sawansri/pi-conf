@@ -102,6 +102,11 @@ function renderGroupsForJudge(target: ReviewTarget, groups: DedupeGroup[]): stri
 		lines.push("## Requirements");
 		target.brief.requirements.forEach((r, i) => lines.push(`${i + 1}. ${r}`));
 	}
+	if (target.brief && target.brief.nonGoals.length > 0) {
+		lines.push("");
+		lines.push("## Out of scope (non-goals; findings that only ask for these are not Act On)");
+		for (const g of target.brief.nonGoals) lines.push(`- ${g}`);
+	}
 	lines.push("");
 	lines.push("## Deduped findings (in severity order)");
 	if (groups.length === 0) {

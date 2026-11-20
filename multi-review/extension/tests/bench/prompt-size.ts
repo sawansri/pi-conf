@@ -51,6 +51,7 @@ const brief = {
 	contextFiles: [],
 	checks: [],
 	suspicions: [],
+	nonGoals: [],
 };
 target.brief = brief;
 

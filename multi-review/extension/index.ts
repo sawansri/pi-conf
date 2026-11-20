@@ -302,7 +302,7 @@ export default function (pi: ExtensionAPI) {
 			"Use multi_review when the user asks for a code review, a second opinion, a check of an implementation against a spec, or a Socratic discussion/debate among models on a topic.",
 			"When the user asks for a Socratic discussion about a topic, set `socratic: true` and pass the question or design tension in `topic` (framed neutrally without biasing the models toward your preferred conclusion), plus relevant `context_files` and `intent`. Models keep their tool-enabled sessions across rounds (default `rounds: 2`) to cross-examine peers' claims against the code.",
 			"Before calling, understand the change or topic yourself and write the brief: models do not see the conversation. Give them what they can't discover, not where you think the bugs are or which answer you prefer — independent discovery is what makes their agreement meaningful.",
-			"`intent`: goals plus facts models can't find in the repo (external API behaviour, constraints, out-of-scope items) — not a narration of the implementation. With a spec, pass spec_path and list its checkable requirements.",
+			"`intent`: goals plus facts models can't find in the repo (external API behaviour, constraints) — not a narration of the implementation; what is deliberately left out goes in `non_goals`. With a spec, pass spec_path and list its checkable requirements.",
 			"`focus`: risk areas only, never hypotheses. Put your specific bug hypotheses or devil's-advocate challenges in `suspicions`; they are hidden from Round 1 and checked against independent findings (or tested in Round 2 of a Socratic discussion).",
 			"`context_files` are repo paths models should read in full (callers, types, tests) — not files already whole in the diff.",
 			"`checks` are up to 4 fast commands (type-check, targeted tests) run once in a sandbox (repo read-only, no network) before the fan-out; models see their output. C/C++ changes are compile-checked automatically.",
@@ -343,6 +343,12 @@ export default function (pi: ExtensionAPI) {
 					"Your own hypotheses about possible bugs or devil's-advocate challenges. NOT shown in Round 1 (they'd anchor models); " +
 					"checked against what reviewers find independently (or posed as Round 2 Socratic challenges).",
 				maxItems: 20,
+			})),
+			non_goals: Type.Optional(Type.Array(Type.String({ maxLength: 300 }), {
+				description:
+					"What the change deliberately leaves out (\"no background install path\", \"native backends unchanged\"). " +
+					"Reviewers don't report findings that only ask for these or whose fix would need them.",
+				maxItems: 12,
 			})),
 			context_files: Type.Optional(Type.Array(Type.String(), {
 				description: "Repo-relative paths reviewers should see in full beyond the diff (callers, types, tests). Max 12.",

@@ -6,6 +6,8 @@ export interface BriefInput {
 	intent?: string;
 	requirements?: string[];
 	suspicions?: string[];
+	/** What the change deliberately leaves out; reviewers don't report findings that are only about these. */
+	nonGoals?: string[];
 	specPath?: string;
 	contextFiles?: string[];
 	/** Shell commands (type-check, build, targeted tests) run once in the sandbox before the fan-out. */
@@ -13,7 +15,7 @@ export interface BriefInput {
 }
 
 export function hasBriefInput(b: BriefInput): boolean {
-	return Boolean(b.intent?.trim() || b.specPath || b.requirements?.length || b.contextFiles?.length || b.suspicions?.length || b.checks?.length);
+	return Boolean(b.intent?.trim() || b.specPath || b.requirements?.length || b.contextFiles?.length || b.suspicions?.length || b.nonGoals?.length || b.checks?.length);
 }
 
 /**
@@ -26,6 +28,7 @@ export interface ReviewBrief {
 	requirements: string[];
 	/** The lead's own bug hypotheses. Never shown to finding reviewers (anchoring); see SuspicionResult. */
 	suspicions: string[];
+	nonGoals: string[];
 	spec?: { path: string; text: string };
 	contextFiles: { path: string; text: string }[];
 	checks: string[];
@@ -37,6 +40,7 @@ const CONTEXT_TOTAL_BUDGET_CHARS = 150_000;
 const MAX_CONTEXT_FILES = 12;
 const MAX_SUSPICIONS = 20;
 const MAX_CHECKS = 4;
+const MAX_NON_GOALS = 12;
 
 function clip(text: string, budget: number, label: string): string {
 	if (text.length <= budget) return text;
@@ -68,6 +72,7 @@ export function buildBrief(
 		intent: input.intent?.trim() ?? "",
 		requirements: (input.requirements ?? []).map((r) => r.trim()).filter(Boolean),
 		suspicions: (input.suspicions ?? []).map((r) => r.trim()).filter(Boolean).slice(0, MAX_SUSPICIONS),
+		nonGoals: (input.nonGoals ?? []).map((r) => r.trim()).filter(Boolean).slice(0, MAX_NON_GOALS),
 		contextFiles: [],
 		checks: (input.checks ?? []).map((c) => c.trim()).filter(Boolean),
 	};

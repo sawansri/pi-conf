@@ -139,6 +139,12 @@ export function buildReviewUserPrompt(target: ReviewTarget, opts: { reverseFiles
 		brief.requirements.forEach((r, i) => chunks.push(`${i + 1}. ${r}`));
 		chunks.push("");
 	}
+	if (brief && brief.nonGoals.length > 0) {
+		chunks.push("## Out of scope (non-goals)");
+		chunks.push("The change deliberately leaves these out. Don't report a finding that only asks for one of them, or whose fix would need one; a bug the change introduces is still a finding even if it touches these areas.");
+		for (const g of brief.nonGoals) chunks.push(`- ${g}`);
+		chunks.push("");
+	}
 	if (target.metaLines.length > 0) {
 		chunks.push("## Context");
 		chunks.push(...target.metaLines);

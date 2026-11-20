@@ -42,7 +42,8 @@ Write a JSON file (e.g. `~/.local/share/multi-review/runs/<timestamp>/brief.json
 For a **code review**:
 ```json
 {
-  "intent": "Implement Phase 1 of agent-roadmap.md: … Facts outside this repo: pi's models.json apiKey supports ${NAME} interpolation; … Out of scope: …",
+  "intent": "Implement Phase 1 of agent-roadmap.md: … Facts outside this repo: pi's models.json apiKey supports ${NAME} interpolation; …",
+  "non_goals": ["no GUI changes", "opencode keeps its current MCP handling"],
   "spec_path": "agent-roadmap.md",
   "requirements": ["1.1: per-model entries include contextWindow from recipe_options.ctx_size", "…"],
   "context_files": ["src/cpp/cli/pi_profile.cpp", "test/cpp/test_pi_profile.cpp"],
@@ -68,7 +69,8 @@ For a **Socratic discussion** (when `--socratic` / `--discuss` is passed, or whe
 | Field | Content |
 |---|---|
 | `socratic`, `topic`, `rounds` | For Socratic discussions: set `"socratic": true`, state `"topic"` as a neutral open inquiry or design tension (never telegraph which answer you prefer), and optionally set `"rounds"` (default 2: Round 1 opening inquiry + Socratic questions, Round 2 blind cross-examination; max 5). Models have the same repo tools as during review and keep their tool-enabled sessions across rounds. Any `suspicions` you brief are hidden in Round 1 (no anchoring) and posed in Round 2 as Socratic challenges for every participant to test against the code. |
-| `intent` | What the change must accomplish (or background context for a Socratic discussion), plus facts models can't find in the repo: external tool/API behaviour, deployment constraints, what's deliberately out of scope. State goals; don't narrate the implementation, which models verify for themselves. |
+| `intent` | What the change must accomplish (or background context for a Socratic discussion), plus facts models can't find in the repo: external tool/API behaviour, deployment constraints. Put what's deliberately out of scope in `non_goals`. State goals; don't narrate the implementation, which models verify for themselves. |
+| `non_goals` | What the change deliberately leaves out, one per item, from the conversation, the PR description or the spec's out-of-scope section. Reviewers don't report findings that only ask for these or whose fix would need them, which keeps a review from growing the change past its scope. |
 | `spec_path` | The spec path exactly as the user gave it: repo-relative or absolute (don't rewrite an absolute path; the spec may live outside the repo). Its text goes to reviewers verbatim. |
 | `requirements` | With a spec: every concrete, checkable requirement, one per item, including the edge cases and error behaviour it pins down. Without one: only explicit acceptance criteria. |
 | `context_files` | Up to 8 repo paths models should read in full beyond the diff: callers, types/interfaces, tests that pin the behaviour. |
