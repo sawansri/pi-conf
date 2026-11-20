@@ -49,3 +49,8 @@ test("the reply caps the buckets past Act On", async () => {
 	assert.match(text, /### Follow-ups\n[^\n]*Show at most 5, most important first[^\n]*verdict\.md keeps them all/);
 	assert.match(text, /### Consider\n[^\n]*At most 3/);
 });
+
+test("each Act On item carries a patch that applies", async () => {
+	const { leadJudgmentInstructions } = await import("../src/lead.ts");
+	assert.match(leadJudgmentInstructions(false), /\*\*Patch\*\*: a unified diff of the smallest fix that applies with `git apply`/);
+});

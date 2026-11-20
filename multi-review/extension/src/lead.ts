@@ -149,7 +149,7 @@ export function leadJudgmentInstructions(hasSpec: boolean, prNumber?: number): s
 	}
 	lines.push(
 		"### Act On",
-		"Real issues this change introduced that block merging and have a proportional fix, numbered. Each: what, where (file:line), which models raised it, why it matters, **Repro** (the concrete trigger → observed vs expected; take the reviewer's and correct it if needed) and its result (reproduced / not run, with the command and the output that shows it), **Test** (the failing test that will prove the fix), and the fix. Aim for ≤5; more means you aren't filtering hard enough.",
+		"Real issues this change introduced that block merging and have a proportional fix, numbered. Each: what, where (file:line), which models raised it, why it matters, **Repro** (the concrete trigger → observed vs expected; take the reviewer's and correct it if needed) and its result (reproduced / not run, with the command and the output that shows it), **Test** (the failing test that will prove the fix), and the fix as a **Patch**: a unified diff of the smallest fix that applies with `git apply`, with its +/- line count (check it applies in your scratch copy). A fix you can't write as a short patch, or that needs code the change doesn't have yet, isn't proportional: move it to Follow-ups or ask the user. Aim for ≤5; more means you aren't filtering hard enough.",
 		"### Side effects",
 		"For each Act On fix: what changes besides fixing the issue — behavior or output changes, API/signature or config changes, callers or tests that will need updating, compatibility, performance, and error-handling changes. Check the call sites; don't guess. Write \"none\" for a fix with no side effects, rather than leaving it out.",
 		"### Follow-ups",

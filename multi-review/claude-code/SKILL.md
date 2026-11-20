@@ -113,7 +113,7 @@ Read `<dir>/result.md`. It is the compact lead view. Each issue has one canonica
 - weigh verification evidence rather than votes;
 - say which of your suspicions held up.
 
-Reply in its format: Intent · Reviewers · (Spec conformance) · Act On · Side effects · Follow-ups · Consider · Noted · Dismissed · Agreement Map. Every Act On item gets a **Repro** with its result (the command and the output) and a **Test**. **Side effects** lists, for each Act On fix, everything it changes besides fixing the issue: behavior or output changes, API or config changes, callers and tests that need updating, compatibility, and performance. Check the call sites to find them, and write "none" for a fix with no side effects. Keep the reply short past Act On: at most 5 Follow-ups, 3 Consider and 5 Noted items, most important first, then one line `and N more: g7, g9, …`. `verdict.md` keeps every item.
+Reply in its format: Intent · Reviewers · (Spec conformance) · Act On · Side effects · Follow-ups · Consider · Noted · Dismissed · Agreement Map. Every Act On item gets a **Repro** with its result (the command and the output), a **Test**, and a **Patch**: the smallest fix as a unified diff that applies with `git apply` in your scratch copy, with its +/- line count. If you can't write the fix as a short patch, or it needs code the change doesn't have yet, it isn't proportional: move it to Follow-ups or ask the user. **Side effects** lists, for each Act On fix, everything it changes besides fixing the issue: behavior or output changes, API or config changes, callers and tests that need updating, compatibility, and performance. Check the call sites to find them, and write "none" for a fix with no side effects. Keep the reply short past Act On: at most 5 Follow-ups, 3 Consider and 5 Noted items, most important first, then one line `and N more: g7, g9, …`. `verdict.md` keeps every item.
 
 If you need a reviewer's exact wording, `result.json` → `details.groups[].members` has the verbatim per-reviewer text (look issues up by id).
 
@@ -129,6 +129,7 @@ Review: <dir>/result.md
   - Repro result: reproduced | not run (<why>) — `<command>` → <output>
   - Test: <test file / name and what it asserts>
   - Fix: <approach>
+  - Patch (+N/-M): <unified diff that applies with `git apply`>
   - Side effects: <what else the fix changes, or "none">
 ## Follow-ups
 - F1 (g4) <title> — `file:line` — waits because <pre-existing | doesn't block merge | needs <machinery> | non-goal>; smallest fix: <…>
