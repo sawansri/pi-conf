@@ -28,7 +28,8 @@ Output ONLY a JSON array:
     "evidence_kind": "executed"|"traced"|"inferred",
     "origin": "introduced"|"pre-existing",
     "repro": "<steps someone can run as written: the exact command, test, or call sequence with concrete inputs, driving the changed code itself (not a re-implementation of it), then observed vs expected, e.g. \"cache.set('k', v, 1000); advance clock 500ms; cache.get('k') → undefined; expected v\". Omit only for pure design/docs findings. ≤400 chars>",
-    "suggestion": "<optional concrete fix, ≤200 chars>"
+    "suggestion": "<optional: the smallest change that fixes it, ≤200 chars>",
+    "fix_scope": "local"|"new-machinery"
   }
 ]
 
@@ -39,6 +40,7 @@ Rules:
 - category "spec": a requirement that is missing, partially implemented, or contradicted. Quote the requirement in evidence.
 - evidence_kind says how you know: "executed" (you ran the repro and saw the failure; evidence cites the command and its output), "traced" (you followed the whole path in the code), "inferred" (part of the path, or reasoning about code you didn't read). Don't claim more than you did: an honest "inferred" is worth more than a false "executed".
 - origin says whether the change caused the problem: "introduced" if the change adds or alters the faulty code, or newly reaches existing code in a way that fails; "pre-existing" if the problem was there before the change and the change doesn't make it worse. Check with git blame or the base version when unsure.
+- suggestion is the smallest change that fixes the problem, done the way the surrounding code already handles the same case; not a redesign. fix_scope is "new-machinery" when even that fix needs something the code doesn't have yet (a background worker or queue, a cache, a probe or retry policy, a new setting, a test seam), otherwise "local".
 - Severity: critical (security hole, data loss, spec requirement fundamentally unmet), high (correctness bug, race, broken edge case), medium (perf cliff, fragile design that will bite soon), low (minor correctness/maintainability), info (style, docs).`;
 
 /** Appended when the reviewer runs as a nested agent with read-only tools. */

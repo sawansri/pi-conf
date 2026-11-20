@@ -92,7 +92,8 @@ export function synthesizeLeadView(
 		const kind = canon.parts?.evidenceKind;
 		if (evidence) lines.push(`- **Evidence${kind ? ` (${kind})` : ""}:** ${evidence.replace(/\s+/g, " ")}`);
 		if (repro) lines.push(`- **Repro:** ${repro.replace(/\s+/g, " ")}`);
-		if (fix) lines.push(`- **Fix:** ${fix.replace(/\s+/g, " ")}`);
+		const machinery = g.members.filter((m) => m.parts?.fixScope === "new-machinery").length;
+		if (fix) lines.push(`- **Fix${machinery ? ` (needs new machinery per ${machinery}/${g.members.length})` : ""}:** ${fix.replace(/\s+/g, " ")}`);
 		// At most one alternative framing: the most distinct from the canonical
 		// one, and only if it differs at all. Paraphrases are noise for the lead;
 		// verbatim text stays available in details.groups by issue id.

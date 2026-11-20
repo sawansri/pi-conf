@@ -35,6 +35,17 @@ export interface FindingParts {
 	evidenceKind?: EvidenceKind;
 	/** Whether the change introduced the problem or it was there before. */
 	origin?: FindingOrigin;
+	/** Whether the smallest fix stays local or needs new machinery (a worker, cache, probe, test seam, setting). */
+	fixScope?: FixScope;
+}
+
+export type FixScope = "local" | "new-machinery";
+
+export function normalizeFixScope(raw: string): FixScope | undefined {
+	const v = raw.toLowerCase();
+	if (/^(local|small|minimal|contained|in-place)/.test(v)) return "local";
+	if (/^(new|machinery|mechanism|infra|large|structural)/.test(v)) return "new-machinery";
+	return undefined;
 }
 
 export type FindingOrigin = "introduced" | "pre-existing";
@@ -211,9 +222,10 @@ export function parseReviewerJson(rawText: string): ReviewerFinding[] {
 		const reproText = pickText(raw, ["repro", "reproduction", "trigger", "steps", "test_case", "example"]);
 		const evidenceKind = normalizeEvidenceKind(pickText(raw, ["evidence_kind", "evidenceKind", "evidence_type"]));
 		const origin = normalizeOrigin(pickText(raw, ["origin", "introduced_by", "provenance"]));
+		const fixScope = normalizeFixScope(pickText(raw, ["fix_scope", "fixScope", "fix_size"]));
 		const evidence = evidenceText ? `\nEvidence${evidenceKind ? ` (${evidenceKind})` : ""}: ${evidenceText}` : "";
 		const repro = reproText ? `\nRepro: ${reproText}` : "";
-		const suggestion = suggestionText ? `\nSuggestion: ${suggestionText}` : "";
+		const suggestion = suggestionText ? `\nSuggestion${fixScope === "new-machinery" ? " (needs new machinery)" : ""}: ${suggestionText}` : "";
 		const comment = (core + evidence + repro + suggestion + (origin === "pre-existing" ? "\nOrigin: pre-existing" : "")).slice(0, 2800);
 		const filePath = pickText(raw, ["file", "path", "filename", "file_path"]);
 		if (!filePath) continue;
@@ -227,6 +239,7 @@ export function parseReviewerJson(rawText: string): ReviewerFinding[] {
 				suggestion: suggestionText || undefined,
 				...(evidenceKind ? { evidenceKind } : {}),
 				...(origin ? { origin } : {}),
+				...(fixScope ? { fixScope } : {}),
 			},
 		});
 	}

@@ -29,3 +29,12 @@ test("origin is parsed, and only a pre-existing one is spelled out in the commen
 	assert.doesNotMatch(intro.comment, /Origin/);
 	assert.equal(parseReviewerJson(finding({ origin: "dunno" }))[0].parts?.origin, undefined);
 });
+
+test("fix_scope is parsed, and a fix that needs new machinery says so", () => {
+	const [big] = parseReviewerJson(finding({ suggestion: "add a worker", fix_scope: "new-machinery" }));
+	assert.equal(big.parts?.fixScope, "new-machinery");
+	assert.match(big.comment, /\nSuggestion \(needs new machinery\): add a worker/);
+	const [small] = parseReviewerJson(finding({ suggestion: "check null", fix_scope: "Local" }));
+	assert.equal(small.parts?.fixScope, "local");
+	assert.match(small.comment, /\nSuggestion: check null/);
+});
