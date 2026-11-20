@@ -42,3 +42,10 @@ test("fix rounds report the change's size and stop after two", async () => {
 	assert.match(text, /`non_goals` = the original non-goals plus each Follow-up/);
 	assert.match(text, /Stop after two fix rounds/);
 });
+
+test("the reply caps the buckets past Act On", async () => {
+	const { leadJudgmentInstructions } = await import("../src/lead.ts");
+	const text = leadJudgmentInstructions(false);
+	assert.match(text, /### Follow-ups\n[^\n]*Show at most 5, most important first[^\n]*verdict\.md keeps them all/);
+	assert.match(text, /### Consider\n[^\n]*At most 3/);
+});
