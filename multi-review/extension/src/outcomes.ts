@@ -14,7 +14,7 @@ import { verificationTally, vetoes } from "./verdicts.ts";
  * Volume is one user's reviews, so it's shown as a prior, never a filter.
  */
 
-export const BUCKETS = ["act_on", "consider", "noted", "dismissed"] as const;
+export const BUCKETS = ["act_on", "follow_up", "consider", "noted", "dismissed"] as const;
 export type Bucket = (typeof BUCKETS)[number];
 
 export interface OutcomeRecord {
@@ -79,6 +79,7 @@ export function readOutcomes(file = outcomesPath()): OutcomeRecord[] {
 function normalizeBucket(raw: unknown): Bucket | undefined {
 	const v = String(raw ?? "").toLowerCase().replace(/[^a-z]/g, "");
 	if (v === "acton" || v === "act") return "act_on";
+	if (v === "followup" || v === "followups" || v === "defer" || v === "deferred") return "follow_up";
 	if (v === "consider") return "consider";
 	if (v === "noted" || v === "note") return "noted";
 	if (v === "dismissed" || v === "dismiss") return "dismissed";

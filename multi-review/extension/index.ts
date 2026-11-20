@@ -228,7 +228,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("multi-review-outcomes", {
 		description:
 			"Record the lead's verdicts for a headless review: /multi-review-outcomes --dir=<run dir>. " +
-			"Joins <dir>/outcomes.json ({\"g1\": \"act_on\"|\"consider\"|\"noted\"|\"dismissed\"}) with <dir>/result.json into the outcomes log the lead view's track record reads.",
+			"Joins <dir>/outcomes.json ({\"g1\": \"act_on\"|\"follow_up\"|\"consider\"|\"noted\"|\"dismissed\"}) with <dir>/result.json into the outcomes log the lead view's track record reads.",
 		handler: async (args, ctx) => {
 			const dir = parseValueFlag(args, "dir").value;
 			const out = dir ? recordOutcomes(path.resolve(ctx.cwd, dir)) : { error: "missing --dir=<run dir>" };

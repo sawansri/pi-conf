@@ -100,7 +100,7 @@ pi -p "/multi-review-run --brief=<brief.json> --out=<dir>/result.json" < /dev/nu
 
 Read `<dir>/result.md`. It is the compact lead view. Each issue has one canonical description with **Evidence**, **Repro** and **Fix**, other reviewers' framings as one-liners, and its verification tally and evidence. Then come your suspicions, warnings, and a **Lead judgment** section. Follow that section:
 - verify single-reviewer findings by reading the code;
-- a finding whose **Where** line says pre-existing (the problem was there before the change and the change doesn't make it worse) doesn't go in Act On, however severe: check the claim against the base version, then note it as a follow-up;
+- a finding whose **Where** line says pre-existing (the problem was there before the change and the change doesn't make it worse) doesn't go in Act On, however severe: check the claim against the base version, then put it in Follow-ups;
 - **run each finding's repro yourself**, in this session rather than a subagent, so the results stay in your context:
   - first correct the reviewer's steps against the code: the right entry point, inputs that reach the flagged line, the real expected value;
   - drive the code under review (import it, call it, run the binary or an existing test), never a re-implementation of it;
@@ -108,11 +108,11 @@ Read `<dir>/result.md`. It is the compact lead view. Each issue has one canonica
   - record reproduced / not reproduced / not run, with the command and its output;
   - if it doesn't reproduce, check why: fix a wrong setup and rerun once, but don't bend the trigger until it fails.
 
-  Reproduced findings go in Act On; ones that still don't reproduce are Dismissed unless the code shows the attempt can't reach the trigger here; ones you couldn't run are judged on the code;
+  Reproduced findings go in Act On only when the change introduced them, they block merging (wrong results, crash or hang, data loss, security hole, unmet stated requirement; not a rare edge case the change doesn't handle yet), and the fix is proportional: local, no new machinery (worker or queue, cache, probe or retry policy, new setting, test seam), nothing a non-goal rules out, no departure from how the code already handles the same case. A fix that departs from existing behavior tends to need machinery of its own, whose bugs the next review finds. Other real findings go in **Follow-ups**. If a merge-blocking bug has only a machinery-sized fix, ask the user, with the lines you expect it to add. Ones that still don't reproduce are Dismissed unless the code shows the attempt can't reach the trigger here; ones you couldn't run are judged on the code;
 - weigh verification evidence rather than votes;
 - say which of your suspicions held up.
 
-Reply in its format: Intent · Reviewers · (Spec conformance) · Act On · Side effects · Consider · Noted · Dismissed · Agreement Map. Every Act On item gets a **Repro** with its result (the command and the output) and a **Test**. **Side effects** lists, for each Act On fix, everything it changes besides fixing the issue: behavior or output changes, API or config changes, callers and tests that need updating, compatibility, and performance. Check the call sites to find them, and write "none" for a fix with no side effects.
+Reply in its format: Intent · Reviewers · (Spec conformance) · Act On · Side effects · Follow-ups · Consider · Noted · Dismissed · Agreement Map. Every Act On item gets a **Repro** with its result (the command and the output) and a **Test**. **Side effects** lists, for each Act On fix, everything it changes besides fixing the issue: behavior or output changes, API or config changes, callers and tests that need updating, compatibility, and performance. Check the call sites to find them, and write "none" for a fix with no side effects.
 
 If you need a reviewer's exact wording, `result.json` → `details.groups[].members` has the verbatim per-reviewer text (look issues up by id).
 
@@ -129,14 +129,16 @@ Review: <dir>/result.md
   - Test: <test file / name and what it asserts>
   - Fix: <approach>
   - Side effects: <what else the fix changes, or "none">
+## Follow-ups
+- F1 (g4) <title> — `file:line` — waits because <pre-existing | doesn't block merge | needs <machinery> | non-goal>; smallest fix: <…>
 ## Consider / Noted / Dismissed
 <one line each>
 ```
 
-Then record which bucket each issue went in, so later reviews can show each model's track record. Write `<dir>/outcomes.json`, one entry per issue id (`g1`, …; not suspicions or PR claims) with `"act_on"`, `"consider"`, `"noted"` or `"dismissed"`:
+Then record which bucket each issue went in, so later reviews can show each model's track record. Write `<dir>/outcomes.json`, one entry per issue id (`g1`, …; not suspicions or PR claims) with `"act_on"`, `"follow_up"`, `"consider"`, `"noted"` or `"dismissed"`:
 
 ```json
-{"g1": "act_on", "g2": "dismissed", "g3": "consider"}
+{"g1": "act_on", "g2": "dismissed", "g3": "follow_up", "g4": "consider"}
 ```
 
 and run, exactly in this form:
@@ -152,10 +154,10 @@ It appends to `~/.local/share/multi-review/outcomes.jsonl` and prints how many f
 The result has an **Existing PR review comments** section. Each checkable claim extracted from the comments shows whether the independent reviewers found the same defect, plus verifier verdicts with evidence. Questions and preferences come after the claims. Resolved threads are used only as context; they're not re-checked.
 
 Your reply adds, as the Lead judgment section asks:
-- **Existing PR comments:** one row per claim, question and preference. Give the verdict (valid / invalid / unclear / not a defect), the evidence, and the action (fix → Act On / reply with explanation / answer / resolve). A human reviewer's claim that verifiers refute is presented with the code evidence, not overruled silently.
+- **Existing PR comments:** one row per claim, question and preference. Give the verdict (valid / invalid / unclear / not a defect), the evidence, and the action (fix → Act On / defer → Follow-ups / reply with explanation / answer / resolve). A human reviewer's claim that verifiers refute is presented with the code evidence, not overruled silently.
 - **New issues not mentioned on the PR:** what this review found beyond the existing comments.
 
-Then write `<dir>/pr-replies.md`: one section per comment with its link, the verdict, and a ready-to-paste reply. Valid → what will be fixed and how. Invalid → the code evidence. Question → the answer. Tell the user the path. **Do not post anything.**
+Then write `<dir>/pr-replies.md`: one section per comment with its link, the verdict, and a ready-to-paste reply. Valid → what will be fixed and how, or for a follow-up, that it is real and will be handled in a separate change. Invalid → the code evidence. Question → the answer. Tell the user the path. **Do not post anything.**
 
 ### With `--socratic`: moderate and synthesize the discussion
 

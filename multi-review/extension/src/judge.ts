@@ -33,7 +33,8 @@ For each finding, in the order provided, write:
 - **Category:** <category>
 - **Raised by:** <reviewer-count> — <comma-separated short model names>
 - **Verdict:** confirmed | plausible | false positive — <one sentence citing the specific diff lines that support or refute it>
-- **Judge's take:** <one or two sentences: mechanics, root cause, or a concrete fix>
+- **Judge's take:** <one or two sentences: mechanics, root cause, or the smallest concrete fix>
+- **Now or later:** blocks merge | follow-up — <why, for confirmed or plausible findings>
 
 When reviewers frame the same finding differently, say so in the take — do not silently pick one.
 
@@ -46,6 +47,7 @@ Rules:
 - Keep every finding in the output (mark false positives, never delete them). Do not invent new findings.
 - Verify against the diff. A finding about code the diff doesn't touch is at most "plausible" unless the diff clearly breaks it.
 - When independent verification is present, weigh it: a refutation with concrete code evidence (marked VETO) makes a finding a false positive unless the diff shows the refutation is wrong, however many verifiers confirmed; a confirmation that ran the repro (executed) is strong support, one that only reasoned is weak. Say which way it went.
+- A real finding is a follow-up, not blocks merge, when it is pre-existing, when it doesn't break the change's goal (a rare edge case the change doesn't handle yet), when its fix needs new machinery (a worker, cache, probe, setting, test seam), or when it only asks for a non-goal.
 - You may adjust the displayed severity by one step when the evidence warrants; note the change in the take.
 - Keep each finding ≤ 90 words. Do not paste reviewer comments verbatim; they are shown separately.
 - Use file paths exactly as given — do not rewrite to absolute paths.

@@ -102,3 +102,9 @@ test("each run gets its own directory, named so they sort by start time", () => 
 		else process.env.XDG_DATA_HOME = saved;
 	}
 });
+
+test("a deferred finding is recorded as follow_up", () => {
+	const log = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "mr-log-")), "outcomes.jsonl");
+	recordOutcomes(runDir(GROUPS, { g2: "Follow-up", g4: "follow_up" }), log);
+	assert.deepEqual(readOutcomes(log).map((r) => [r.group, r.bucket]), [["g2", "follow_up"], ["g4", "follow_up"]]);
+});

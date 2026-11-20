@@ -22,7 +22,7 @@ findings, lead-judgment buckets).
 4. The tool result (rendered as a collapsible review panel) goes back to
    the agent with lead-judgment instructions. The agent verifies the
    findings and replies with **Intent · Reviewers · Spec conformance ·
-   Act On · Side effects · Consider · Noted · Dismissed · Agreement
+   Act On · Side effects · Follow-ups · Consider · Noted · Dismissed · Agreement
    Map**. It does not apply fixes unless you ask.
 
 `--direct` (and print/RPC modes, which have no agent turn to hand off to)
@@ -361,7 +361,7 @@ The flow:
 3. It runs `/multi-review-run` in the background (Bash, `run_in_background`),
    waits for the completion notification, and reads `result.md`.
 4. It delivers the lead verdict: Intent · Reviewers · Spec conformance ·
-   Act On · Side effects · Consider · Noted · Dismissed · Agreement Map. It also saves
+   Act On · Side effects · Follow-ups · Consider · Noted · Dismissed · Agreement Map. It also saves
    the verdict as `verdict.md`, a checklist where each Act On item has a
    repro, a test, a fix, and the fix's side effects.
 5. **If you ask it to fix**, it works from `verdict.md`, not the raw
@@ -644,6 +644,8 @@ extglob — documented limitation.
    pstack-style instructions:
    every Act On item gets a Repro and the Test that will prove the fix,
    verify single-reviewer findings before Act On, aim for ≤ 5 Act On items,
+   keep Act On to merge-blocking problems the change introduced whose fix
+   is proportional (no new machinery) and send the rest to Follow-ups,
    list each fix's side effects (behavior, API, caller, compatibility
    and performance changes beyond the fix itself),
    give a reason for each dismissal, and add a spec conformance table when a

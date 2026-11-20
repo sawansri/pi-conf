@@ -26,3 +26,11 @@ test("non-goals reach reviewers as out of scope, and an empty list adds nothing"
 	const none = buildReviewUserPrompt({ ...(target as object), brief: buildBrief(process.cwd(), { intent: "x" }, []) } as never);
 	assert.doesNotMatch(none, /Out of scope/);
 });
+
+test("the lead keeps Act On to merge-blocking, introduced problems with a proportional fix", async () => {
+	const { leadJudgmentInstructions } = await import("../src/lead.ts");
+	const text = leadJudgmentInstructions(false);
+	assert.match(text, /goes in Act On only when all three hold: the change introduced it; it blocks merging/);
+	assert.match(text, /no new machinery/);
+	assert.match(text, /### Act On[\s\S]*### Side effects[\s\S]*### Follow-ups[\s\S]*### Consider/);
+});
